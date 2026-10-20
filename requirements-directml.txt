@@ -1,0 +1,24 @@
+# onnxruntime-directml: RapidOCR acceleration on a non-Intel GPU via onnxruntime's DirectML
+# execution provider (exocortex/screen/ocr.py: directml_available(), _OrtSession,
+# RapidOcr._attach_directml). Runs on any DirectX 12 GPU (AMD, Intel, NVIDIA), which is why
+# exocortex.screen.ocr uses it -- not OpenVINO's GPU plugin -- as the accelerator for a non-Intel
+# integrated or discrete GPU (measured 2026-09-25 on a Ryzen AI MAX+ 395 / Radeon 8060S: OpenVINO's
+# GPU plugin crashes the interpreter on this hardware -- see exocortex/screen/ocr.py's module
+# docstring -- while onnxruntime-directml works and matches the CPU engine's text).
+#
+# It REPLACES the plain "onnxruntime" package: both install into the same "onnxruntime" import
+# path (onnxruntime-directml is onnxruntime's own wheel with the DML execution provider compiled
+# in), so the two cannot coexist in one venv. faster-whisper depends on plain "onnxruntime" (CPU),
+# so run.bat installs this INSTEAD of it only on a machine where it decided DirectML should be the
+# OCR accelerator (a non-Intel GPU, or Intel without a working OpenVINO GPU plugin): it uninstalls
+# "onnxruntime" first, then installs this file, exactly like the two commands below (verified in
+# this venv on 2026-09-25):
+#
+#   pip uninstall -y onnxruntime
+#   pip install -r requirements-directml.txt
+#
+# Pinned to the exact version measured on this machine (Python 3.12; onnxruntime-directml needs
+# Python >= 3.11). faster-whisper's own onnxruntime usage (VAD-adjacent code inside ctranslate2's
+# dependency chain) is CPU-only either way and works fine against the DirectML wheel's CPU
+# execution provider, which is always present alongside DmlExecutionProvider.
+onnxruntime-directml==1.24.4

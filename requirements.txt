@@ -1,0 +1,32 @@
+# Verified on Windows 11 / Python 3.12 / RTX 5080 Laptop on 2026-09-20
+#
+# This is the vendor-neutral core: it installs on any machine (NVIDIA, AMD, Intel iGPU, or no
+# GPU) with no wasted downloads. run.bat adds GPU-specific extras on top, picked by
+# `exocortex.gpu --extras`: requirements-nvidia.txt (CUDA/cuDNN wheels for faster-whisper on an
+# NVIDIA GPU) on NVIDIA machines, requirements-directml.txt (onnxruntime-directml, replacing the
+# CPU onnxruntime that faster-whisper/rapidocr pull in) on AMD machines. openvino stays in this
+# core file: it serves the Intel iGPU/NPU OCR path and also the CPU / OpenVINO-GPU OCR path on
+# AMD machines (exocortex/screen/ocr.py), so every machine benefits from it being present.
+faster-whisper==1.2.1
+ctranslate2==4.8.2
+pyaudiowpatch==0.2.12.8
+sherpa-onnx==1.13.8
+PySide6==6.11.2
+httpx==0.28.1
+numpy>=2.0
+pynput==1.8.2
+soundfile==0.14.0
+# screen reading
+mss==10.2.0
+pillow>=11
+rapidocr==3.9.2
+winrt-runtime==3.2.1
+winrt-Windows.Foundation==3.2.1
+winrt-Windows.Foundation.Collections==3.2.1
+winrt-Windows.Globalization==3.2.1
+winrt-Windows.Graphics.Imaging==3.2.1
+winrt-Windows.Media.Ocr==3.2.1
+winrt-Windows.Storage.Streams==3.2.1
+pytest>=8
+comtypes>=1.4          # UI Automation / MSAA (caret tracking for completion mode)
+openvino==2026.4.0     # RapidOCR on the Intel iGPU / NPU (exocortex/screen/ocr.py); optional at runtime

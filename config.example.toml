@@ -1,0 +1,301 @@
+# ExoCortex configuration
+#
+# Tuned (2026-10-20) for pair programming / team coding with you DRIVING: the co-pilot keeps a
+# living list of questions worth asking and blind spots / follow-ups in the Notes tab's Insights
+# pane, keeps dev-session notes, answers spoken questions, and recaps on demand -- without ever
+# taking over the Assist tab while you type. See docs/PAIR_PROGRAMMING.md.
+
+[llm]
+# "auto" (recommended): resolve at startup -- llamacpp (an LM Studio or upstream-fetched runtime
+# pack for this machine's GPU + a GGUF in this app's own library or LM Studio's) -> ollama (already
+# running, or started here) -> openai (a server at server_url) -> a clear error naming what to
+# install. "llamacpp" / "ollama" / "openai" pin one explicitly, with NO probing (an NVIDIA machine
+# that already worked with "auto" keeps landing on llamacpp exactly as before -- see
+# exocortex/llm/route.py).
+backend = "auto"
+# 2026-09-27: the external server for backend = "ollama" / "openai"; empty = that backend's
+# standard address (Ollama 127.0.0.1:11434, OpenAI-compatible 127.0.0.1:8081). The old base_url /
+# ollama_url keys still load and are migrated into this field.
+server_url = ""
+# The specific, tuned model, so a fresh/no-config install loads exactly what this app is verified
+# against. "auto": the largest GGUF in this app's own library (library_dir below) or LM Studio's
+# folder, whichever it finds, that fits ~75% of this machine's GPU memory budget
+# (exocortex/llm/server.py:pick_default_model, via exocortex.llm.library.scan_library's combined
+# list; on Ollama, the largest model it has pulled) -- set this on a machine that lacks
+# "maple-preview" (e.g. an AMD/Intel iGPU box), or leave it at "auto" and let run.bat's first-run
+# setup (exocortex/setup.py) pull one and fill this in for you. A name that isn't found (including
+# "maple-preview" itself) falls back to "auto" with a warning instead of failing the start.
+model = "maple-preview"
+llama_server_path = ""
+lmstudio_models_dir = ""
+# 2026-09-27: the app's own GGUF library (<library_dir>/<publisher>/<repo>/*.gguf). Empty =
+# <repo>/models/llm. LM Studio's own folder (lmstudio_models_dir above), when present, is scanned
+# too, as a second source.
+library_dir = ""
+# Which llama.cpp GPU framework to use among LM Studio's installed runtime packs: "auto" follows
+# the primary GPU's vendor (exocortex/gpu.py) -- NVIDIA: cuda12 > cuda > vulkan > cpu (unchanged);
+# AMD: rocm > vulkan > cpu (measured 2026-09-26 on the Radeon 8060S with a 16.8 GB Qwen3.8-27B:
+# ROCm ~300 tok/s prompt processing and 0.4 s to the first cached token vs Vulkan's ~160 tok/s and
+# 3.4 s, generation equal; LM Studio only installs ROCm on GPUs it supports, and a ROCm pack that
+# lists no device or dies while loading falls through to Vulkan, which runs on every AMD GPU);
+# Intel: vulkan > cpu; no GPU detected: the legacy cuda12 > cuda > vulkan > cpu order. Explicit:
+# "cuda" | "rocm" | "vulkan" | "cpu" (a missing pack falls back down the same ladder with a warning).
+# "sycl" | "openvino" (added 2026-09-26) are Intel-only frameworks that exist only as upstream
+# llama.cpp builds -- LM Studio's own runtime catalog packages neither -- so in practice they only
+# get a binary at all when llama_source (below) is "auto" or "upstream"; under "lmstudio" (packs
+# only) a request for either simply falls back down the ladder to Vulkan/CPU like any other
+# missing pack.
+llama_backend = "auto"
+# Which GPU llama-server uses when the chosen framework sees more than one ("--device"): "auto" =
+# the primary GPU, matched by name in `llama-server --list-devices` (a single device gets no
+# flag; CUDA builds are never given one -- unchanged for NVIDIA); "" = let llama.cpp decide; or an
+# exact device name as --list-devices prints it ("Vulkan0", "ROCm0").
+llama_device = "auto"
+# 2026-09-26/27: where the llama-server BINARY comes from -- "auto" (default): an LM Studio
+# runtime pack first, for EVERY vendor and GPU flavor (CUDA/ROCm included, as of 2026-09-27 -- a
+# machine with an LM Studio pack for the flavor it lands on is byte-identical to before this field
+# existed, no network call, ever); only when NO LM Studio pack exists for ANY GPU flavor of this
+# vendor's ladder does it fetch the pinned official llama.cpp build instead
+# (exocortex.llm.runtimes), before finally dropping to the CPU pack -- this is what lets a machine
+# with neither LM Studio nor Ollama installed still get a working GPU-accelerated backend. An
+# upstream-sourced CUDA pack may still fall through to the next flavor on a load failure, like any
+# other GPU flavor; an LM Studio CUDA pack never does. "lmstudio": LM Studio's packs only, never
+# fetches (pre-2026-09-26 behaviour). "upstream": official llama.cpp release builds only, ignoring
+# LM Studio's packs entirely -- the only way llama_backend = "sycl"/"openvino" gets a binary under
+# a strict "lmstudio" setting is to change this to "auto" or "upstream".
+llama_source = "auto"
+# The llama.cpp release tag exocortex.llm.runtimes fetches builds from when llama_source is
+# "upstream" (or "auto" falls through to it) -- pinned so a fresh install never makes a network
+# call just to discover asset digests. Any other tag is resolved live from GitHub's release API.
+llama_upstream_build = "b11200"
+# 2026-09-27: where a fetched upstream llama.cpp runtime pack is cached. Empty = <repo>/.tools/llama.cpp.
+runtime_dir = ""
+# Extra environment variables merged into llama-server's process, after PATH -- e.g. an Intel Arc
+# "Alchemist" Vulkan workaround ({ GGML_VK_DISABLE_COOPMAT = "1" }; --doctor prints the exact
+# GGML_VK_* switches the installed ggml-vulkan.dll build recognises, via
+# exocortex.llm.runtimes.vulkan_env_switches) or SYCL's device selector
+# ({ ONEAPI_DEVICE_SELECTOR = "level_zero:0" }). Framework "sycl" additionally gets
+# ZES_ENABLE_SYSMAN = "1" by default (SYCL.md: enables free-VRAM reporting) unless a key of this
+# same name is already set here.
+llama_env = {}
+llama_port = 0
+ctx_size = 8192
+gpu_layers = 999999
+threads = 0
+parallel = 2
+flash_attn = true
+load_mode = "mmap"
+llama_extra_args = []
+llama_startup_timeout_s = 180.0
+thinking = "off"
+assist_max_tokens = 220
+ask_max_tokens = 400
+solve_max_tokens = 700
+text_max_tokens = 400
+notes_max_tokens = 900
+insights_max_tokens = 320   # co-pilot insights: questions to ask + blind spots / follow-ups
+recap_max_tokens = 360      # the Recap action: goal / done / now / next
+temperature = 0.6
+top_p = 0.85
+context_tokens = 2500
+auto_load_model = true
+request_timeout_s = 120.0
+extra_body = { top_k = 20, min_p = 0.0 }
+kv_cache_type = "q8_0"      # quantised KV for the spawned llama-server ("f16" opts out)
+vram_guard = true            # toast when free VRAM stays under vram_guard_free_mb
+vram_guard_free_mb = 1500
+swap_unload_url = "http://127.0.0.1:8081"   # freed at launch/quit; "" disables
+
+[asr]
+model = "large-v3-turbo"
+device = "auto"
+compute_type = "auto"
+language = "en"
+beam_size = 1
+partial_interval_s = 1.2
+partials_enabled = true
+hotwords = []
+no_speech_threshold = 0.7
+logprob_threshold = -1.2
+cpu_threads = 0              # 0 = auto: 4 on an NVIDIA machine (unchanged), else min(8, max(4, physical cores/2))
+# Which speech-recognition engine Transcriber.load() builds. "auto" (default): "faster-whisper"
+# whenever CUDA is available (unchanged on the NVIDIA laptops), else "sherpa" (sherpa-onnx over a
+# NeMo Parakeet-TDT transducer) -- measured on a Ryzen AI MAX+ 395 / Radeon 8060S (no NVIDIA GPU):
+# faster-whisper 6.03 s median/utterance (CPU, int8, 8 threads) vs sherpa 0.19 s, word overlap
+# 0.99 vs 1.00 -- comfortably clears the "auto" decision rule. "faster-whisper" / "sherpa" pin one.
+engine = "auto"
+# sherpa-onnx model bundle (a key of exocortex.models_dl.SHERPA_MODELS), used when `engine`
+# resolves to "sherpa". Swaps automatically to the multilingual "-v3-int8" bundle when `language`
+# is set to anything other than "en" and this is still at its default.
+sherpa_model = "parakeet-tdt-0.6b-v2-int8"
+
+[audio]
+capture_system = true
+capture_mic = true
+system_device = "default"
+mic_device = "default"
+frame_ms = 32
+vad_threshold = 0.5
+min_silence_s = 0.4
+min_speech_s = 0.25
+max_utterance_s = 20.0
+pre_roll_s = 0.3
+echo_suppression = true
+mic_start_muted = false
+loopback_keepalive = true
+
+[diarization]
+enabled = true
+model = "wespeaker_en_voxceleb_CAM++.onnx"
+threshold = 0.45
+enroll_min_s = 1.5
+max_speakers = 8
+num_threads = 2
+
+[assist]
+auto_answer_questions = true
+coalesce_ms = 700
+style = "bullets"
+persona = ""
+min_question_words = 3
+autonomous = true
+focus = "auto"              # technical (only technical substance) | auto (questions + task-like lines, code-biased) | all (answer anything)
+ignore_patterns = []
+primary_language = "Python"
+libraries = "basic"         # none (built-ins only, no imports) | basic (the standard library's basics) | all -- a default, "no libraries" said in the interview wins
+comments = "normal"
+# ---- pair programming / team coding (also in the "..." > Assist menu) ----
+# What the session is about -- project, stack, today's goal -- handed to every answer, insight and
+# recap, e.g. "FastAPI + Postgres billing service; today: per-tenant rate limiting".
+session_context = ""
+# driver (you are at the keyboard: questions for the navigator / team, what you may be missing) |
+# navigator (a teammate types, you review: questions for the driver, review points) |
+# participant (a design / team discussion). Pairs swap often: one click in the Assist menu.
+role = "driver"
+suggest_questions = true    # background: questions worth asking right now (Notes tab > Insights)
+flag_blind_spots = true     # background: unhandled edge cases, missing tests, risky assumptions, follow-ups
+insight_interval_s = 120    # a background refresh at most this often (0 = on demand only: Ctrl+Alt+W) ...
+insight_min_new_words = 60  # ... once this much new speech arrived -- or the code on screen changed a lot
+insight_max_items = 4       # bullets per section
+
+[notes]
+auto_interval_s = 180
+min_new_words = 120
+template = "dev"            # dev (code changed, bugs + causes, design choices, commands, TODOs) | meeting
+
+[screen]
+mode = "auto"
+interval_s = 1.5            # capture cadence; also hands-free mode's sampling interval
+ocr_engine = "auto"         # auto = Windows OCR (0.1 s) if available, else rapidocr (more accurate)
+# Where RapidOCR runs: "igpu" = an Intel iGPU via OpenVINO, or -- on a non-Intel GPU, where
+# OpenVINO's GPU plugin crashes on AMD hardware (measured on a Radeon 8060S) -- onnxruntime's
+# DirectML execution provider (requirements-directml.txt); "npu" = Intel AI Boost via OpenVINO;
+# "cpu" = OpenVINO CPU if installed, else onnxruntime; "auto" = igpu > npu > cpu. Never the
+# discrete NVIDIA GPU (it holds Whisper and llama-server).
+ocr_device = "auto"
+monitor = 0
+region = [0, 0, 0, 0]
+use_in_answers = true
+# Off while you drive: every change to your editor would start an unrequested solve / answer that
+# takes over the Assist tab. The insights read the screen instead. On for an interview screen.
+auto_suggest = false
+suggest_min_interval_s = 20
+answer_screen_questions = false
+max_text_chars = 2500
+save_text = false
+show_text = false
+exclude_own_windows = true  # blank this app's own windows out of the screen text (the overlay is capturable)
+
+[completion]
+enabled = false
+poll_ms = 150
+debounce_ms = 1200
+min_interval_ms = 800
+max_tokens = 120
+max_lines = 8
+prefix_chars = 1500
+suffix_chars = 200
+min_prefix_chars = 2
+temperature = 0.2
+repeat_penalty = 1.1
+use_transcript = true
+use_screen = true
+use_answers = true
+use_notes = true
+hint = ""
+ghost_color = "#9aa0a6"
+ghost_opacity = 0.75
+font_scale = 1.0
+default_font_pt = 11.0
+
+[explain]
+enabled = false
+walkthrough_max_tokens = 220
+explain_max_tokens = 420
+typed_fraction = 0.9
+
+[handsfree]
+enabled = false             # the switch at the right of the tab strip (Ctrl+Alt+H); true = start in hands-free mode
+settle_s = 1.0              # the screen must hold still this long before it is read and acted on
+min_new_lines = 1           # new lines of prose (3+ words, not typed, not an edit of a line) that make a new task; a new question always does
+change_threshold = 0.6      # or: share of lines that differ between two consecutive samples (a big scroll, a different screen)
+min_changed_lines = 3       # ...and at least this many lines new or gone
+on_code = "code"            # code on screen (a snippet, an editor, a dev window, a task asking for code): code (Code only) | code_first | ignore
+deviation_threshold = 0.5   # regenerate Code when this share of the code on screen is not the app's own (0 = off)
+context_chars = 6000        # cumulative screen context (scrolled-out lines + current screen) for Text / Code
+run_text = true             # Text (walkthrough) for each new task; skipped with explanations on / in completion mode
+run_code = true             # Code for each new task
+code_first = false          # Code before Text
+accurate_ocr = true         # re-read the settled screen with RapidOCR (on ocr_device) before acting
+manual = false              # manual advance (the Manual switch, Ctrl+Alt+J): watching, OCR, checkpoints and the
+                            # transcript keep running, but nothing is generated until the mouse gesture, anywhere
+                            # on screen: the left button = Text, the middle button = Code
+manual_hold_s = 0.8         # press-and-hold time for a button that requires the hold; moving the pointer while
+                            # the button is down cancels (a drag, a selection), hold required or not
+manual_hold_text = true     # Text needs the hold (left clicks happen constantly; false = EVERY click generates)
+manual_hold_code = false    # Code does not: a quick middle press -- or a touchpad three-finger tap mapped to
+                            # "Middle mouse button" in Windows touchpad settings -- triggers it right away
+
+[ui]
+opacity = 0.93
+width = 460
+height = 680
+x = -1
+y = -1
+font_size = 11
+start_hidden = false
+click_through = false
+always_on_top = true
+
+[hotkeys]
+toggle_visible = "ctrl+alt+space"
+answer_last = "ctrl+alt+a"
+ask_focus = "ctrl+alt+q"
+notes = "ctrl+alt+n"
+toggle_auto = "ctrl+alt+t"
+toggle_mic = "ctrl+alt+m"
+click_through = "ctrl+alt+c"
+# Off by default: Ctrl+Alt+arrows are VS Code's add-cursor-above/below and JetBrains' navigate
+# back/forward, and a global hotkey swallows them in every app. Any hotkey set to "" is not registered.
+move_left = ""
+move_right = ""
+move_up = ""
+move_down = ""
+select_region = "ctrl+alt+r"
+suggest_now = "ctrl+alt+s"
+toggle_screen = "ctrl+alt+v"
+toggle_completion = "ctrl+alt+k"
+toggle_explanations = "ctrl+alt+e"
+checkpoint = "ctrl+alt+b"
+toggle_pause = "rshift"     # pause / resume: a TAP of the right Shift key (or rctrl / ralt / a key such as "right", or a "ctrl+alt+p" combination; "" = off)
+code = "ctrl+alt+g"
+toggle_handsfree = "ctrl+alt+h"
+toggle_manual = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
+insights = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
+recap = "ctrl+alt+y"           # recap the session so far
+quit = "ctrl+alt+x"
+
+[paths]
+models_dir = ""
+sessions_dir = ""
+autosave_interval_s = 30

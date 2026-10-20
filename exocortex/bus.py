@@ -1,0 +1,385 @@
+"""Thread-safe fan-out event bus and the event/data types shared by every module.
+
+Design rules:
+- Every producer thread calls `bus.publish(event)`; it never blocks.
+- Every consumer calls `q = bus.subscribe()` once and drains `q` on its own thread
+  (the Qt UI drains it from a QTimer; the Assistant drains it on a worker thread).
+- Events are immutable dataclasses. `ts` is `time.monotonic()` at creation.
+- Segment times (`t_start`, `t_end`) are seconds since session start (the Engine's clock).
+"""
+from __future__ import annotations
+
+import queue
+import threading
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, Literal
+
+
+class Source(str, Enum):
+    MIC = "mic"        # the user's microphone  -> speaker "me" / label "Me"
+    SYSTEM = "system"  # WASAPI loopback of the default output -> remote participants
+
+
+@dataclass(frozen=True)
+class TranscriptSegment:
+    id: int
+    source: Source
+    speaker_id: str      # "me" for MIC; "spk1", "spk2", ... for SYSTEM
+    speaker_label: str   # "Me", "Speaker 1", or a user-assigned name
+    text: str
+    t_start: float       # seconds since session start
+    t_end: float
+    confidence: float    # 0..1, roughly exp(avg_logprob) clipped
+    is_question: bool = False
+
+    @property
+    def duration(self) -> float:
+        return max(0.0, self.t_end - self.t_start)
+
+
+def _now() -> float:
+    return time.monotonic()
+
+
+@dataclass(frozen=True)
+class Event:
+    ts: float = field(default_factory=_now, init=False)
+
+
+# ---- audio -----------------------------------------------------------------
+@dataclass(frozen=True)
+class AudioLevelEvent(Event):
+    source: Source
+    rms: float   # 0..1 linear
+    peak: float  # 0..1 linear
+
+
+@dataclass(frozen=True)
+class AudioStatusEvent(Event):
+    source: Source
+    state: Literal["started", "stopped", "error", "device_changed", "muted", "unmuted"]
+    device_name: str = ""
+    detail: str = ""
+
+
+# ---- transcript --------------------------------------------------------------
+@dataclass(frozen=True)
+class PartialTranscriptEvent(Event):
+    """In-progress text for the utterance currently being spoken (replaces previous partial)."""
+    source: Source
+    text: str
+    t_start: float
+
+
+@dataclass(frozen=True)
+class FinalTranscriptEvent(Event):
+    segment: TranscriptSegment
+
+
+@dataclass(frozen=True)
+class SpeakerRenamedEvent(Event):
+    speaker_id: str
+    new_label: str
+
+
+@dataclass(frozen=True)
+class QuestionDetectedEvent(Event):
+    segment_id: int
+    question_text: str
+
+
+# ---- screen reading ------------------------------------------------------------
+@dataclass(frozen=True)
+class ScreenTextEvent(Event):
+    """OCR result of the latest screen capture (published only when the text changed, or forced)."""
+    mode: str                          # auto | monitor | region
+    source_name: str                   # window title, "monitor 1" or "region"
+    rect: tuple[int, int, int, int]    # x, y, w, h in screen pixels
+    text: str                          # lines joined with "\n"
+    lines: tuple[str, ...]
+    changed: bool                      # False when a forced snapshot found no change
+    ocr_ms: float
+    captured_at: float                 # seconds since session start
+    engine: str = ""                   # OCR engine that produced it ("windows", "rapidocr/igpu", ...)
+    # The answer to a `capture_now(accurate=True)` request (hands-free mode) -- set whether or not an
+    # accurate engine existed to serve it (`engine` tells); never set on an ordinary sample.
+    accurate: bool = False
+    # The foreground window at capture time (title / executable name, e.g. "main.py - Visual Studio
+    # Code" / "Code.exe"), whatever the capture mode -- hands-free mode uses it to tell a
+    # development window. "" when unknown or when our own overlay was in front.
+    window_title: str = ""
+    window_process: str = ""
+
+
+@dataclass(frozen=True)
+class ScreenStatusEvent(Event):
+    state: Literal["active", "paused", "off", "error"]
+    detail: str = ""                   # e.g. "auto: Zoom Meeting" / "region 800x600" / error text
+
+
+# ---- completion mode --------------------------------------------------------------
+@dataclass(frozen=True)
+class CompletionEvent(Event):
+    """What the ghost-text window should show right now (published by the Completer).
+
+    Coordinates are PHYSICAL screen pixels (as Win32/accessibility report them); ``x``/``y`` is
+    the caret's top-left, ``line_h`` the caret height. ``font_px`` is the matched font size in
+    physical pixels (0 = unknown, derive from ``line_h``). ``current_line`` is the text before
+    the caret on the caret's own line, so the renderer can line up continuation lines with the
+    start of the line. ``visible=False`` hides the ghost text (other fields then unused).
+    """
+    visible: bool = False
+    text: str = ""
+    x: int = 0
+    y: int = 0
+    line_h: int = 0
+    font_px: float = 0.0
+    font_name: str = ""
+    mono: bool = False
+    current_line: str = ""
+    app: str = ""
+
+
+@dataclass(frozen=True)
+class CompletionModeEvent(Event):
+    """Completion mode turned on/off (UI + engine stay in sync through this)."""
+    enabled: bool = False
+    detail: str = ""
+
+
+# ---- hands-free mode ---------------------------------------------------------------
+#: Hands-free controller states: off; watching (sampling, nothing new); settling (the screen just
+#: changed, waiting for it to hold still); reading (an accurate OCR re-read is in flight);
+#: checkpoint / text / code (that step of the cycle is running); armed (manual advance: the new
+#: task was read and checkpointed, generation waits for the press-and-hold gesture); paused.
+HandsFreeState = Literal["off", "watching", "settling", "reading", "checkpoint", "text", "code", "armed", "paused"]
+
+
+@dataclass(frozen=True)
+class HandsFreeEvent(Event):
+    """Hands-free mode turned on/off, or its controller moved to another state (the switch, the
+    slim bar's menu entry and the title-bar status all follow this)."""
+    enabled: bool = False
+    state: HandsFreeState = "off"
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class ManualAdvanceEvent(Event):
+    """Manual advance toggled (the Manual switch next to Hands-free, ``[handsfree].manual``).
+    While on, nothing starts a model call by itself -- the transcript, screen reading, cumulative
+    context and auto-checkpoints keep running, and generation happens only on the press-and-hold
+    mouse gesture (left button: Text, middle button: Code) or a manual action. The switch, the
+    slim bar's menu entry and the settings dialog all follow this."""
+    enabled: bool = False
+
+
+# ---- assistant ---------------------------------------------------------------
+# auto: question heard in system audio; manual: hotkey/button; ask: typed question;
+# screen: question that appeared on screen; suggest: proactive suggestions from screen + transcript;
+# solve: autonomous "solve what is on screen"; complete: inline ghost-text completion at the caret;
+# explain: explanation of the finished solution once its code has been typed out (explanations on);
+# code: the "Code" button -- write the code for the task discussed / shown since the last checkpoint;
+# text: the "Text" button -- a plain-English walkthrough of that same task (what is asked, the key
+# insight, the approach, edge cases, complexity), the way an engineer talks it through before coding;
+# insights: the co-pilot's proactive (or on-demand) read of the session -- questions worth asking
+# right now and blind spots / follow-ups -- rendered in the Notes tab's Insights pane, never in the
+# Assist tab (see InsightsUpdatedEvent); recap: an on-demand "where are we" summary of the session
+AssistKind = Literal[
+    "auto", "manual", "ask", "screen", "suggest", "solve", "complete", "explain", "code", "text",
+    "insights", "recap",
+]
+
+
+@dataclass(frozen=True)
+class CheckpointEvent(Event):
+    """A checkpoint was set (the Checkpoint button / hotkey): the coding context -- what solve,
+    code and inline completions are built from -- starts fresh from here. The transcript, notes
+    and the ask box keep the whole meeting. `segment_id` is the last transcript segment BEFORE
+    the boundary (None when the transcript was empty); `t` is the session clock."""
+    t: float
+    segment_id: int | None = None
+
+
+@dataclass(frozen=True)
+class AssistStartedEvent(Event):
+    job_id: int
+    kind: AssistKind
+    question: str
+
+
+@dataclass(frozen=True)
+class AssistDeltaEvent(Event):
+    job_id: int
+    delta: str
+
+
+@dataclass(frozen=True)
+class AssistDoneEvent(Event):
+    job_id: int
+    text: str
+    ttft_s: float
+    tokens: int
+    tok_per_s: float
+    cancelled: bool = False
+    # The model answered with the skip marker ("(nothing to do)" -- prompts.SKIP_MARKER): the job
+    # finished, there was just nothing to show. Always paired with cancelled=True (nothing to
+    # render) so older consumers keep treating it as "no answer".
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class AssistErrorEvent(Event):
+    job_id: int
+    message: str
+
+
+@dataclass(frozen=True)
+class NotesUpdatedEvent(Event):
+    markdown: str
+    generated_at: float  # seconds since session start
+
+
+@dataclass(frozen=True)
+class NotesErrorEvent(Event):
+    message: str
+
+
+@dataclass(frozen=True)
+class InsightsUpdatedEvent(Event):
+    """The co-pilot's living insights document changed (a proactive pass or an on-demand request
+    finished): the current markdown bullet list of each section, "" when that section has no
+    items yet. A pass that refreshed only some sections carries the others unchanged, so a
+    consumer can always just replace what it shows. `auto` tells a background pass from one
+    the user asked for; `generated_at` is the session clock."""
+    questions: str = ""
+    blindspots: str = ""
+    generated_at: float = 0.0
+    auto: bool = False
+
+
+# ---- system ------------------------------------------------------------------
+Component = Literal["audio", "asr", "diarization", "llm", "session", "app", "completion"]
+ComponentState = Literal["loading", "ready", "error", "info", "busy"]
+
+
+@dataclass(frozen=True)
+class ComponentStatusEvent(Event):
+    component: Component
+    state: ComponentState
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class SessionEvent(Event):
+    kind: Literal["new", "saved", "exported"]
+    path: str = ""
+
+
+@dataclass(frozen=True)
+class AutoAssistChangedEvent(Event):
+    enabled: bool
+
+
+# ---- model manager (2026-09-27, portable-install) -----------------------------------------
+# The "Models..." window (exocortex/ui/models.py) drives the engine through EngineActions'
+# model_library / load_model / unload_model / delete_model / pull_model / search_models and hears
+# back through these three events (plus ComponentStatusEvent("llm", ...) for load/unload progress,
+# exactly like the status bar does). Every field is plain data so the dialog never touches the
+# library module or the network itself.
+PullState = Literal["queued", "downloading", "verifying", "done", "error", "cancelled"]
+
+
+@dataclass(frozen=True)
+class ModelPullEvent(Event):
+    """Progress of one whole-model pull (`pull_model`): `file` is the shard / projector being
+    streamed right now, `done_bytes` / `total_bytes` count the WHOLE pull (every file), `state`
+    moves queued -> downloading -> verifying -> done, or error / cancelled with `detail`."""
+    repo_id: str
+    state: PullState
+    file: str = ""
+    done_bytes: int = 0
+    total_bytes: int = 0
+    detail: str = ""
+    model_key: str = ""     # the library key once the pull is done (e.g. "unsloth/gemma-4-12b-it")
+
+
+@dataclass(frozen=True)
+class ModelLibraryEvent(Event):
+    """The library changed (a pull finished, a model was deleted, a profile was saved, the
+    loaded model changed): re-read `model_library()`. `reason` is for logs / a toast."""
+    reason: str = ""
+    loaded_key: str = ""    # the model llama-server currently serves ("" when nothing is loaded)
+
+
+@dataclass(frozen=True)
+class ModelSearchEvent(Event):
+    """The answer to `search_models(query, request_id)`: `results` are plain dicts (id, downloads,
+    likes, modified, gated) so a stale answer (an older `request_id`) can simply be dropped."""
+    request_id: int
+    query: str
+    results: tuple[dict[str, Any], ...] = ()
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ModelInfoEvent(Event):
+    """The answer to `inspect_model(repo_id, request_id)`: the repo's quant options and the one
+    `choose_quant` would pick for this machine, as plain dicts."""
+    request_id: int
+    repo_id: str
+    quants: tuple[dict[str, Any], ...] = ()
+    chosen: str = ""
+    architecture: str = ""
+    params: int | None = None
+    context_length: int | None = None
+    mmproj: bool = False
+    error: str = ""
+
+
+class EventBus:
+    """Fan-out bus: each subscriber owns a queue; publish copies the reference to all."""
+
+    def __init__(self) -> None:
+        self._subs: list[queue.Queue[Any]] = []
+        self._lock = threading.Lock()
+
+    def subscribe(self, maxsize: int = 0) -> "queue.Queue[Any]":
+        q: queue.Queue[Any] = queue.Queue(maxsize=maxsize)
+        with self._lock:
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: "queue.Queue[Any]") -> None:
+        with self._lock:
+            if q in self._subs:
+                self._subs.remove(q)
+
+    def publish(self, event: Event) -> None:
+        with self._lock:
+            subs = list(self._subs)
+        for q in subs:
+            try:
+                q.put_nowait(event)
+            except queue.Full:
+                # drop oldest to keep the consumer alive
+                try:
+                    q.get_nowait()
+                    q.put_nowait(event)
+                except queue.Empty:
+                    pass
+                except queue.Full:
+                    pass
+
+
+def drain(q: "queue.Queue[Any]", max_items: int = 200) -> list[Any]:
+    """Non-blocking drain used by pollers (the UI timer)."""
+    out: list[Any] = []
+    for _ in range(max_items):
+        try:
+            out.append(q.get_nowait())
+        except queue.Empty:
+            break
+    return out

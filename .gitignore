@@ -1,0 +1,28 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# --- run.bat's private Python bootstrap (uv + the interpreter it installs), used only when no
+# --- system Python 3.11-3.13 is found ---
+.tools/
+
+# --- Local config (template: config.example.toml) ---
+config.toml
+
+# --- Model weights (auto-downloaded by exocortex/models_dl.py) ---
+models/*.onnx
+models/*.part
+# --- sherpa-onnx ASR model bundles (2026-09-26 asr-sherpa; ensure_sherpa_model() extracts each
+# --- one's .tar.bz2 into its own models/<name>/ directory, e.g. models/parakeet-tdt-0.6b-v2-int8/) ---
+models/*/
+
+# --- Debug / scratch artifacts ---
+*.out
+.wda_*
+.stealth_*
+# --- OpenVINO compiled-kernel cache for RapidOCR on the iGPU / NPU (exocortex/screen/ocr.py) ---
+models/ov_cache/

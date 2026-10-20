@@ -1,0 +1,8 @@
+# NVIDIA-only extra: CUDA/cuDNN wheels faster-whisper needs to run Whisper on the GPU (CUDA
+# float16). Installed by run.bat only when `exocortex.gpu --vendor` prints "nvidia" -- on AMD or
+# Intel machines these are ~1 GB of downloads that nothing on the machine can use, so they were
+# split out of requirements.txt (the vendor-neutral core) into this file.
+#
+# Verified on Windows 11 / Python 3.12 / RTX 5080 Laptop on 2026-09-20
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.26.0.51

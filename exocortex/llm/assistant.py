@@ -183,7 +183,18 @@ _CANCELS: dict[str, tuple[str, ...]] = {
     "complete": ("complete",),
     "recap": ("recap",),
     "insights": ("insights",),
+    "dashboard": ("dashboard",),
 }
+
+#: Kinds whose SYSTEM prompt carries the installed Claude Code toolkit's catalog (<toolkit>,
+#: exocortex.context) when `[context].toolkit_in_answers` is on; "dashboard" builds its own.
+_TOOLKIT_KINDS: frozenset[str] = frozenset({"ask", "auto", "manual", "screen", "recap", "text", "code", "solve", "suggest", "insights"})
+#: Kinds whose USER turn gets the on-demand <repo> / <toolkit_detail> lookups (the question, the
+#: tail of the transcript and the screen name the identifiers searched for).
+_LOOKUP_KINDS: frozenset[str] = frozenset({"ask", "auto", "manual", "screen", "recap", "text", "code", "solve"})
+#: File-scan budget of one repo lookup made for an answer (a spoken question must stay snappy);
+#: the dashboard refresh uses its own, longer budget.
+_LOOKUP_BUDGET_S = 0.8
 
 _T = TypeVar("_T")
 
@@ -424,6 +435,7 @@ class Assistant:
         self._recap_slot: _JobSlot[_AssistJob] = _JobSlot()       # recap lane: the Recap action ("where are we")
         self._explain_slot: _JobSlot[_AssistJob] = _JobSlot()     # explain lane: explanation of the finished solution
         self._insight_slot: _JobSlot[_AssistJob] = _JobSlot()     # insight lane: questions to ask / blind spots
+        self._dashboard_slot: _JobSlot[_AssistJob] = _JobSlot()   # dashboard lane: a refresh of the tracked board (exocortex.dashboard)
         self._complete_slot: _JobSlot[_AssistJob] = _JobSlot()    # completion lane: inline completions (lowest priority)
         self._notes_slot: _JobSlot[_NotesJob] = _JobSlot()
 
@@ -481,6 +493,15 @@ class Assistant:
         self._insights_seg_id: int | None = None
         self._insights_screen_lines: set[str] = set()
         self._insights_lock = threading.Lock()
+
+        #: Dashboard mode (exocortex.dashboard, 2026-10-20): the DashboardService's hooks that
+        #: BUILD a "dashboard" job's prompt from its store and SETTLE the result (None = no
+        #: dashboard wired: `dashboard_now` refuses, and the Notes-tab insights passes run as
+        #: before). And the on-demand context provider (exocortex.context.provider) that adds the
+        #: installed toolkit's catalog and repository lookups to the other kinds' prompts.
+        self._dashboard_build: Callable[..., tuple[str, str, int]] | None = None
+        self._dashboard_settle: Callable[..., None] | None = None
+        self._context_provider: Any = None
 
         self._auto_enabled = cfg.assist.auto_answer_questions
         #: Global pause for all *automatic* assist activity (auto-answer, screen questions,
@@ -751,6 +772,137 @@ class Assistant:
         with self._insights_lock:
             current = dict(self._insights)
         return prompts.render_insights(current, skip_empty=False) if current else ""
+
+    def replace_insights(self, sections: dict[str, str], *, auto: bool = False) -> bool:
+        """Set the insights document from outside -- the dashboard mirrors its open questions and
+        blind spots here while it tracks them (`exocortex.dashboard.service`), so the Notes tab's
+        Insights pane and the session's insights.md keep working. Publishes an
+        `InsightsUpdatedEvent` when a section actually changed; returns whether one did."""
+        changed = False
+        with self._insights_lock:
+            for section in prompts.INSIGHT_SECTIONS:
+                if section not in sections:
+                    continue
+                body = (sections.get(section) or "").strip()
+                if self._insights.get(section, "") != body:
+                    self._insights[section] = body
+                    changed = True
+            snapshot = dict(self._insights)
+        if changed:
+            self._bus.publish(InsightsUpdatedEvent(
+                questions=snapshot.get("questions", ""), blindspots=snapshot.get("blindspots", ""),
+                generated_at=self._clock(), auto=auto,
+            ))
+        return changed
+
+    # ---- the dashboard lane (exocortex.dashboard, 2026-10-20) --------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        """Whether `start()` has run (and `stop()` has not): the workers drain the lanes."""
+        return bool(self._threads)
+
+    def set_dashboard_hooks(
+        self,
+        build: Callable[..., tuple[str, str, int]] | None,
+        settle: Callable[..., None] | None,
+    ) -> None:
+        """Wire the dashboard service: `build(job, screen_text, until_id)` returns the (system,
+        user, max_tokens) of a "dashboard" job; `settle(job, ok=..., text=..., until_id=...,
+        screen_text=...)` is told how it ended (`ok` False: cancelled / failed, nothing to apply).
+        Both run on the assist-worker thread."""
+        self._dashboard_build = build
+        self._dashboard_settle = settle
+
+    def dashboard_tracking(self) -> bool:
+        """Whether the dashboard's background refreshes replace the insights passes: a service
+        is wired and `[dashboard].track` is on (read live)."""
+        dashboard = getattr(self._cfg, "dashboard", None)
+        return self._dashboard_build is not None and bool(getattr(dashboard, "track", False))
+
+    def dashboard_now(self, *, auto: bool = False, sections: Sequence[str] = ()) -> int | None:
+        """Queue one dashboard refresh (kind "dashboard") on its own lane; the job id, or None
+        when no dashboard is wired or a background pass found an on-demand request queued.
+
+        On demand (`auto=False`): supersedes a running or queued dashboard job (latest wins) but
+        never cancels any other job; works while paused. Background (`auto=True`): only takes an
+        empty slot or one holding another background refresh, and is cancelled by any other job
+        submitted while it runs (`_preempt_auto_insights`); the service retries it later."""
+        if self._dashboard_build is None:
+            return None
+        secs = tuple(str(s) for s in (sections or ()) if str(s).strip())
+        label = "Dashboard refresh" + (f": {', '.join(secs)}" if secs else "")
+        job = _AssistJob(id=next(self._job_ids), kind="dashboard", question=label, cancel=threading.Event(),
+                         sections=secs, auto=auto)
+        if auto:
+            if not self._dashboard_slot.put_if(job, lambda queued: queued.auto):
+                return None
+        else:
+            self._cancel_running_of(_CANCELS["dashboard"])
+            self._dashboard_slot.put(job)
+        log.debug("assistant: submitted %s dashboard job %d: %s", "auto" if auto else "manual", job.id, secs or "all")
+        return job.id
+
+    def _dashboard_prompt(self, job: _AssistJob, screen_text: str, until_id: int | None) -> tuple[str, str, int]:
+        build = self._dashboard_build
+        if build is None:
+            raise LLMError("the dashboard is not wired (no DashboardService)")
+        return build(job, screen_text, until_id)
+
+    def _settle_dashboard(
+        self, job: _AssistJob, *, ok: bool, text: str = "", until_id: int | None = None, screen_text: str = "",
+    ) -> None:
+        """Tell the dashboard service how a "dashboard" job ended (a no-op for every other kind)."""
+        if job.kind != "dashboard":
+            return
+        settle = self._dashboard_settle
+        if settle is None:
+            return
+        try:
+            settle(job, ok=ok, text=text, until_id=until_id, screen_text=screen_text)
+        except Exception:  # noqa: BLE001 - the service's own bug must never kill the worker
+            log.exception("assistant: dashboard settle hook failed for job %d", job.id)
+
+    # ---- on-demand context (exocortex.context, 2026-10-20) ------------------------------------
+
+    def set_context_provider(self, provider: Any) -> None:
+        """Register (or with None, clear) the `exocortex.context.provider.ContextProvider` whose
+        `toolkit_block()` joins the system prompt of answers and `repo_block()` /
+        `toolkit_lookup()` the user turn (`_TOOLKIT_KINDS` / `_LOOKUP_KINDS`). Called on the
+        assist-worker thread once per job, never from here."""
+        self._context_provider = provider
+
+    def _toolkit_system_suffix(self, kind: str) -> str:
+        """The <toolkit> catalog (with its standing rule) to append to a system prompt, or ""."""
+        provider = self._context_provider
+        context_cfg = getattr(self._cfg, "context", None)
+        if provider is None or kind not in _TOOLKIT_KINDS or not getattr(context_cfg, "toolkit_in_answers", False):
+            return ""
+        try:
+            block = provider.toolkit_block() or ""
+        except Exception:  # noqa: BLE001 - context is optional, never a reason to fail an answer
+            log.exception("assistant: toolkit_block() failed")
+            return ""
+        return f"\n{prompts.TOOLKIT_RULE}\n{block}" if block.strip() else ""
+
+    def _context_extra(self, job: _AssistJob, window: str, screen_text: str) -> str:
+        """The on-demand blocks for a user turn: lines from the repository matching the names
+        the question / recent transcript / screen mention, and the full text of a toolkit part
+        that was mentioned. "" when there is no provider, nothing to look up or nothing found."""
+        provider = self._context_provider
+        if provider is None or job.kind not in _LOOKUP_KINDS:
+            return ""
+        tail = window[-600:] if window else ""
+        context_cfg = getattr(self._cfg, "context", None)
+        try:
+            repo = provider.repo_block(job.question, job.focus, tail, screen_text, time_budget_s=_LOOKUP_BUDGET_S) or ""
+            detail = ""
+            if getattr(context_cfg, "toolkit_in_answers", False):
+                detail = provider.toolkit_lookup(job.question, job.focus, tail) or ""
+        except Exception:  # noqa: BLE001
+            log.exception("assistant: context lookup failed for job %d", job.id)
+            return ""
+        return "\n\n".join(part for part in (repo.strip(), detail.strip()) if part)
 
     def complete(self, prefix: str, suffix: str, field: str) -> int:
         """Queue an inline completion (kind "complete") for text ending at the caret; returns the
@@ -1158,7 +1310,7 @@ class Assistant:
         """Every assist-worker lane, highest priority first."""
         return (
             self._assist_slot, self._suggest_slot, self._text_slot, self._recap_slot, self._explain_slot,
-            self._insight_slot, self._complete_slot,
+            self._insight_slot, self._dashboard_slot, self._complete_slot,
         )
 
     def _assist_worker_loop(self) -> None:
@@ -1201,8 +1353,9 @@ class Assistant:
     def _run_assist_job(self, job: _AssistJob) -> None:
         """Build the prompt once, stream the answer, and publish Started/Delta/Done/Error."""
         self._bus.publish(AssistStartedEvent(job_id=job.id, kind=job.kind, question=job.question))
-        if job.kind == "insights":
+        if job.kind in ("insights", "dashboard"):
             job.started = self._clock()
+        if job.kind == "insights":
             with self._insights_lock:
                 self._insights_last_start = job.started
 
@@ -1228,6 +1381,7 @@ class Assistant:
             log.debug("assist job %d (%s) cancelled before streaming started", job.id, job.kind)
             self._settle_plan_state(job, is_plan, "", keep=False)
             self._settle_insights(job, ok=False)
+            self._settle_dashboard(job, ok=False)
             self._bus.publish(
                 AssistDoneEvent(job_id=job.id, text="", ttft_s=0.0, tokens=0, tok_per_s=0.0, cancelled=True)
             )
@@ -1244,18 +1398,29 @@ class Assistant:
         assistant_prefix: str | None = None
         temperature: float | None = None
         choices, choices_on_screen = self._detect_choices(job, screen_text)
-        if job.kind == "complete":
-            system, user, max_tokens, assistant_prefix, temperature = self._complete_prompt_parts(job, window, screen_text)
-        else:
-            # The annotated copies exist only for the prompt: every screen-line fingerprint (plan
-            # matching, suggest throttling, screen-question de-dup) keeps comparing raw OCR text.
-            prompt_screen, prompt_question = screen_text, job.question
-            if choices is not None:
-                if choices_on_screen:
-                    prompt_screen = annotate_choices(screen_text, choices)
-                else:
-                    prompt_question = annotate_choices(job.question, choices)
-            system, user, max_tokens = self._build_prompt_parts(job, window, prompt_screen, choices, prompt_question)
+        try:
+            if job.kind == "complete":
+                system, user, max_tokens, assistant_prefix, temperature = self._complete_prompt_parts(job, window, screen_text)
+            else:
+                # The annotated copies exist only for the prompt: every screen-line fingerprint (plan
+                # matching, suggest throttling, screen-question de-dup) keeps comparing raw OCR text.
+                prompt_screen, prompt_question = screen_text, job.question
+                if choices is not None:
+                    if choices_on_screen:
+                        prompt_screen = annotate_choices(screen_text, choices)
+                    else:
+                        prompt_question = annotate_choices(job.question, choices)
+                system, user, max_tokens = self._build_prompt_parts(
+                    job, window, prompt_screen, choices, prompt_question, until_id=until_id,
+                )
+        except Exception as exc:  # noqa: BLE001 - a prompt that cannot be built (a dashboard / context
+            # hook raising) is this job's error, never a dead worker or a job without its Done
+            log.error("assist job %d (%s): building the prompt failed: %s", job.id, job.kind, exc, exc_info=True)
+            self._settle_plan_state(job, is_plan, "", keep=False)
+            self._settle_insights(job, ok=False)
+            self._settle_dashboard(job, ok=False)
+            self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
+            return
 
         start_wall = time.monotonic()
         delta_count = 0
@@ -1282,6 +1447,7 @@ class Assistant:
             log.error("assist job %d (%s) failed: %s", job.id, job.kind, exc, exc_info=True)
             self._settle_plan_state(job, is_plan, "", keep=False)
             self._settle_insights(job, ok=False)
+            self._settle_dashboard(job, ok=False)
             self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
             self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
             return
@@ -1289,6 +1455,7 @@ class Assistant:
             log.error("assist job %d (%s) failed unexpectedly: %s", job.id, job.kind, exc, exc_info=True)
             self._settle_plan_state(job, is_plan, "", keep=False)
             self._settle_insights(job, ok=False)
+            self._settle_dashboard(job, ok=False)
             self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
             return
 
@@ -1298,6 +1465,7 @@ class Assistant:
             self._settle_plan_state(job, is_plan, "", keep=False)
             # Nothing to add is still a completed pass: the same material is not re-sent next tick.
             self._settle_insights(job, ok=True, until_id=until_id, screen_text=screen_text)
+            self._settle_dashboard(job, ok=True, text="", until_id=until_id, screen_text=screen_text)
             self._bus.publish(AssistDoneEvent(job_id=job.id, text="", ttft_s=0.0, tokens=0, tok_per_s=0.0,
                                               cancelled=True, skipped=True))
             return
@@ -1322,12 +1490,13 @@ class Assistant:
         # Before the Done event, so the Insights pane already holds the new lists when its
         # streaming preview ends.
         self._settle_insights(job, ok=not cancelled, text=text, until_id=until_id, screen_text=screen_text)
+        self._settle_dashboard(job, ok=not cancelled, text=text, until_id=until_id, screen_text=screen_text)
         self._bus.publish(
             AssistDoneEvent(
                 job_id=job.id, text=final_text, ttft_s=ttft_s, tokens=tokens, tok_per_s=tok_per_s, cancelled=cancelled
             )
         )
-        if not cancelled and final_text.strip() and job.kind not in ("complete", "insights"):
+        if not cancelled and final_text.strip() and job.kind not in ("complete", "insights", "dashboard"):
             if job.kind == "suggest":
                 with self._suggestions_lock:
                     self._suggestions.append((self._clock(), final_text))
@@ -1366,7 +1535,7 @@ class Assistant:
         otherwise look like a fork -- see `prompts.system_code`) or "text" (a walkthrough reasons
         its way to an answer in prose; the two-sentence verdict shape would cut it short).
         """
-        if job.kind in ("suggest", "explain", "complete", "code", "text", "insights", "recap"):
+        if job.kind in ("suggest", "explain", "complete", "code", "text", "insights", "recap", "dashboard"):
             return None, False
         if job.question and job.kind != "solve":
             cs = find_choices(job.question, typed=True)
@@ -1408,14 +1577,35 @@ class Assistant:
 
     def _build_prompt_parts(
         self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
-        question: str | None = None,
+        question: str | None = None, until_id: int | None = None,
     ) -> tuple[str, str, int]:
         """System/user prompt text and the token budget for one job.
+
+        A "dashboard" job's prompt comes from the dashboard service's hook (`_dashboard_prompt`:
+        the board's open items, the transcript up to `until_id`, the context lookups). Every
+        other kind is built by `_build_prompt_parts_base` and then, through the context
+        provider (2026-10-20): the installed toolkit's catalog is appended to the system prompt
+        (`_toolkit_system_suffix`, config-stable, so it stays a cached prefix) and the on-demand
+        repository / toolkit-detail lookups go into the user turn (`_context_extra`).
+        """
+        if job.kind == "dashboard":
+            return self._dashboard_prompt(job, screen_text, until_id)
+        extra = self._context_extra(job, window, screen_text)
+        system, user, max_tokens = self._build_prompt_parts_base(job, window, screen_text, choices, question, extra=extra)
+        suffix = self._toolkit_system_suffix(job.kind)
+        return (system + suffix if suffix else system), user, max_tokens
+
+    def _build_prompt_parts_base(
+        self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
+        question: str | None = None, extra: str = "",
+    ) -> tuple[str, str, int]:
+        """System/user prompt text and the token budget for one job (every kind but "dashboard").
 
         `choices` (a detected multiple-choice option set) adds the <choices> block to the
         question-answering prompts and `CHOICES_TOKEN_HEADROOM` to their budget, so the verdict
         line never has to compete with the answer's own shape for tokens; `question` replaces
-        `job.question` in the prompt (its annotated copy) and defaults to it.
+        `job.question` in the prompt (its annotated copy) and defaults to it; `extra` is the
+        on-demand context the user turn carries after the screen block (`prompts._extra_block`).
         """
         block = choices_block(choices) if choices is not None else ""
         headroom = CHOICES_TOKEN_HEADROOM if choices is not None else 0
@@ -1423,7 +1613,7 @@ class Assistant:
         context = self._cfg.assist.session_context
         if job.kind == "ask":
             system = prompts.system_ask(self._cfg.assist.persona, context)
-            user = prompts.user_ask(window, q, screen_text, block)
+            user = prompts.user_ask(window, q, screen_text, block, extra=extra)
             return system, user, self._cfg.llm.ask_max_tokens + headroom
         if job.kind == "solve":
             ex = self._cfg.explain
@@ -1433,7 +1623,7 @@ class Assistant:
                 language=self._cfg.assist.primary_language,
                 libraries=self._cfg.assist.libraries, context=context,
             )
-            user = prompts.user_solve(window, screen_text, job.focus, block)
+            user = prompts.user_solve(window, screen_text, job.focus, block, extra=extra)
             return system, user, self._code_budget(ex.enabled, level) + headroom
         if job.kind == "code":
             ex = self._cfg.explain
@@ -1443,11 +1633,11 @@ class Assistant:
                 language=self._cfg.assist.primary_language,
                 libraries=self._cfg.assist.libraries, context=context,
             )
-            user = prompts.user_code(window, screen_text, self._previous_code_text(), job.focus)
+            user = prompts.user_code(window, screen_text, self._previous_code_text(), job.focus, extra=extra)
             return system, user, self._code_budget(ex.enabled, level) + headroom
         if job.kind == "text":
             system = prompts.system_text(self._cfg.assist.persona, context)
-            user = prompts.user_text(window, screen_text, self._previous_code_text(), job.focus)
+            user = prompts.user_text(window, screen_text, self._previous_code_text(), job.focus, extra=extra)
             return system, user, self._cfg.llm.text_max_tokens
         if job.kind == "explain":
             with self._plan_lock:
@@ -1474,11 +1664,11 @@ class Assistant:
             with self._notes_lock:
                 notes = self._notes_markdown
             system = prompts.system_recap(self._cfg.assist.persona, context)
-            user = prompts.user_recap(window, notes, screen_text, job.focus)
+            user = prompts.user_recap(window, notes, screen_text, job.focus, extra=extra)
             return system, user, self._cfg.llm.recap_max_tokens
         # "auto", "manual", "screen"
         system = prompts.system_assist(self._cfg.assist.persona, self._cfg.assist.style, context)
-        user = prompts.user_assist(window, q, screen_text, block)
+        user = prompts.user_assist(window, q, screen_text, block, extra=extra)
         return system, user, self._cfg.llm.assist_max_tokens + headroom
 
     def _code_budget(self, explain: bool, level: str) -> int:
@@ -1548,7 +1738,7 @@ class Assistant:
             wants_screen = self._cfg.completion.use_screen
         else:
             wants_screen = (
-                job.kind in ("suggest", "screen", "solve", "code", "text", "explain", "insights", "recap")
+                job.kind in ("suggest", "screen", "solve", "code", "text", "explain", "insights", "recap", "dashboard")
                 or self._cfg.screen.use_in_answers
             )
         max_chars = self._cfg.screen.max_text_chars
@@ -1951,13 +2141,15 @@ class Assistant:
         insights job is left alone."""
         with self._current_lock:
             job = self._current_job
-            if job is not None and job.kind == "insights" and job.auto:
+            if job is not None and job.kind in ("insights", "dashboard") and job.auto:
                 job.cancel.set()
 
     def _drop_auto_insights(self) -> None:
-        """Pause / completion mode: cancel a running background pass and drop a queued one."""
+        """Pause / completion mode: cancel a running background pass (insights or a dashboard
+        refresh) and drop a queued one."""
         self._preempt_auto_insights()
         self._insight_slot.remove_if(lambda queued: queued.auto)
+        self._dashboard_slot.remove_if(lambda queued: queued.auto)
 
     def _auto_insight_sections(self) -> tuple[str, ...]:
         """The sections background passes refresh, per `[assist].suggest_questions` /
@@ -1975,7 +2167,12 @@ class Assistant:
         manual advance), and there is something new to look at -- `insight_min_new_words` of
         speech since the last completed pass, or a screen that changed substantially since then
         (`INSIGHT_SCREEN_JACCARD`, at least `INSIGHT_MIN_SCREEN_LINES` lines): the driver writing
-        code in silence still gets blind spots on it."""
+        code in silence still gets blind spots on it.
+
+        Never while the dashboard tracks the session (`dashboard_tracking`): its refreshes cover
+        the same questions and blind spots and mirror them into the insights document."""
+        if self.dashboard_tracking():
+            return False
         sections = self._auto_insight_sections()
         if not sections:
             return False

@@ -25,6 +25,8 @@ from exocortex.bus import (
     AssistStartedEvent,
     CheckpointEvent,
     ComponentStatusEvent,
+    DashboardModeEvent,
+    DashboardUpdatedEvent,
     Event,
     EventBus,
     FinalTranscriptEvent,
@@ -170,6 +172,8 @@ class Engine(EngineActions):
         self.screen: Any = None          # ScreenReader
         self.completer: Any = None       # Completer (completion mode)
         self.handsfree: Any = None       # HandsFreeController (hands-free mode), created on first use
+        self.context: Any = None         # exocortex.context.provider.ContextProvider (toolkit catalog, repo lookups)
+        self.dashboard: Any = None       # exocortex.dashboard.service.DashboardService (the tracked board)
         self._models_cache: list[str] = []
         # 2026-09-27 (portable-install): the model manager's one-at-a-time Hub pull ("model-pull"
         # thread) and its cancel flag; stop() sets the flag and joins briefly so a quit mid-pull
@@ -223,6 +227,8 @@ class Engine(EngineActions):
         self.recorder = SessionRecorder(cfg, self.bus, self.transcript, self.assistant)
         folder = self.recorder.start()
         log.info("session folder: %s", folder)
+        self._init_context()
+        self._init_dashboard(folder)
 
         self._llm_thread = threading.Thread(target=self._init_llm, name="llm-init", daemon=True)
         self._llm_thread.start()
@@ -234,6 +240,47 @@ class Engine(EngineActions):
             self.set_completion_mode(True)
         if cfg.handsfree.enabled:
             self.set_hands_free(True)
+        if cfg.dashboard.enabled:
+            self.bus.publish(DashboardModeEvent(enabled=True))   # the overlay opens on the board
+
+    def _init_context(self) -> None:
+        """The on-demand context provider (2026-10-20): the Claude Code toolkit discovered in
+        [context].repo_root and the repository lookups, handed to the assistant (answers, ask,
+        recap) and to the dashboard service. Never blocks start(): a failure just leaves prompts
+        without it."""
+        try:
+            from exocortex.context.provider import ContextProvider
+
+            self.context = ContextProvider(self.cfg, self.clock)
+            if self.assistant is not None and hasattr(self.assistant, "set_context_provider"):
+                self.assistant.set_context_provider(self.context)
+            summary = self.context.toolkit_summary()
+            if summary:
+                log.info("context: Claude Code toolkit found: %s", summary)
+                self._status("context", "info", f"Claude Code toolkit: {summary}")
+        except Exception as e:  # noqa: BLE001
+            log.exception("context provider failed to start")
+            self.context = None
+            self._status("app", "info", f"context lookups unavailable: {e}")
+
+    def _init_dashboard(self, folder: Path | None) -> None:
+        """The dashboard service (2026-10-20): the tracked board's store (in the session folder
+        while [dashboard].persist is on) and its refresh timer. Its background refreshes replace
+        the assistant's insights passes while [dashboard].track is on."""
+        try:
+            from exocortex.dashboard.service import DashboardService
+
+            self.dashboard = DashboardService(
+                self.cfg, self.bus, self.transcript, self.assistant, self.clock, context=self.context,
+                screen_provider=lambda: self.screen.latest_text if self.screen is not None else "",
+                folder=folder if self.cfg.dashboard.persist else None,
+            )
+            self.dashboard.set_paused(self._paused)
+            self.dashboard.start()
+        except Exception as e:  # noqa: BLE001
+            log.exception("dashboard service failed to start")
+            self.dashboard = None
+            self._status("dashboard", "error", f"dashboard unavailable: {e}")
 
     def _start_gpu_guard(self) -> None:
         """The GPU pressure guard (exocortex.gpu): turns a sustained free-VRAM collapse -- the
@@ -402,6 +449,9 @@ class Engine(EngineActions):
                 self.assistant.insights_now(tuple(s for s in text.split(",") if s) or None)
             elif kind == "recap":
                 self.assistant.recap()
+            elif kind == "dashboard":
+                if self.dashboard is not None:
+                    self.dashboard.refresh_now(tuple(s for s in text.split(",") if s))
         if self._completion_wanted and self.completer is None and not self._stopped.is_set():
             self._completion_wanted = False
             self.set_completion_mode(True)
@@ -554,8 +604,8 @@ class Engine(EngineActions):
         if self._pull_thread is not None and self._pull_thread.is_alive():
             self._pull_thread.join(timeout=2.0)    # polled per 64 KiB chunk: returns within a chunk
         for name, comp in (("hands-free", self.handsfree), ("completer", self.completer), ("screen", self.screen),
-                           ("pipeline", self.pipeline), ("assistant", self.assistant), ("recorder", self.recorder),
-                           ("llama-server", self.server)):
+                           ("pipeline", self.pipeline), ("dashboard", self.dashboard), ("assistant", self.assistant),
+                           ("recorder", self.recorder), ("llama-server", self.server)):
             if comp is None:
                 continue
             try:
@@ -683,6 +733,14 @@ class Engine(EngineActions):
         self._t0 = time.monotonic()
         if self.recorder:
             self.recorder.start()
+        if self.dashboard is not None:
+            folder = None
+            if self.recorder is not None and self.cfg.dashboard.persist:
+                try:
+                    folder = self.recorder.folder
+                except Exception:  # noqa: BLE001 - a recorder that did not start: keep the board in memory
+                    folder = None
+            self.dashboard.reset(folder)
         self._status("session", "info", "new session")
         if self.completer is not None and self.cfg.explain.enabled and self._llm_ready.is_set()                 and hasattr(self.assistant, "ensure_plan"):
             self.assistant.ensure_plan()   # completion mode follows the plan: rebuild it for what is on screen
@@ -740,8 +798,13 @@ class Engine(EngineActions):
 
     # ---- co-pilot insights / recap (pair programming, 2026-10-20) ----
     def insights_now(self, sections: tuple[str, ...] = ()) -> None:
-        """`EngineActions.insights_now`; deferred (latest request wins) while the LLM starts."""
+        """`EngineActions.insights_now`; deferred (latest request wins) while the LLM starts.
+        While the dashboard tracks the session ([dashboard].track) it refreshes the dashboard
+        instead -- the same questions and blind spots, mirrored into the Insights pane."""
         secs = tuple(str(s) for s in (sections or ()) if str(s).strip())
+        if self.dashboard is not None and self.cfg.dashboard.track:
+            self.dashboard_refresh(secs)
+            return
         if self.assistant is not None and hasattr(self.assistant, "insights_now") \
                 and not self._defer("insights", ",".join(secs)):
             self.assistant.insights_now(secs or None)
@@ -770,6 +833,32 @@ class Engine(EngineActions):
         self.cfg.assist.session_context = " ".join(str(text or "").split())
         log.info("session context %s", "set" if self.cfg.assist.session_context else "cleared")
 
+    # ---- dashboard mode (2026-10-20) ----
+    def set_dashboard_mode(self, enabled: bool) -> None:
+        """`EngineActions.set_dashboard_mode`: the view's switch ([dashboard].enabled, persisted
+        with the config); the overlay follows the event. The tracking runs regardless."""
+        self.cfg.dashboard.enabled = bool(enabled)
+        self.bus.publish(DashboardModeEvent(enabled=bool(enabled)))
+        log.info("dashboard mode %s", "on" if enabled else "off")
+
+    def dashboard_refresh(self, sections: tuple[str, ...] = ()) -> None:
+        """`EngineActions.dashboard_refresh`; deferred (latest request wins) while the LLM starts."""
+        secs = tuple(str(s) for s in (sections or ()) if str(s).strip())
+        if self.dashboard is None:
+            self._status("dashboard", "error", "dashboard unavailable")
+            return
+        if self._defer("dashboard", ",".join(secs)):
+            return
+        self.dashboard.refresh_now(secs)
+
+    def dashboard_item(self, item_id: int, action: str, text: str = "") -> None:
+        if self.dashboard is not None:
+            self.dashboard.item_action(int(item_id), str(action), str(text or ""))
+
+    def dashboard_add(self, kind: str, text: str) -> None:
+        if self.dashboard is not None:
+            self.dashboard.add_item(str(kind), str(text))
+
     def set_auto_suggest(self, enabled: bool) -> None:
         self.cfg.screen.auto_suggest = enabled
 
@@ -787,6 +876,8 @@ class Engine(EngineActions):
             self.completer.set_paused(paused)
         if self.handsfree is not None:
             self.handsfree.set_paused(paused)
+        if self.dashboard is not None:
+            self.dashboard.set_paused(paused)
         self._status("app", "info", "paused" if paused else "listening")
 
     # ---- hands-free mode ----
@@ -901,6 +992,12 @@ class Engine(EngineActions):
                           ("answers", "use_answers"), ("notes", "use_notes")):
             if key in sources:
                 setattr(cc, attr, bool(sources[key]))
+        # 2026-10-20: the same menu switches the on-demand lookups (exocortex.context) -- the
+        # repository search and the toolkit catalog that answers and the dashboard get.
+        if "repo" in sources:
+            self.cfg.context.repo_search = bool(sources["repo"])
+        if "toolkit" in sources:
+            self.cfg.context.toolkit_in_answers = bool(sources["toolkit"])
         if hint is not None:
             cc.hint = hint.strip()
         if self.completer is not None:
@@ -946,6 +1043,17 @@ class Engine(EngineActions):
         if "handsfree.manual" in changed:
             self.set_manual_advance(bool(changed["handsfree.manual"]))   # publishes the sync event
         # every other [handsfree] value is read live by the controller on its next evaluation
+        if any(k.startswith("context.") for k in changed) and self.context is not None:
+            try:
+                self.context.reconfigure()      # a new repo root / toolkit dir: re-index, rescan now
+                summary = self.context.toolkit_summary()
+                self._status("context", "info",
+                             f"Claude Code toolkit: {summary}" if summary else "no Claude Code toolkit found")
+            except Exception:  # noqa: BLE001
+                log.exception("context reconfigure failed")
+        if "dashboard.enabled" in changed:
+            self.set_dashboard_mode(bool(changed["dashboard.enabled"]))   # publishes the sync event
+        # every other [dashboard] value is read live by the service on its next tick / refresh
         self.save_config()
         log.info("settings applied: %s", ", ".join(sorted(changed)))
 
@@ -1374,7 +1482,8 @@ def _run_headless(cfg: Config, duration_s: float = 0.0) -> int:
     engine.start()
     deadline = time.monotonic() + duration_s if duration_s > 0 else None
     print("ExoCortex headless. Ctrl+C to stop. Type a question + Enter to ask; "
-          "/questions, /blindspots, /insights, /recap, /notes, /code, /text.", flush=True)
+          "/questions, /blindspots, /insights, /recap, /notes, /code, /text, /refresh (the dashboard), "
+          "/dashboard (print it).", flush=True)
     from exocortex.llm.prompts import render_insights
 
     def _stdin_loop() -> None:
@@ -1394,6 +1503,10 @@ def _run_headless(cfg: Config, duration_s: float = 0.0) -> int:
                 engine.recap()
             elif line in ("/insights", "/questions", "/blindspots"):
                 engine.insights_now({"/questions": ("questions",), "/blindspots": ("blindspots",)}.get(line, ()))
+            elif line == "/refresh":
+                engine.dashboard_refresh()
+            elif line == "/dashboard":
+                print(engine.dashboard.markdown() if engine.dashboard is not None else "(no dashboard)", flush=True)
             elif line in ("/handsfree", "/handsfree on", "/handsfree off"):
                 engine.set_hands_free(line.endswith("on") or (line == "/handsfree" and not cfg.handsfree.enabled))
             elif line:
@@ -1425,6 +1538,9 @@ def _run_headless(cfg: Config, duration_s: float = 0.0) -> int:
                 elif isinstance(ev, InsightsUpdatedEvent):
                     body = render_insights({"questions": ev.questions, "blindspots": ev.blindspots}) or "(no open items)"
                     print(f"\n===== INSIGHTS =====\n{body}\n====================\n", flush=True)
+                elif isinstance(ev, DashboardUpdatedEvent):
+                    open_count = sum(1 for item in ev.items if item.status == "open")
+                    print(f"[dashboard] {ev.detail or 'updated'}: {open_count} open item(s)", flush=True)
                 elif isinstance(ev, CheckpointEvent):
                     print(f"[checkpoint] coding context reset (segment {ev.segment_id})", flush=True)
                 elif isinstance(ev, HandsFreeEvent):

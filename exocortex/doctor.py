@@ -789,6 +789,56 @@ def _check_completion(r: _Report, cfg: Config) -> None:
                 + (" - starts in completion mode" if cfg.completion.enabled else ""))
 
 
+def _check_context(r: _Report, cfg: Config) -> None:
+    """2026-10-20: the repository root ([context].repo_root), the Claude Code toolkit discovered
+    in it (exocortex.context.toolkit) and the dashboard's tracking settings."""
+    r.section("Context: repository, Claude Code toolkit, dashboard")
+    c, d = cfg.context, cfg.dashboard
+    root = (c.repo_root or "").strip()
+    if not root:
+        r.line(_WARN, "[context].repo_root not set: no repository lookups and no toolkit discovery "
+                      "(Settings > Context > Repository root)")
+    else:
+        p = Path(root).expanduser()
+        if p.is_dir():
+            r.line(_OK, f"repo root: {p} (lookups {'on' if c.repo_search else 'off'}: "
+                        f"{c.repo_max_files} files / {c.repo_max_chars} chars per lookup, on mention only)")
+        else:
+            r.line(_FAIL, f"[context].repo_root does not exist: {p}")
+    try:
+        from exocortex.context.toolkit import discover, find_toolkit_dir
+
+        cat = discover(root or None, user_layer=bool(c.toolkit_user_layer), toolkit_dir=c.toolkit_dir)
+        if not c.toolkit:
+            r.line(_WARN, "toolkit context off ([context].toolkit = false)")
+        elif cat.is_empty:
+            where = f"{root}/.claude" if root else "(no repo root)"
+            r.line(_WARN, f"no Claude Code toolkit found under {where}; install one in the repo with "
+                          "`bash ~/claude-toolkit/install.sh --set live`, or hand-copy skills into .claude/skills")
+        else:
+            extras = []
+            if cat.loop:
+                extras.append(f"working loop: {len(cat.loop)} rules")
+            if cat.commands:
+                extras.append("repo commands: " + ", ".join(k for k, _c in cat.commands))
+            r.line(_OK, f"toolkit: {cat.summary() or 'house rules only'}" + (f" ({'; '.join(extras)})" if extras else ""))
+            for kind in ("skill", "agent", "workflow"):
+                names = [p.command for p in cat.by_kind(kind)]
+                if names:
+                    r.line(_OK, f"  {kind}s: " + ", ".join(names))
+        clone = find_toolkit_dir(c.toolkit_dir)
+        if clone is not None:
+            r.line(_OK, f"toolkit clone: {clone} (richer part descriptions)")
+        else:
+            r.line(_WARN, "toolkit clone not found (~/claude-toolkit, ~/.claude/dev-toolkit, [context].toolkit_dir): "
+                          "descriptions come from the installed files only -- fine")
+    except Exception as e:  # noqa: BLE001
+        r.line(_WARN, f"toolkit discovery failed: {e}")
+    r.line(_OK, f"dashboard: tracking {'on' if d.track else 'off'} (a refresh at most every {d.refresh_interval_s} s "
+                f"after {d.min_new_words} new words), view {'on' if d.enabled else 'off'} at start "
+                f"({cfg.hotkeys.toggle_dashboard or 'no hotkey'}), items {'persisted' if d.persist else 'in memory'}")
+
+
 def run_doctor(cfg: Config) -> int:
     r = _Report()
     print("ExoCortex doctor")
@@ -799,6 +849,7 @@ def run_doctor(cfg: Config) -> int:
     _check_audio(r, cfg)
     _check_screen(r, cfg)
     _check_completion(r, cfg)
+    _check_context(r, cfg)
     _check_llm(r, cfg)
     _check_overlay(r, cfg)
     print()

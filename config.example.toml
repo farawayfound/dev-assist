@@ -95,6 +95,7 @@ text_max_tokens = 400
 notes_max_tokens = 900
 insights_max_tokens = 320   # co-pilot insights: questions to ask + blind spots / follow-ups
 recap_max_tokens = 360      # the Recap action: goal / done / now / next
+dashboard_max_tokens = 420  # one dashboard refresh: the model reports only what changed (docs/DASHBOARD.md)
 temperature = 0.6
 top_p = 0.85
 context_tokens = 2500
@@ -182,6 +183,46 @@ insight_max_items = 4       # bullets per section
 auto_interval_s = 180
 min_new_words = 120
 template = "dev"            # dev (code changed, bugs + causes, design choices, commands, TODOs) | meeting
+
+# ---- dashboard mode (2026-10-20, docs/DASHBOARD.md): the overlay as a board -- session notes,
+# questions to ask, blind spots & follow-ups, next steps & suggested prompts -- fed by a small
+# database (<session folder>/dashboard.sqlite) the model never holds: every refresh hands it only
+# the OPEN items plus what is new, and applies the changes it reports. The ▦ button / Ctrl+Alt+D.
+[dashboard]
+enabled = false             # start in the dashboard view (mirrors the toggle; persisted)
+track = true                # background refreshes; replaces the Notes tab's insights passes while on
+refresh_interval_s = 90     # a background refresh at most this often (0 = on demand only) ...
+min_new_words = 40          # ... once this much new speech arrived -- or the code on screen changed a lot
+max_open_items = 8          # open items per column handed to the model (oldest first)
+max_new_items = 4           # new items the model may add per column per refresh
+suggest_prompts = true      # the Next steps column also suggests prompts to type into Claude Code
+show_resolved = true        # answered / done items stay visible, collapsed ...
+resolved_keep = 12          # ... this many per column
+show_notes = true           # which columns the board shows
+show_questions = true
+show_blindspots = true
+show_nextsteps = true
+width = 1180                # window width in dashboard mode (the normal size is restored on exit)
+view_refresh_s = 5          # the board re-renders its timestamps this often (no model call)
+persist = true              # keep the items in the session folder (dashboard.sqlite); false = memory only
+
+# ---- model context (2026-10-20, docs/DASHBOARD.md): what the model may look up beyond the
+# transcript and the screen -- the repository being worked on (searched for the names a prompt
+# mentions, never read wholesale) and the Claude Code toolkit installed in it (a compact catalog
+# auto-discovered from <repo_root>/.claude and CLAUDE.local.md, re-checked every rescan_s).
+[context]
+repo_root = ""              # the project directory, e.g. "D:/repos/my-service"; "" = none
+repo_search = true          # look up the files / identifiers mentioned (answers, dashboard); matching lines only
+repo_max_files = 6          # ... files per lookup
+repo_max_chars = 1800       # ... characters of matched lines
+repo_exclude = [".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".tools", "models", ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea", ".vscode", ".claude"]
+toolkit = true              # the Claude Code toolkit catalog (skills, agents, rules, workflows, hooks), auto-discovered
+toolkit_lookup = true       # ... hand over the full text of a skill / agent that is mentioned
+toolkit_in_answers = true   # ... also for answers, ask and recap (not only the dashboard)
+toolkit_user_layer = false  # ... also scan ~/.claude/skills and ~/.claude/agents (the opt-in user layer)
+toolkit_dir = ""            # the toolkit clone (fuller part descriptions); "" = ~/claude-toolkit or ~/.claude/dev-toolkit
+toolkit_max_chars = 3000    # catalog budget (chars) at the end of the system prompt (prefix-cached)
+rescan_s = 30               # how often the repository's .claude/ is re-checked (an install mid-session is picked up)
 
 [screen]
 mode = "auto"
@@ -293,6 +334,7 @@ toggle_handsfree = "ctrl+alt+h"
 toggle_manual = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
 insights = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
 recap = "ctrl+alt+y"           # recap the session so far
+toggle_dashboard = "ctrl+alt+d"   # dashboard mode on / off (the ▦ title-bar button)
 quit = "ctrl+alt+x"
 
 [paths]

@@ -98,6 +98,26 @@ class EngineActions(Protocol):
         """What the session is about -- project, stack, goal (`[assist].session_context`) --
         handed to every answer, insight and recap as standing context. "" clears it."""
 
+    # ---- dashboard mode (2026-10-20) ----
+    def set_dashboard_mode(self, enabled: bool) -> None:
+        """Dashboard mode (the multi-column view) on / off: `[dashboard].enabled`, persisted with
+        the config. Publishes a `DashboardModeEvent`; the tracking itself (`[dashboard].track`)
+        keeps running either way."""
+
+    def dashboard_refresh(self, sections: tuple[str, ...] = ()) -> None:
+        """Refresh the dashboard now: one model call that updates the tracked questions, blind
+        spots & follow-ups and next steps / prompts (`sections` from ("questions", "blindspots",
+        "nextsteps"); empty = all). Manual: works while paused. Deferred while the LLM starts.
+        Streams as Assist events of kind "dashboard", then a `DashboardUpdatedEvent`."""
+
+    def dashboard_item(self, item_id: int, action: str, text: str = "") -> None:
+        """Change one tracked item by hand: `action` "answer" (mark answered / done, `text` = the
+        answer, may be empty), "dismiss" (drop it), "reopen", or "edit" (`text` = the new
+        wording). Publishes a `DashboardUpdatedEvent`."""
+
+    def dashboard_add(self, kind: str, text: str) -> None:
+        """Add an item of `kind` ("question" | "blindspot" | "nextstep" | "prompt") by hand."""
+
     # ---- completion mode ----
     def set_completion_mode(self, enabled: bool) -> None:
         """Enter/leave completion mode: ghost-text completions at the caret of the focused app;

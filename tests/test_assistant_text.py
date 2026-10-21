@@ -554,13 +554,16 @@ def test_text_has_its_own_lane_dispatched_after_the_side_lane_and_before_explain
     be silently overwritten by the next auto-solve (no Started/Done ever) -- and a queued "code"
     by a Text press. "text" therefore gets its own slot, between the side lane and explain.
     (2026-10-20: the recap lane sits right after it and the insight lane after explain -- both
-    their own slots for the same reason; see tests/test_insights_assistant.py.)"""
+    their own slots for the same reason; see tests/test_insights_assistant.py. The dashboard
+    lane -- a refresh of the tracked board, exocortex.dashboard -- follows the insight lane,
+    still above the completion lane; see tests/test_dashboard_service.py.)"""
     a = Assistant(Config(), EventBus(), FakeClient(), Transcript(), clock=time.monotonic)
     slots = a._assist_slots()
     assert slots == (a._assist_slot, a._suggest_slot, a._text_slot, a._recap_slot, a._explain_slot,
-                     a._insight_slot, a._complete_slot)
+                     a._insight_slot, a._dashboard_slot, a._complete_slot)
     assert slots.index(a._suggest_slot) < slots.index(a._text_slot) < slots.index(a._explain_slot)
-    assert len({id(s) for s in slots}) == 7
+    assert slots.index(a._insight_slot) < slots.index(a._dashboard_slot) < slots.index(a._complete_slot)
+    assert len({id(s) for s in slots}) == 8
 
 
 def test_queued_text_survives_a_later_code_submission(bus: EventBus, transcript: Transcript) -> None:

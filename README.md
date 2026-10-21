@@ -408,6 +408,37 @@ starts a model call by itself, so the GPU sits idle and no context is spent unti
   armed runs by itself, the way Auto would have run it. With hands-free off, the gesture is
   simply the Text / Code button without touching the overlay.
 
+### Dashboard mode
+
+The **▦** button at the left of the title-bar icons (`Ctrl+Alt+D`, `⋯ › Dashboard mode`,
+`[dashboard].enabled`) turns the overlay into a board: **Session notes**, **Questions to ask**,
+**Blind spots & follow-ups** and **Next steps & prompts**, side by side, each column kept current
+by itself. Questions and blind spots are *tracked*: once the conversation answers or settles
+one, it moves under **Answered (n)** with the answer; next steps are marked done the same way,
+and the prompts column holds what to type into Claude Code next, exactly as you would type it
+(copy it with **⧉**). The window widens to `[dashboard].width` and shrinks back when you leave
+the mode; the ask box and the bottom controls stay, so asking, pausing, **Text** and **Code**
+keep working.
+
+The data is not the model's memory. A small database in the session folder (`dashboard.sqlite`,
+also written as `dashboard.md`) holds the items, and each refresh hands the model only the open
+items (under short ids) plus what was said since the last refresh, asking for the changes alone
+(`NEW: …` / `ANSWERED Q2: …` / `DONE N1: …` / `DROP B1`). A background refresh runs at most every
+`[dashboard].refresh_interval_s` (90 s) once `min_new_words` (40) arrived or the code on screen
+changed substantially; it replaces the Notes tab's insights passes while `[dashboard].track` is
+on, and the Insights pane then mirrors the board's open items. Screen capture and OCR keep their
+own cadence (`[screen].interval_s`) in every view mode.
+
+If a Claude Code toolkit is installed in the repository (`[context].repo_root`), dev-assist
+discovers it by itself — the skills, agents, rules, workflows and hooks under `.claude/`, the
+house rules' working loop and the detected commands in `CLAUDE.local.md`, re-checked every
+`rescan_s` seconds, nothing hard-coded — and the suggested prompts (and answers, with
+`toolkit_in_answers` on) name its real `/skills` and agents, with a mentioned part's full text
+handed over on demand. The repository itself is never injected wholesale: with `repo_search` on,
+the identifiers and file names a prompt mentions are looked up and only the matching lines go in.
+Both live on the Settings dialog's **Context** tab, everything else on its **Dashboard** tab.
+The card actions and every key: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+
 ### Screen reading
 
 The **Screen** tab reads what is on your screen and folds it into everything else:
@@ -633,6 +664,7 @@ back, is listed in [docs/SHORTCUTS.md](docs/SHORTCUTS.md).
 | `Ctrl+Alt+G` | Code: write the code for the task discussed / shown, right now |
 | `Ctrl+Alt+H` | hands-free mode on / off (auto read → checkpoint → text → code on screen change) |
 | `Ctrl+Alt+J` | manual advance on / off (generate only on a press-and-hold: left = Text, middle = Code) |
+| `Ctrl+Alt+D` | dashboard mode on / off (the ▦ button: notes, questions, blind spots, next steps & prompts as a board) |
 | *(tap)* Right Shift | pause / resume everything automatic (screen reading, auto-answer, auto-solve, hands-free) |
 | `Ctrl+Alt+X` | quit (saves the session) |
 
@@ -719,8 +751,10 @@ Explanations, **Hands-free** (what makes a new task — new-line and view-change
 **when code is on screen** — settle time, deviation, cumulative context size, Text/Code on or
 off, accurate OCR, **manual advance** with its press-and-hold time and the quick-middle-click
 option), Assist (including **Focus**, **Use libraries** and **Comments in generated
-code**), Screen (including **OCR device**), Window, Audio — covering everything in the
-Configuration section below. The old **Model** tab (backend, model, context size, llama.cpp
+code**), Notes, **Dashboard** (the board's tracking, columns and width), **Context** (the
+repository root, the on-demand repository lookups and the Claude Code toolkit catalog), Screen
+(including **OCR device**), Window, Audio — covering everything in the Configuration section
+below. The old **Model** tab (backend, model, context size, llama.cpp
 knobs) has moved to **`⋯ › Models…`** (see above) — this dialog no longer touches `[llm]` at all.
 **Apply**/**OK** write the values into the running app (most take effect at once;
 the few that need a restart, such as the OCR engine or capture exclusion, are marked *(restart)*
@@ -800,6 +834,21 @@ primary_language = "Python" # fallback for solve, Code and completions when the 
 comments = "normal"        # none | minimal | normal | detailed
 style = "bullets"           # bullets | short | detailed
 persona = ""                # e.g. "I am a backend engineer interviewing for a platform role."
+
+[dashboard]
+enabled = false             # start in dashboard mode (the ▦ button / Ctrl+Alt+D); persisted with the toggle
+track = true                # background refreshes of the tracked questions / blind spots / next steps
+refresh_interval_s = 90     # at most this often, once min_new_words arrived or the screen changed a lot
+min_new_words = 40
+width = 1180                # window width in dashboard mode; the normal size is restored on exit
+
+[context]
+repo_root = ""              # the project directory: searched on demand for the names a prompt mentions,
+                            # never read wholesale; also where the Claude Code toolkit (.claude/,
+                            # CLAUDE.local.md) is auto-discovered and re-checked every rescan_s
+repo_search = true          # look up files / identifiers mentioned (answers, dashboard); matching lines only
+toolkit = true              # the installed toolkit's catalog (skills, agents, rules, workflows, hooks)
+toolkit_in_answers = true   # ... also for answers / ask / recap, not only the dashboard
 
 [screen]
 interval_s = 1.5             # capture cadence; also hands-free mode's sampling interval

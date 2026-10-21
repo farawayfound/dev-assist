@@ -28,6 +28,16 @@ The questions and blind spots live in the **Notes tab's Insights pane**, above t
 A background refresh never switches tabs and never touches the Assist tab. When one lands while
 you are elsewhere, the Notes tab shows a dot (**Notes •**) until you look.
 
+**Dashboard mode** (`Ctrl+Alt+D`, the **▦** button) shows the same things as a board you can keep
+on a second screen: the notes, the questions (each tracked until the conversation answers it,
+then kept with its answer), the blind spots and follow-ups (tracked the same way), and the next
+steps with the prompts to type into Claude Code. While the dashboard tracks the session (the
+default), its refreshes replace the background insights passes described below, and the Insights
+pane shows the board's open items. The tracked items live in a small database in the session
+folder, not in the model's context, and dev-assist discovers a Claude Code toolkit installed in
+the repository by itself so the suggested prompts name its real skills and agents. See
+[DASHBOARD.md](DASHBOARD.md).
+
 ## Set up a session
 
 1. **Session context.** In **⋯ > Assist > Session context…**, say what you are working on, for

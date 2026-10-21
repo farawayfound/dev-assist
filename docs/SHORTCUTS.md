@@ -56,8 +56,9 @@ See [Pair programming and team coding](PAIR_PROGRAMMING.md).
 
 | Keys | Action | `[hotkeys]` key |
 |---|---|---|
-| `Ctrl+Alt+W` | Refresh the co-pilot insights now: questions to ask, plus blind spots and follow-ups, in the Notes tab's Insights pane. Works while paused | `insights` |
+| `Ctrl+Alt+W` | Refresh the co-pilot insights now: questions to ask, plus blind spots and follow-ups, in the Notes tab's Insights pane (while the dashboard tracks the session, this refreshes the dashboard instead). Works while paused | `insights` |
 | `Ctrl+Alt+Y` | Recap the session so far (goal, done, now, next) in the Assist tab. Works while paused | `recap` |
+| `Ctrl+Alt+D` | Dashboard mode on / off (the **▦** button): the overlay as a board — session notes, questions to ask, blind spots & follow-ups, next steps & prompts. See [DASHBOARD.md](DASHBOARD.md) | `toggle_dashboard` |
 
 ### Coding
 
@@ -96,8 +97,10 @@ These work only in the place listed, not globally.
 | Live tab | Double-click a speaker name | Rename the speaker |
 | Title bar or slim bar | Drag | Move the overlay |
 | Window edges or bottom-right corner | Drag | Resize the overlay |
-| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots and recap now; the automatic switches; role; session context; Assist settings…), Export session, New session, Settings…, Models…, Rename speakers, Screen region…, Screen: pause/resume, Quit |
+| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots, recap and the dashboard now; the automatic switches; role; session context; Assist settings…), **Dashboard mode**, Export session, New session, Settings…, Models…, Rename speakers, Screen region…, Screen: pause/resume, Quit |
 | Notes tab | **Questions** / **Blind spots** / **Recap** buttons | Refresh one insight section now, or recap the session |
+| Dashboard mode | **✓** / **✕** / **↺** / **⧉** on a card, or right-click a card | Mark an item answered or done (with an optional answer), dismiss it, reopen it, copy a prompt; the menu also has **Edit…** |
+| Dashboard mode | **+** / **↻** in a column header, **Refresh all** | Add an item by hand; refresh that column, or everything (the items and the notes) |
 | Text panes and the ask box | Right-click | The usual text menu (Copy, Select All, …) plus **Hide overlay** and **Quit ExoCortex** |
 | Hands-free view, over the answer or the expanded history | Mouse wheel | Scroll it, even though the window is click-through there |
 | Hands-free view, over the expanded history | Tap `↑` / `↓` | Jump to the previous / next answer, marked with an accent bar. The arrow keys work normally everywhere else |

@@ -207,6 +207,67 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("notes", "auto_interval_s", "Refresh the notes every (s; 0 = only on demand)", "int", 0, 1800, 30),
         Field("notes", "min_new_words", "... once this many new words were said", "int", 0, 2000, 10),
     ),
+    # ---- dashboard mode (2026-10-20): the multi-column board and its background tracking ----
+    "Dashboard": (
+        Field("dashboard", "enabled", "Dashboard mode on (also at the next launch)", "bool",
+              help="The overlay as a board: session notes, questions to ask, blind spots & follow-ups, next "
+                   "steps & suggested prompts, side by side. Same as the ▦ title-bar button (Ctrl+Alt+D)."),
+        Field("dashboard", "track", "Track questions, blind spots & next steps in the background", "bool",
+              help="A small database (the session folder's dashboard.sqlite) holds the items; each refresh "
+                   "hands the model only the open ones plus what is new, and applies the changes it reports. "
+                   "While on, these refreshes replace the Notes tab's background insights passes (the "
+                   "Insights pane shows the dashboard's open questions and blind spots)."),
+        Field("dashboard", "refresh_interval_s", "Refresh at most every (s; 0 = on demand only)", "int", 0, 1800, 15,
+              help="Each background refresh is one local model call (the GPU cost knob). It also needs "
+                   "something new: the speech below, or the screen changing substantially. Screen capture "
+                   "and OCR keep their own cadence (the Screen tab) in every view mode."),
+        Field("dashboard", "min_new_words", "... once this many new words were said", "int", 0, 1000, 10),
+        Field("dashboard", "max_open_items", "Open items per column handed to the model", "int", 2, 20),
+        Field("dashboard", "max_new_items", "New items per column per refresh", "int", 1, 8),
+        Field("dashboard", "suggest_prompts", "Suggest prompts for Claude Code (Next steps column)", "bool",
+              help="Exactly what to type into Claude Code next. With a toolkit installed in the repository "
+                   "(the Context tab), only its skills and agents are named."),
+        Field("dashboard", "show_resolved", "Keep answered / done items visible, collapsed", "bool"),
+        Field("dashboard", "resolved_keep", "... how many per column", "int", 0, 50),
+        Field("dashboard", "show_notes", "Column: Session notes", "bool",
+              help="The running notes (the Notes tab's cadence: every [notes].auto_interval_s)."),
+        Field("dashboard", "show_questions", "Column: Questions to ask", "bool"),
+        Field("dashboard", "show_blindspots", "Column: Blind spots & follow-ups", "bool"),
+        Field("dashboard", "show_nextsteps", "Column: Next steps & suggested prompts", "bool"),
+        Field("dashboard", "width", "Window width in dashboard mode (px)", "int", 600, 4000, 20,
+              help="The normal size is restored when you leave dashboard mode; resizing the board updates this."),
+        Field("dashboard", "view_refresh_s", "Re-render the board every (s)", "int", 1, 60,
+              help="Timestamps and relative times only; no model call."),
+        Field("dashboard", "persist", "Keep the items in the session folder (dashboard.sqlite)", "bool",
+              help="Applies to the next session (New session / the next launch); off = in memory only. "
+                   "The board is also written as dashboard.md next to the notes either way."),
+    ),
+    # ---- model context (2026-10-20): what the model may look up beyond transcript + screen ----
+    "Context": (
+        Field("context", "repo_root", "Repository root (the project being worked on)", "text",
+              help="A directory. Searched on demand for the file names and identifiers a prompt mentions; "
+                   "never read wholesale. Also where the Claude Code toolkit is looked for (.claude/, "
+                   "CLAUDE.local.md). Empty = none."),
+        Field("context", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
+              help="Only the matching lines go to the model, only when something identifier-like was said, "
+                   "typed or shown. Not for inline completions (latency)."),
+        Field("context", "repo_max_files", "... files per lookup", "int", 1, 20),
+        Field("context", "repo_max_chars", "... characters of matched lines", "int", 200, 8000, 100),
+        Field("context", "toolkit", "Claude Code toolkit context (auto-discovered in the repository)", "bool",
+              help="The installed skills, agents, rules, workflows and hooks, as a compact catalog built from "
+                   "their own files -- nothing hard-coded -- so the model names them exactly and suggests "
+                   "the right one. Re-checked every few seconds (below): an install mid-session is picked up."),
+        Field("context", "toolkit_lookup", "... hand over the full text of a skill / agent that is mentioned", "bool"),
+        Field("context", "toolkit_in_answers", "... also for answers, ask and recap (not only the dashboard)", "bool",
+              help="The catalog sits at the end of the system prompt, so it is prefix-cached across turns."),
+        Field("context", "toolkit_user_layer", "... also scan ~/.claude (the opt-in user layer)", "bool"),
+        Field("context", "toolkit_dir", "Toolkit clone (optional)", "text",
+              help="Richer one-line descriptions from its modules/index.json for the parts installed. Empty = "
+                   "~/claude-toolkit or ~/.claude/dev-toolkit when present. Never lists parts that are not "
+                   "installed."),
+        Field("context", "toolkit_max_chars", "Toolkit catalog budget (chars)", "int", 300, 8000, 100),
+        Field("context", "rescan_s", "Re-check the repository's .claude/ every (s)", "int", 5, 600, 5),
+    ),
     "Screen": (
         Field("screen", "interval_s", "Capture interval (s)", "float", 0.5, 10.0, 0.5),
         Field("screen", "auto_suggest", "Solve / suggest when the screen changes", "bool",

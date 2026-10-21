@@ -189,8 +189,11 @@ class ManualAdvanceEvent(Event):
 # Assist tab (see InsightsUpdatedEvent); recap: an on-demand "where are we" summary of the session
 AssistKind = Literal[
     "auto", "manual", "ask", "screen", "suggest", "solve", "complete", "explain", "code", "text",
-    "insights", "recap",
+    "insights", "recap", "dashboard",
 ]
+# dashboard: one refresh of the tracked dashboard (exocortex.dashboard): the model is shown the open
+# items and what is new since the last refresh and answers with the changes only; the result is
+# applied to the store and published as a DashboardUpdatedEvent -- never shown as an answer.
 
 
 @dataclass(frozen=True)
@@ -260,8 +263,48 @@ class InsightsUpdatedEvent(Event):
     auto: bool = False
 
 
+# ---- dashboard mode (2026-10-20) ------------------------------------------------------
+#: One tracked item of the dashboard (exocortex.dashboard.store). `kind`: "question" (questions to
+#: ask), "blindspot" (blind spots & follow-ups), "nextstep" (next steps) or "prompt" (a prompt to
+#: type into Claude Code). `status`: "open", "answered" (answered / done / resolved -- `answer`
+#: carries the answer or how it was settled) or "dropped". `source`: "model" or "user". Times are
+#: the session clock.
+@dataclass(frozen=True)
+class DashboardItem:
+    id: int
+    kind: str
+    text: str
+    status: str = "open"
+    answer: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+    source: str = "model"
+
+
+@dataclass(frozen=True)
+class DashboardUpdatedEvent(Event):
+    """The dashboard's data changed (a refresh finished, the user edited an item, the notes were
+    regenerated): the whole current snapshot -- every item the view shows, open and resolved --
+    plus the running notes, so a consumer always just replaces what it shows. `auto` tells a
+    background refresh from one the user asked for; `detail` is a one-line status for the view
+    ("updated: +2 new, 1 answered", "nothing new", "refresh cancelled", "error: ...")."""
+    items: tuple[DashboardItem, ...] = ()
+    notes: str = ""
+    notes_at: float | None = None
+    generated_at: float = 0.0
+    auto: bool = False
+    detail: str = ""
+
+
+@dataclass(frozen=True)
+class DashboardModeEvent(Event):
+    """Dashboard mode (the view) turned on / off -- the title-bar button, the hotkey, the menu, the
+    settings dialog and the engine's own switch all stay in sync through this."""
+    enabled: bool = False
+
+
 # ---- system ------------------------------------------------------------------
-Component = Literal["audio", "asr", "diarization", "llm", "session", "app", "completion"]
+Component = Literal["audio", "asr", "diarization", "llm", "session", "app", "completion", "dashboard", "context"]
 ComponentState = Literal["loading", "ready", "error", "info", "busy"]
 
 

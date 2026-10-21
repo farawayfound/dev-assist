@@ -171,6 +171,9 @@ class LLMConfig:
     notes_max_tokens: int = 900
     insights_max_tokens: int = 320      # co-pilot insights: questions to ask + blind spots / follow-ups
     recap_max_tokens: int = 360         # the Recap action: where the session stands, ready to read out
+    # One dashboard refresh (exocortex.dashboard): the model reports only what CHANGED (new items,
+    # answered / done / dropped ones) against the open items it was shown, so this stays small.
+    dashboard_max_tokens: int = 420
     # Qwen3-family non-thinking guidance: temperature 0.7 / top_p 0.8 / top_k 20 / min_p 0.
     # Greedy decoding (0.0) is discouraged upstream (repetition); we go slightly lower for factual answers.
     temperature: float = 0.6
@@ -388,6 +391,73 @@ class NotesConfig:
 
 
 @dataclass
+class DashboardConfig:
+    """Dashboard mode (2026-10-20): the overlay as a multi-column board -- session notes, questions
+    to ask, blind spots & follow-ups, next steps & suggested prompts -- fed by a small database
+    (exocortex.dashboard.store, SQLite in the session folder) that the model never holds: every
+    refresh hands the model only the OPEN items plus what is new since the last refresh, and the
+    model answers with the CHANGES (new / answered / done / dropped), which the store applies.
+    The view is toggled with the ▦ title-bar button, Ctrl+Alt+D, or the "⋯" menu; the tracking
+    runs whether or not the view is open. Screen capture / OCR keep their own cadence
+    ([screen].interval_s) in every view mode: a refresh reads whatever the screen reader last saw.
+    """
+    enabled: bool = False              # start in the dashboard view (also mirrors the toggle; persisted)
+    # Background tracking passes. While on, these REPLACE the Notes tab's background insights
+    # passes ([assist].suggest_questions / flag_blind_spots) -- the Insights pane and insights.md
+    # then show the dashboard's open questions and blind spots, so nothing runs twice.
+    track: bool = True
+    refresh_interval_s: int = 90       # a background refresh at most this often (0 = on demand only)
+    min_new_words: int = 40            # ... once this much new speech arrived -- or the screen changed a lot
+    max_open_items: int = 8            # open items per column handed to the model (oldest first)
+    max_new_items: int = 4             # new items the model may add per column per refresh
+    suggest_prompts: bool = True       # the Next steps column also suggests prompts to type into Claude Code
+    show_resolved: bool = True         # answered / done items stay visible, collapsed under the open ones
+    resolved_keep: int = 12            # ... how many of them each column keeps on screen
+    show_notes: bool = True            # which columns the view shows
+    show_questions: bool = True
+    show_blindspots: bool = True
+    show_nextsteps: bool = True
+    width: int = 1180                  # window width in dashboard mode (the normal size is restored on exit)
+    view_refresh_s: int = 5            # the view re-renders its timestamps this often (no model call)
+    persist: bool = True               # keep the tracked items in <session folder>/dashboard.sqlite
+
+
+@dataclass
+class ContextConfig:
+    """What the model may look up beyond the transcript and the screen (2026-10-20): the
+    repository being worked on, and the Claude Code toolkit installed in it. Nothing here is
+    injected wholesale -- the repo is SEARCHED for the file names and identifiers a prompt
+    mentions, and only the matching lines go in; the toolkit is a compact, auto-discovered
+    catalog of what is installed (skills, agents, rules, workflows, hooks) plus, on mention,
+    one part's full text. Edited on the settings dialog's "Context" tab.
+    """
+    # The project directory ("" = none): searched on demand, never read wholesale. Also where the
+    # Claude Code toolkit is looked for (<repo_root>/.claude, <repo_root>/CLAUDE.local.md).
+    repo_root: str = ""
+    repo_search: bool = True           # search the repo for files / identifiers mentioned; inject matching lines only
+    repo_max_files: int = 6            # files per lookup
+    repo_max_chars: int = 1800         # characters of matched lines handed to the model
+    repo_exclude: list[str] = field(default_factory=lambda: [
+        ".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__", ".tools", "models",
+        ".pytest_cache", ".mypy_cache", ".ruff_cache", ".idea", ".vscode", ".claude",
+    ])
+    # The Claude Code toolkit (claude-toolkit's skills, agents, rules, workflows, hooks) as
+    # installed in the repo: auto-discovered from <repo_root>/.claude and CLAUDE.local.md, re-checked
+    # every rescan_s, so an install or update mid-session is picked up without a restart. Nothing
+    # about the toolkit is hard-coded: the catalog is built from the files' own frontmatter and
+    # the house rules' "Loop" section.
+    toolkit: bool = True
+    toolkit_lookup: bool = True        # also hand over the full text of a skill / agent that is mentioned
+    toolkit_in_answers: bool = True    # the catalog also feeds answers, ask and recap (not only the dashboard)
+    toolkit_user_layer: bool = False   # also scan ~/.claude/skills and ~/.claude/agents (the opt-in user layer)
+    # The toolkit CLONE (optional): richer one-line descriptions from its modules/index.json for
+    # the parts installed in the repo. "" = look in ~/claude-toolkit and ~/.claude/dev-toolkit.
+    toolkit_dir: str = ""
+    toolkit_max_chars: int = 3000      # catalog budget (chars) in a system prompt; ~750 tokens, prefix-cached
+    rescan_s: int = 30                 # how often the repo's .claude/ is re-checked
+
+
+@dataclass
 class ScreenConfig:
     """Live screen reading: capture -> local OCR -> context for answers / suggestions."""
     mode: str = "auto"                 # off | auto (active window) | monitor (whole primary monitor) | region
@@ -600,6 +670,7 @@ class HotkeysConfig:
     toggle_manual: str = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
     insights: str = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
     recap: str = "ctrl+alt+y"           # recap the session so far (goal, done, current state, next)
+    toggle_dashboard: str = "ctrl+alt+d"   # dashboard mode on / off (the ▦ title-bar button)
     quit: str = "ctrl+alt+x"
 
 
@@ -618,6 +689,8 @@ class Config:
     diarization: DiarizationConfig = field(default_factory=DiarizationConfig)
     assist: AssistConfig = field(default_factory=AssistConfig)
     notes: NotesConfig = field(default_factory=NotesConfig)
+    dashboard: DashboardConfig = field(default_factory=DashboardConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     screen: ScreenConfig = field(default_factory=ScreenConfig)
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     explain: ExplainConfig = field(default_factory=ExplainConfig)

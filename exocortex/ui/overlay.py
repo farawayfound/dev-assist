@@ -59,6 +59,8 @@ from exocortex.bus import (
     CompletionEvent,
     CompletionModeEvent,
     ComponentStatusEvent,
+    DashboardModeEvent,
+    DashboardUpdatedEvent,
     Event,
     EventBus,
     FinalTranscriptEvent,
@@ -130,6 +132,12 @@ try:
 except Exception:  # pragma: no cover - models.py may be missing/mid-implementation
     ModelsDialog = None  # type: ignore[assignment]
     log.warning("exocortex.ui.models unavailable; the Models window is disabled")
+
+try:
+    from exocortex.ui.dashboard import DashboardView
+except Exception:  # pragma: no cover - dashboard.py may be missing/mid-implementation
+    DashboardView = None  # type: ignore[assignment]
+    log.warning("exocortex.ui.dashboard unavailable; dashboard mode is disabled")
 
 _SLIM_MIN_WIDTH = 300
 # The width the slim bar is allowed to grow to when the full-mode window is wider than it. With
@@ -569,6 +577,11 @@ class OverlayWindow(QWidget):
         # Windows platform (the offscreen QPA tests must never hook the developer's real mouse).
         self._manual = bool(cfg.handsfree.manual)
         self._manual_hook: "PressHoldMouseHook | None" = None
+        # Dashboard mode (2026-10-20): the board (exocortex.ui.dashboard) replaces the tab strip
+        # and the stacked tabs; the window widens to [dashboard].width and the normal geometry is
+        # remembered and restored on exit, the way completion mode's slim bar does it.
+        self._dashboard_mode = False
+        self._dashboard_normal_geometry: QRect | None = None
 
         # Window flags must be set once, before the first show(). A visible copilot: a normal
         # top-level window (it appears in the taskbar / Alt-Tab), frameless and always-on-top.
@@ -612,6 +625,10 @@ class OverlayWindow(QWidget):
             # is destroyed before it runs, so a fast close can never dereference a dead
             # completion_btn here.
             QTimer.singleShot(0, self, lambda: self.completion_btn.setChecked(True))
+        if cfg.dashboard.enabled and self.dashboard_view is not None and not cfg.completion.enabled:
+            # Open on the board (the engine publishes DashboardModeEvent too; the second one is a
+            # no-op). Completion mode wins when both are set: the slim bar has no room for a board.
+            QTimer.singleShot(0, self, lambda: self.dashboard_btn.setChecked(True))
 
         self._install_hotkeys()
         if self._manual:
@@ -658,6 +675,16 @@ class OverlayWindow(QWidget):
         self.stack.addWidget(self.notes_view)
         self.stack.addWidget(self.screen_view)
         root_layout.addWidget(self.stack, 1)
+        # Dashboard mode's board: hidden until the mode is on (it then stands in for the tab
+        # strip + stack; the ask box, control row and status bar stay).
+        self.dashboard_view = DashboardView(self._cfg, self.root) if DashboardView is not None else None
+        if self.dashboard_view is not None:
+            self.dashboard_view.hide()
+            self.dashboard_view.item_action.connect(self._on_dashboard_item)
+            self.dashboard_view.item_added.connect(self._on_dashboard_add)
+            self.dashboard_view.refresh_requested.connect(self._on_dashboard_refresh)
+            self.dashboard_view.notes_requested.connect(lambda: self._actions.generate_notes())
+            root_layout.addWidget(self.dashboard_view, 1)
         self.screen_view.set_mode(self._screen_mode)
         self._show_tab(_START_TAB)   # also enables the hands-free switch (usable from Assist)
 
@@ -698,7 +725,10 @@ class OverlayWindow(QWidget):
         bar = _TitleBar(self.root)
         layout = QHBoxLayout(bar)
         layout.setContentsMargins(4, 4, 4, 4)
-        layout.setSpacing(4)   # 8 icon buttons + slider must fit the 340 px floor (each has its own padding)
+        layout.setSpacing(4)   # 9 icon buttons + slider must fit the 340 px floor (each has its own padding)
+        # The dashboard button (2026-10-20) made it nine: a tighter padding for THIS bar's icon
+        # buttons keeps the row inside the floor (the slim bar and the tabs have their own sheets).
+        bar.setStyleSheet("QPushButton#icon { padding: 2px 4px; }")
 
         self.status_dot = _DotIndicator(bar)
         layout.addWidget(self.status_dot)
@@ -713,6 +743,18 @@ class OverlayWindow(QWidget):
         title_col.addWidget(self.subtitle_label)
         layout.addLayout(title_col)
         layout.addStretch(1)
+
+        self.dashboard_btn = QPushButton("▦", bar)
+        self.dashboard_btn.setObjectName("icon")
+        self.dashboard_btn.setCheckable(True)
+        self.dashboard_btn.setChecked(False)
+        self.dashboard_btn.setToolTip(
+            "Dashboard mode: session notes, questions to ask, blind spots & follow-ups, next steps & "
+            "prompts, side by side (Ctrl+Alt+D)"
+        )
+        self.dashboard_btn.setEnabled(DashboardView is not None)
+        self.dashboard_btn.toggled.connect(self._on_dashboard_toggled)
+        layout.addWidget(self.dashboard_btn)
 
         self.explain_btn = QPushButton("\U0001f4a1", bar)
         self.explain_btn.setObjectName("icon")
@@ -870,6 +912,17 @@ class OverlayWindow(QWidget):
             act.setChecked(on)
             act.toggled.connect(lambda checked, k=key: self._actions.set_completion_context({k: checked}))
         menu.addSeparator()
+        # 2026-10-20: the on-demand lookups (exocortex.context) that answers and the dashboard get.
+        ctx = self._cfg.context
+        repo_action = menu.addAction("Repository lookup (answers, dashboard)")
+        repo_action.setCheckable(True)
+        repo_action.setChecked(bool(ctx.repo_search))
+        repo_action.toggled.connect(lambda checked: self._actions.set_completion_context({"repo": checked}))
+        toolkit_action = menu.addAction("Toolkit catalog (answers, dashboard)")
+        toolkit_action.setCheckable(True)
+        toolkit_action.setChecked(bool(ctx.toolkit_in_answers))
+        toolkit_action.toggled.connect(lambda checked: self._actions.set_completion_context({"toolkit": checked}))
+        menu.addSeparator()
         hint_text = f"Hint: {cc.hint}" if cc.hint else "Hint\u2026 (none set)"
         hint_action = menu.addAction(hint_text)
         hint_action.triggered.connect(self._prompt_completion_hint)
@@ -956,6 +1009,10 @@ class OverlayWindow(QWidget):
             self.mic_btn.blockSignals(False)
         if any(str(key).startswith("screen.") for key in changed):
             self.screen_view.sync_toggles()
+        if "dashboard.enabled" in changed:
+            self._set_dashboard_mode(bool(cfg.dashboard.enabled), notify_engine=False)
+        if any(str(key).startswith("dashboard.") for key in changed) and self.dashboard_view is not None:
+            self.dashboard_view.apply_config()
         try:
             self._actions.apply_settings(dict(changed))
         except Exception:
@@ -1103,6 +1160,8 @@ class OverlayWindow(QWidget):
 
     def _set_completion_mode(self, enabled: bool) -> None:
         """Collapse to the slim bar (and start completions) or restore the full overlay."""
+        if enabled and self._dashboard_mode:
+            self._set_dashboard_mode(False)   # the slim bar and the board cannot share the window
         self._completion_mode = enabled
         self.completion_btn.blockSignals(True)
         self.completion_btn.setChecked(enabled)
@@ -1171,6 +1230,129 @@ class OverlayWindow(QWidget):
         color = {"ready": COLORS["ok"], "error": COLORS["err"]}.get(state, COLORS["warn"])
         self.slim_dot.set_color(color)
         self.slim_status.setText(detail or state)
+
+    # ---------------------------------------------------------------- dashboard mode ---
+    @property
+    def dashboard_mode(self) -> bool:
+        return self._dashboard_mode
+
+    @property
+    def _hands_free_view_active(self) -> bool:
+        """The hands-free view (output only, click-through content) is what is on screen:
+        hands-free is on and neither the slim bar nor the board has taken over the window."""
+        return self._hands_free and not self._completion_mode and not self._dashboard_mode
+
+    def _on_dashboard_toggled(self, checked: bool) -> None:
+        if checked != self._dashboard_mode:
+            self._set_dashboard_mode(checked)
+
+    def _sync_dashboard_button(self) -> None:
+        if self.dashboard_btn.isChecked() != self._dashboard_mode:
+            self.dashboard_btn.blockSignals(True)
+            self.dashboard_btn.setChecked(self._dashboard_mode)
+            self.dashboard_btn.blockSignals(False)
+
+    def _set_dashboard_mode(self, enabled: bool, *, notify_engine: bool = True) -> None:
+        """Enter / leave dashboard mode and (unless mirroring a bus event) tell the engine.
+
+        The board stands in for the tab strip and the stacked tabs; the title bar, the ask box,
+        the control row and the status bar stay, so asking, pausing, Text / Code all keep
+        working. The window widens to ``[dashboard].width`` (growing leftwards from its right
+        edge, clamped to the screen) and the previous geometry is restored on exit. Completion
+        mode's slim bar is left first when it is on; the hands-free view resumes on exit.
+        Screen capture / OCR are untouched either way (their cadence is the Screen tab's).
+        """
+        if self.dashboard_view is None:
+            if enabled:
+                self.show_toast("Dashboard unavailable")
+            return
+        if enabled == self._dashboard_mode:
+            self._sync_dashboard_button()
+            return
+        if enabled and self._completion_mode:
+            self._set_completion_mode(False)
+        self._dashboard_mode = enabled
+        self._sync_dashboard_button()
+        if enabled:
+            # Remember the size BEFORE the board is shown: its four columns raise the layout's
+            # minimum width, and Qt grows the window to it as soon as the view is visible.
+            self._dashboard_normal_geometry = QRect(self.geometry())
+            self._restore_click_through()
+            self._release_hover_hooks()
+            for w in (self.askbox, self.control_row, self.status, self.size_grip, self.clickthrough_btn):
+                w.setVisible(True)   # the hands-free view may have hidden them
+            self.dashboard_view.apply_config()
+        self.tabstrip.setVisible(not enabled)
+        self.stack.setVisible(not enabled)
+        self.dashboard_view.setVisible(enabled)
+        # The layout recomputes its minimum size only on the next event-loop pass; forcing it now
+        # lets the window take the board's width at once, and shrink back at once on exit (the
+        # stale, board-sized minimum would otherwise clamp the restored geometry -- the same
+        # trick as `_apply_slim_size`).
+        self.root.layout().activate()
+        self.layout().activate()
+        if enabled:
+            self._apply_dashboard_geometry()
+        else:
+            geo = self._dashboard_normal_geometry
+            self._dashboard_normal_geometry = None
+            if geo is not None:
+                self.setGeometry(geo)
+                self.move(_on_screen_pos(self, geo.topLeft()))
+            self._apply_layout()   # back to the hands-free view when that is on
+        if notify_engine:
+            try:
+                self._actions.set_dashboard_mode(enabled)
+            except Exception:
+                log.exception("actions.set_dashboard_mode(%r) failed", enabled)
+        self.show_toast("Dashboard mode" if enabled else "Full overlay")
+
+    def _apply_dashboard_geometry(self) -> None:
+        geo = self._dashboard_normal_geometry or self.geometry()
+        screen = QGuiApplication.screenAt(geo.center()) or self.screen() or QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        try:
+            wanted = int(self._cfg.dashboard.width)
+        except (TypeError, ValueError):
+            wanted = geo.width()
+        width = max(_MIN_WIDTH, wanted, geo.width())
+        height = geo.height()
+        if avail is not None:
+            width = min(width, avail.width())
+            height = min(max(height, _MIN_HEIGHT), avail.height())
+        x = geo.right() - width + 1   # grow leftwards from the panel's right edge
+        y = geo.y()
+        if avail is not None:
+            x = max(avail.left(), min(x, avail.right() - width + 1))
+            y = max(avail.top(), min(y, avail.bottom() - height + 1))
+        self.setGeometry(x, y, width, height)
+        self.move(_on_screen_pos(self, QPoint(x, y)))
+
+    def _on_dashboard_refresh(self, sections: tuple = ()) -> None:
+        """A column's ↻ (one section) or "Refresh all" (everything: the board and the notes)."""
+        secs = tuple(str(s) for s in (sections or ()) if str(s).strip())
+        try:
+            self._actions.dashboard_refresh(secs)
+            if not secs:
+                self._actions.generate_notes()
+        except Exception:
+            log.exception("actions.dashboard_refresh(%r) failed", secs)
+
+    def _on_dashboard_item(self, item_id: int, action: str, text: str) -> None:
+        try:
+            self._actions.dashboard_item(int(item_id), str(action), str(text or ""))
+        except Exception:
+            log.exception("actions.dashboard_item(%r, %r) failed", item_id, action)
+
+    def _on_dashboard_add(self, kind: str, text: str) -> None:
+        try:
+            self._actions.dashboard_add(str(kind), str(text))
+        except Exception:
+            log.exception("actions.dashboard_add(%r) failed", kind)
+
+    def _on_dashboard_updated(self, ev: DashboardUpdatedEvent) -> None:
+        if self.dashboard_view is not None:
+            self.dashboard_view.set_snapshot(ev.items, ev.notes, ev.notes_at, ev.generated_at, ev.detail)
 
     def _build_control_row(self) -> QWidget:
         """Always-visible bottom controls, one row, left -> right: read the screen now, revert to
@@ -1296,6 +1478,8 @@ class OverlayWindow(QWidget):
         self.live_view.clear()
         self.notes_view.clear()
         self._set_notes_badge(False)
+        if self.dashboard_view is not None:
+            self.dashboard_view.clear()
         self.screen_view.finish_suggestion("", cancelled=True, footer="")
         self._plan_text = self._explain_text = ""
         self._plan_job = self._explain_job = None
@@ -1407,8 +1591,9 @@ class OverlayWindow(QWidget):
 
     def _apply_layout(self) -> None:
         """Show / hide the full overlay's parts for the hands-free view (a no-op in completion
-        mode, whose slim bar owns the layout; ``_set_completion_mode`` re-applies this on exit)."""
-        if self._completion_mode:
+        mode, whose slim bar owns the layout, and in dashboard mode, whose board does;
+        ``_set_completion_mode`` / ``_set_dashboard_mode`` re-apply this on exit)."""
+        if self._completion_mode or self._dashboard_mode:
             return
         hf = self._hands_free
         for w in (self.askbox, self.control_row, self.status, self.size_grip, self.clickthrough_btn):
@@ -1531,7 +1716,7 @@ class OverlayWindow(QWidget):
         try:
             if not self.isVisible() or not self.frameGeometry().contains(pos):
                 return False
-            if self._hands_free and not self._completion_mode:
+            if self._hands_free_view_active:
                 return self._hands_free_clickable_at(pos)
             if self._click_through:
                 return False
@@ -1566,7 +1751,7 @@ class OverlayWindow(QWidget):
         """The output pane under a global cursor position in the hands-free view -- the answer
         browser, or the history list when it is expanded (any ``QAbstractScrollArea`` of the
         view) -- else None."""
-        if not (self._hands_free and not self._completion_mode and self.isVisible()):
+        if not (self._hands_free_view_active and self.isVisible()):
             return None
         if not self.frameGeometry().contains(pos):
             return None
@@ -1642,7 +1827,7 @@ class OverlayWindow(QWidget):
         pane the wheel scrolls that pane although the window is click-through there, and over
         the history Up / Down taps snap through its entries.
         """
-        if not (self._hands_free and not self._completion_mode and self.isVisible()):
+        if not (self._hands_free_view_active and self.isVisible()):
             self._release_hover_hooks()
             return
         if not (_is_windows_platform() and win32 is not None):
@@ -1694,6 +1879,11 @@ class OverlayWindow(QWidget):
             submenu.deleteLater()
         self._menu.clear()
         self._populate_assist_menu(self._menu.addMenu("Assist"))
+        dashboard_action = self._menu.addAction(f"Dashboard mode{_hotkey_hint(self._cfg.hotkeys.toggle_dashboard)}")
+        dashboard_action.setCheckable(True)
+        dashboard_action.setChecked(self._dashboard_mode)
+        dashboard_action.setEnabled(self.dashboard_view is not None)
+        dashboard_action.toggled.connect(lambda checked: self._set_dashboard_mode(checked))
         self._menu.addSeparator()
         export_action = self._menu.addAction("Export session")
         export_action.triggered.connect(self._on_export)
@@ -1739,6 +1929,7 @@ class OverlayWindow(QWidget):
         menu.addAction(f"Recap the session{_hotkey_hint(h.recap)}").triggered.connect(lambda: self._on_recap())
         menu.addAction(f"Regenerate notes{_hotkey_hint(h.notes)}").triggered.connect(
             lambda: self._actions.generate_notes())
+        menu.addAction("Refresh the dashboard now").triggered.connect(lambda: self._on_dashboard_refresh(()))
         menu.addSeparator()
         switches = (
             ("Suggest questions automatically", a.suggest_questions,
@@ -1976,6 +2167,7 @@ class OverlayWindow(QWidget):
             h.toggle_manual: lambda: self._set_manual(not self._manual),
             h.insights: lambda: self._on_insights_now(()),
             h.recap: self._on_recap,
+            h.toggle_dashboard: lambda: self._set_dashboard_mode(not self._dashboard_mode),
             h.quit: self.close,
         }
         # A hotkey left empty is off (see HotkeysConfig): never hand "" to RegisterHotKey, where it
@@ -2131,6 +2323,8 @@ class OverlayWindow(QWidget):
         self._toast_timer.stop()
         self.assist_view.shutdown()
         self.notes_view.shutdown()
+        if self.dashboard_view is not None:
+            self.dashboard_view.shutdown()
         if self._settings is not None:
             self._settings.close()
         if self._ghost is not None:
@@ -2162,7 +2356,14 @@ class OverlayWindow(QWidget):
         self.close()
 
     def _save_geometry(self) -> None:
-        geo = self._normal_geometry if (self._completion_mode and self._normal_geometry is not None) else self.geometry()
+        if self._dashboard_mode and self._dashboard_normal_geometry is not None:
+            # The persisted window size is the NORMAL one; the board's own width is its setting.
+            geo = self._dashboard_normal_geometry
+            self._cfg.dashboard.width = max(_MIN_WIDTH, self.width())
+        elif self._completion_mode and self._normal_geometry is not None:
+            geo = self._normal_geometry
+        else:
+            geo = self.geometry()
         self._cfg.ui.x = geo.x()
         self._cfg.ui.y = geo.y()
         self._cfg.ui.width = geo.width()
@@ -2191,8 +2392,8 @@ class OverlayWindow(QWidget):
             self._on_assist_started(ev)
         elif isinstance(ev, AssistDeltaEvent):
             kind = self._assist_job_kinds.get(ev.job_id)
-            if kind == "complete":
-                pass   # inline completions are rendered by the ghost window, never in a tab
+            if kind in ("complete", "dashboard"):
+                pass   # inline completions: the ghost window; a dashboard refresh: applied to the board on Done
             elif kind == "suggest":
                 self.screen_view.append_suggestion(ev.delta)
             elif kind == "insights":
@@ -2204,6 +2405,9 @@ class OverlayWindow(QWidget):
             kind = self._assist_job_kinds.pop(ev.job_id, None)
             if kind == "complete":
                 pass
+            elif kind == "dashboard":
+                if self.dashboard_view is not None:
+                    self.dashboard_view.finish_update(ev.job_id, ev.cancelled and not ev.skipped)
             elif kind == "suggest":
                 self.screen_view.finish_suggestion(ev.text, ev.cancelled, _assist_footer(ev))
             elif kind == "insights":
@@ -2215,6 +2419,9 @@ class OverlayWindow(QWidget):
             kind = self._assist_job_kinds.pop(ev.job_id, None)
             if kind == "complete":
                 self._set_completion_status("error", ev.message)
+            elif kind == "dashboard":
+                if self.dashboard_view is not None:
+                    self.dashboard_view.update_error(ev.job_id, ev.message)
             elif kind == "suggest":
                 self.screen_view.show_error(ev.message)
             elif kind == "insights":
@@ -2240,8 +2447,15 @@ class OverlayWindow(QWidget):
             self.status.set_screen_status(ev.state, ev.detail)
         elif isinstance(ev, NotesUpdatedEvent):
             self.notes_view.set_notes(ev.markdown, ev.generated_at)
+            if self.dashboard_view is not None:
+                self.dashboard_view.set_notes(ev.markdown, ev.generated_at)
         elif isinstance(ev, InsightsUpdatedEvent):
             self._on_insights_updated(ev)
+        elif isinstance(ev, DashboardUpdatedEvent):
+            self._on_dashboard_updated(ev)
+        elif isinstance(ev, DashboardModeEvent):
+            if ev.enabled != self._dashboard_mode:
+                self._set_dashboard_mode(ev.enabled, notify_engine=False)
         elif isinstance(ev, NotesErrorEvent):
             self.notes_view.set_error(ev.message)
             self.show_toast(f"Notes error: {ev.message}")
@@ -2294,6 +2508,10 @@ class OverlayWindow(QWidget):
         self._assist_job_kinds[ev.job_id] = ev.kind
         if ev.kind == "complete":
             return
+        if ev.kind == "dashboard":
+            if self.dashboard_view is not None:
+                self.dashboard_view.begin_update(ev.job_id, ev.question)   # never switches tabs or views
+            return
         if ev.kind == "insights":
             self.notes_view.begin_insights(ev.job_id, ev.question)   # never switches tabs
             return
@@ -2317,6 +2535,10 @@ class OverlayWindow(QWidget):
             self._set_completion_status(ev.state, ev.detail)
             if ev.state == "error":
                 self.show_toast(f"Completion: {ev.detail or 'error'}")
+            return
+        elif ev.component in ("context", "dashboard"):
+            # A toolkit discovered / installed mid-session, a dashboard problem: say so, never a dot.
+            self.show_toast(ev.detail or ev.component)
             return
         elif ev.state == "error":
             self.show_toast(f"{ev.component}: {ev.detail or 'error'}")

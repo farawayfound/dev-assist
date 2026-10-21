@@ -109,6 +109,20 @@ _FOCUS_RULE = (
 #: Exact reply the model gives when there is nothing technical to do; callers drop such answers.
 SKIP_MARKER = "(nothing to do)"
 
+#: The standing instruction that goes with a <toolkit> block (exocortex.context: the Claude Code
+#: skills / agents / rules installed in the user's repository, auto-discovered): name what is
+#: listed exactly as listed, never invent one. Config-only text, so a system prompt carrying it
+#: stays byte-identical across turns (the KV-cache rule in the module docstring).
+TOOLKIT_RULE = (
+    "A <toolkit> block lists the Claude Code skills, agents, rules and workflows installed in the "
+    "user's repository, each with the exact way it is typed or named. When a next step, an answer or "
+    "a suggested prompt calls for one, name it exactly as listed, with a real argument; never invent "
+    "or guess a skill, agent or command that is not listed. A <toolkit_detail> block, when present, "
+    "is the full text of a part that was mentioned -- use it to be precise about what that part does."
+)
+#: Public names for the pieces exocortex.dashboard.prompts builds its own system prompt from.
+FOCUS_RULE = _FOCUS_RULE
+
 #: Multiple-choice questions: how to read enumerated options, and how to answer when the user
 #: turn carries a <choices> block. Always part of the system prompt, byte-identical every turn
 #: (a system prompt that changes per turn would defeat the KV prefix cache) -- the behaviour is
@@ -143,6 +157,17 @@ def _context_lines(context: str) -> list[str]:
     """
     text = " ".join((context or "").split())
     return [f"Session context (what the team is working on): {text}"] if text else []
+
+
+context_lines = _context_lines
+
+
+def _extra_block(extra: str) -> str:
+    """Render the optional on-demand context blocks a user turn carries right before its ask
+    (``<repo>`` lines from the project, ``<toolkit_detail>``: exocortex.context) -- "" when
+    there is none. Volatile, so always after the screen block."""
+    text = (extra or "").strip()
+    return f"{text}\n\n" if text else ""
 
 
 def system_ask(persona: str, context: str = "") -> str:
@@ -458,13 +483,14 @@ def system_solve(persona: str, explain: bool = False, comments: str = "normal", 
     return "\n".join(lines)
 
 
-def user_solve(transcript_window: str, screen_text: str, focus: str = "", choices: str = "") -> str:
+def user_solve(transcript_window: str, screen_text: str, focus: str = "", choices: str = "", extra: str = "") -> str:
     """User turn for `system_solve`: transcript (stable) then screen (volatile) then the ask.
 
     `focus` carries a direction the user picked from a previous `CHOICE_PREFIX` prompt (or a
     manual instruction); blank means "solve whatever is on screen". `choices` is the rendered
     <choices> block (`exocortex.llm.choices.choices_block`) when the screen shows a
     multiple-choice question, else ""; it sits after the screen text, right before the ask.
+    `extra` (on-demand context: `_extra_block`) goes between the screen and the choices.
     """
     ask = focus.strip() or (
         "Solve whatever task, problem, or question is shown on the screen above. "
@@ -473,7 +499,7 @@ def user_solve(transcript_window: str, screen_text: str, focus: str = "", choice
     return (
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{choices}{ask}"
+        f"{_extra_block(extra)}{choices}{ask}"
     )
 
 
@@ -514,9 +540,9 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
     return "\n".join(lines)
 
 
-def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "") -> str:
+def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "") -> str:
     """User turn for `system_code`: transcript (stable) -> previous code (only when present) ->
-    screen (volatile) -> the ask.
+    screen (volatile) -> on-demand context (`extra`, only when present) -> the ask.
 
     `transcript_window` is already scoped to the segments since the last checkpoint (see
     `Assistant.checkpoint`); "(nothing said since the checkpoint)" when there is none yet.
@@ -535,7 +561,7 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{ask}"
+        f"{_extra_block(extra)}{ask}"
     )
 
 
@@ -585,10 +611,11 @@ def system_text(persona: str, context: str = "") -> str:
     return "\n".join(lines)
 
 
-def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "") -> str:
+def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "") -> str:
     """User turn for `system_text`: the same checkpoint-scoped transcript -> previous code (only
-    when present) -> screen -> ask layout as `user_code`, with the ask asking for the walkthrough.
-    `focus` is an optional extra instruction; blank falls back to the default ask below."""
+    when present) -> screen -> on-demand context -> ask layout as `user_code`, with the ask asking
+    for the walkthrough. `focus` is an optional extra instruction; blank falls back to the default
+    ask below."""
     ask = focus.strip() or (
         "Walk me through, in plain English, the task or question described in the transcript above "
         "and/or shown on the screen: what is asked, the key insight, the approach step by step, the "
@@ -600,7 +627,7 @@ def user_text(transcript_window: str, screen_text: str, previous: str = "", focu
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{ask}"
+        f"{_extra_block(extra)}{ask}"
     )
 
 
@@ -895,6 +922,9 @@ _QUESTION_AUDIENCE: dict[str, str] = {
     "navigator": "the driver",
     "participant": "the group",
 }
+#: Public names (exocortex.dashboard.prompts frames its refresh prompt with the same role text).
+ROLE_FRAMES = _ROLE_FRAMES
+QUESTION_AUDIENCE = _QUESTION_AUDIENCE
 
 
 def _insight_rule(section: str, role: str, max_items: int) -> str:
@@ -1099,17 +1129,17 @@ def system_recap(persona: str = "", context: str = "") -> str:
     return "\n".join(lines)
 
 
-def user_recap(transcript_window: str, notes: str = "", screen_text: str = "", focus: str = "") -> str:
+def user_recap(transcript_window: str, notes: str = "", screen_text: str = "", focus: str = "", extra: str = "") -> str:
     """User turn for `system_recap`: transcript (stable) -> running notes (only when there are
-    any) -> screen (volatile, only when there is any) -> the ask. `focus` is an optional extra
-    instruction; blank falls back to the default ask."""
+    any) -> screen (volatile, only when there is any) -> on-demand context (only when there is
+    any) -> the ask. `focus` is an optional extra instruction; blank falls back to the default ask."""
     ask = focus.strip() or "Recap the session now, as instructed."
     notes_block = f"<notes>\n{notes.strip()}\n</notes>\n\n" if (notes or "").strip() else ""
     return (
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{notes_block}"
         f"{_screen_block(screen_text)}"
-        f"{ask}"
+        f"{_extra_block(extra)}{ask}"
     )
 
 
@@ -1187,7 +1217,7 @@ def _notes_body() -> str:
     )
 
 
-def user_assist(transcript_window: str, question: str, screen_text: str = "", choices: str = "") -> str:
+def user_assist(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "") -> str:
     """User turn for `system_assist`: transcript context, optional screen text, then the question.
 
     STABLE-PREFIX ORDER: `transcript_window` only ever grows by appending new lines at its end, so
@@ -1195,25 +1225,26 @@ def user_assist(transcript_window: str, question: str, screen_text: str = "", ch
     byte-identical across consecutive assist turns, which is what lets the KV prefix cache be
     reused instead of re-evaluating the whole prompt on every question (see module docstring).
     The <screen> block changes often, so it goes AFTER the transcript and before the question;
-    `choices` (the rendered <choices> block of a multiple-choice question, else "") follows it.
+    `extra` (on-demand context, `_extra_block`) and `choices` (the rendered <choices> block of a
+    multiple-choice question, else "") follow it.
     """
     return (
         f"<transcript>\n{transcript_window}\n</transcript>\n\n"
-        f"{_screen_block(screen_text)}{choices}"
+        f"{_screen_block(screen_text)}{_extra_block(extra)}{choices}"
         "The other participant just asked the question below. Answer it as instructed in the "
         "system prompt.\n"
         f"<question>\n{question}\n</question>"
     )
 
 
-def user_ask(transcript_window: str, question: str, screen_text: str = "", choices: str = "") -> str:
+def user_ask(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "") -> str:
     """User turn for `system_ask`: transcript context, optional screen text, then the question.
 
     Same stable-prefix ordering as `user_assist` -- see module docstring.
     """
     return (
         f"<transcript>\n{transcript_window}\n</transcript>\n\n"
-        f"{_screen_block(screen_text)}{choices}"
+        f"{_screen_block(screen_text)}{_extra_block(extra)}{choices}"
         "Answer the question below, using the transcript above (and the screen text, if any) for "
         "context where it's relevant.\n"
         f"<question>\n{question}\n</question>"

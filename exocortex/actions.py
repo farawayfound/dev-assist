@@ -115,8 +115,10 @@ class EngineActions(Protocol):
         answer, may be empty), "dismiss" (drop it), "reopen", or "edit" (`text` = the new
         wording). Publishes a `DashboardUpdatedEvent`."""
 
-    def dashboard_add(self, kind: str, text: str) -> None:
-        """Add an item of `kind` ("question" | "blindspot" | "nextstep" | "prompt") by hand."""
+    def dashboard_add(self, kind: str, text: str, parent_id: int | None = None) -> None:
+        """Add an item of `kind` ("nextstep" | "goal" | "constraint" | "question" | "blindspot" |
+        "prompt") by hand. `parent_id` (an action item) makes a "nextstep" a sub-task and attaches
+        a "goal" or "prompt" to it."""
 
     # ---- completion mode ----
     def set_completion_mode(self, enabled: bool) -> None:

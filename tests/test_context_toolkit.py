@@ -174,6 +174,26 @@ def test_render_catalog_fits_its_budget_and_sheds_detail_in_order(tmp_path: Path
     assert len(tiny) <= 420 and "Rules:" not in tiny and "Hooks:" not in tiny
 
 
+def test_example_command_prefers_the_first_skill_the_working_loop_names(tmp_path: Path) -> None:
+    _install(tmp_path)
+    assert tk.discover(tmp_path).example_command() == "/recon [topic]"          # /pr-brief sorts first; the loop opens with /recon
+    bare = tmp_path / "bare"
+    _install(bare, agents=False, rules=False, extras=False)                       # no house rules, so no loop
+    assert tk.discover(bare).example_command() == "/pr-brief [base-branch]"
+    assert tk.ToolkitCatalog().example_command() == ""
+
+
+def test_check_prompt_rejects_commands_and_agents_that_are_not_installed(tmp_path: Path) -> None:
+    _install(tmp_path)
+    cat = tk.discover(tmp_path)
+    for fine in ("/recon segment evaluation", "/pr-brief main", "/gate", "/tk:recon the export path",
+                 "Use the reviewer agent on export(), one lens: auth", "Write a failing test for export()", ""):
+        assert tk.check_prompt(cat, fine), fine
+    for bad in ("/bogus run it", "/reviewer", "Use the ghost agent on x", "/rules"):
+        assert not tk.check_prompt(cat, bad), bad
+    assert tk.check_prompt(tk.ToolkitCatalog(), "/bogus run it")                  # nothing installed: nothing to check against
+
+
 def test_mentions_and_lookup(tmp_path: Path) -> None:
     _install(tmp_path)
     cat = tk.discover(tmp_path)

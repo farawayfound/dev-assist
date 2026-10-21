@@ -254,10 +254,10 @@ class Engine(EngineActions):
             self.context = ContextProvider(self.cfg, self.clock)
             if self.assistant is not None and hasattr(self.assistant, "set_context_provider"):
                 self.assistant.set_context_provider(self.context)
-            summary = self.context.toolkit_summary()
-            if summary:
-                log.info("context: Claude Code toolkit found: %s", summary)
-                self._status("context", "info", f"Claude Code toolkit: {summary}")
+            detail = f"Context: {self.context.context_summary()}"
+            log.info("%s", detail)
+            if self.context.repo_root is not None:      # a repository was found: say which (a toast)
+                self._status("context", "info", detail)
         except Exception as e:  # noqa: BLE001
             log.exception("context provider failed to start")
             self.context = None
@@ -855,9 +855,9 @@ class Engine(EngineActions):
         if self.dashboard is not None:
             self.dashboard.item_action(int(item_id), str(action), str(text or ""))
 
-    def dashboard_add(self, kind: str, text: str) -> None:
+    def dashboard_add(self, kind: str, text: str, parent_id: int | None = None) -> None:
         if self.dashboard is not None:
-            self.dashboard.add_item(str(kind), str(text))
+            self.dashboard.add_item(str(kind), str(text), int(parent_id) if parent_id is not None else None)
 
     def set_auto_suggest(self, enabled: bool) -> None:
         self.cfg.screen.auto_suggest = enabled
@@ -1038,6 +1038,11 @@ class Engine(EngineActions):
                 self.screen.capture_now()   # wakes the capture loop so the new cadence starts now
             except Exception:  # noqa: BLE001
                 log.debug("capture_now after settings change failed", exc_info=True)
+        if "screen.monitor" in changed and self.screen is not None:
+            try:
+                self.screen.set_monitor(int(changed["screen.monitor"]))   # the View menu's monitor choice
+            except Exception:  # noqa: BLE001
+                log.exception("set_monitor after settings change failed")
         if "handsfree.enabled" in changed:
             self.set_hands_free(bool(changed["handsfree.enabled"]))
         if "handsfree.manual" in changed:
@@ -1046,9 +1051,7 @@ class Engine(EngineActions):
         if any(k.startswith("context.") for k in changed) and self.context is not None:
             try:
                 self.context.reconfigure()      # a new repo root / toolkit dir: re-index, rescan now
-                summary = self.context.toolkit_summary()
-                self._status("context", "info",
-                             f"Claude Code toolkit: {summary}" if summary else "no Claude Code toolkit found")
+                self._status("context", "info", f"Context: {self.context.context_summary()}")
             except Exception:  # noqa: BLE001
                 log.exception("context reconfigure failed")
         if "dashboard.enabled" in changed:

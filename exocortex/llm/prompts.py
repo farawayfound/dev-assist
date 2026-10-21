@@ -1177,6 +1177,18 @@ _DEV_NOTES_RULE = (
     "files, services, tickets, numbers) from the transcript."
 )
 
+#: The same, when the dashboard keeps the action items (tasks and sub-tasks), goals, constraints
+#: and questions in its own database: the notes hold only the narrative.
+_DEV_NOTES_RULE_TRACKED = (
+    "This is a working session of software engineers (pair programming, a team coding or debugging "
+    "session): under \"## Key points\" record the technical substance -- the scope of the brief, what "
+    "was changed in the code (files, functions, modules by name), bugs found and their root cause, "
+    "design choices and the trade-offs behind them, commands, configuration or environment details "
+    "that matter; under \"## Decisions\" each technical decision with its reason in a few words; "
+    "under \"## Open questions\" the technical questions still unresolved. Use the exact names "
+    "(functions, files, services, tickets, numbers) from the transcript."
+)
+
 _NOTES_OUTPUT_RULE = "Output only the markdown document itself, nothing before or after it."
 
 
@@ -1186,20 +1198,41 @@ def normalize_notes_template(value: object) -> str:
     return key if key in NOTES_TEMPLATES else "dev"
 
 
-def system_notes(template: str = "meeting") -> str:
+def system_notes(template: str = "meeting", *, tracked: bool = False) -> str:
     """System prompt for maintaining the running notes document.
 
     `template` (`[notes].template`, `NOTES_TEMPLATES`): "meeting" is the original general-meeting
     prompt, unchanged; "dev" adds `_DEV_NOTES_RULE` right before the closing "Output only ..."
-    line, steering the same five headings toward a working session. Config-only text.
+    line, steering the same five headings toward a working session. `tracked` (dashboard mode is
+    on): the action items, goals, constraints and questions live in the dashboard's database, so
+    the document is narrative only -- four headings, no "## Action items". Config-only text.
     """
-    if normalize_notes_template(template) == "dev":
+    dev = normalize_notes_template(template) == "dev"
+    if tracked:
+        return "\n".join((_notes_body(tracked=True), *((_DEV_NOTES_RULE_TRACKED,) if dev else ()), _NOTES_OUTPUT_RULE))
+    if dev:
         return f"{_notes_body()}\n{_DEV_NOTES_RULE}\n{_NOTES_OUTPUT_RULE}"
     return f"{_notes_body()}\n{_NOTES_OUTPUT_RULE}"
 
 
-def _notes_body() -> str:
+def _notes_body(*, tracked: bool = False) -> str:
     """Everything in the notes prompt before its closing output rule (shared by both templates)."""
+    if tracked:
+        return (
+            "You are maintaining running notes for a live meeting. Rewrite the full notes document in "
+            "markdown using EXACTLY these four headings, in this order, each alone on its own line: "
+            "\"## Summary\", \"## Key points\", \"## Decisions\", \"## Open questions\". Never add, remove, "
+            "rename, reorder, or duplicate a heading.\n"
+            "The tasks and sub-tasks, the goals (acceptance criteria), the constraints and the questions to "
+            "ask are tracked elsewhere: do not list them here and do not write a heading for them.\n"
+            "Keep every still-true fact from the <previous_notes> (if any) and merge in whatever new "
+            "information <new_transcript> adds; drop only what the new transcript has clearly "
+            "superseded or corrected. Be concise: short bullet points, no long paragraphs, no repeated "
+            "information, no invented facts.\n"
+            "\"## Summary\" is 1-3 sentences of plain prose: what the session is about and where it stands. "
+            "\"## Key points\", \"## Decisions\" and \"## Open questions\" are each a \"- \" bullet list "
+            "(write a single \"- (none)\" line if empty)."
+        )
     return (
         "You are maintaining running notes for a live meeting. Rewrite the full notes document in "
         "markdown using EXACTLY these five headings, in this order, each alone on its own line: "

@@ -103,6 +103,18 @@ class ToolkitCatalog:
                 counts.append(f"{n} {kind}{'s' if n != 1 else ''}")
         return ", ".join(counts)
 
+    def example_command(self) -> str:
+        """A real command to show the model what a prompt looks like: the first skill the house
+        rules' working loop names, else the first skill or workflow (``/recon [topic]``); "" when
+        there is none. Read from the installed files, never hard-coded."""
+        commands = [p for p in self.parts if p.kind in ("skill", "workflow")]
+        if not commands:
+            return ""
+        loop = " ".join(self.loop).casefold()
+        named = [(loop.find(f"/{p.name.casefold()}"), p) for p in commands]
+        named = [(at, p) for at, p in named if at >= 0]
+        return min(named, key=lambda t: t[0])[1].command if named else commands[0].command
+
 
 # ---------------------------------------------------------------------- frontmatter --------
 def _unquote(value: str) -> str:
@@ -539,6 +551,28 @@ def mentioned_parts(cat: ToolkitCatalog, text: str) -> list[ToolkitPart]:
         if re.search(rf"\b{name}\b\s+{_KIND_WORDS}\b", low) or re.search(rf"\b{_KIND_WORDS}\s+(?:called\s+|named\s+)?{name}\b", low):
             out.append(p)
     return out
+
+
+_SLASH_COMMAND_RE = re.compile(r"^/([A-Za-z0-9][\w:.-]*)")
+_USE_AGENT_RE = re.compile(r"^use the ([\w-]+) agent\b", re.IGNORECASE)
+
+
+def check_prompt(cat: ToolkitCatalog, text: str) -> bool:
+    """Whether a suggested prompt names only things that are installed: False for one that opens
+    with a slash command that is not a skill / workflow in `cat` (a plugin namespace such as
+    ``/tk:recon`` is ignored) or with "Use the <x> agent" for an agent it does not have. A prompt
+    that names neither, and any prompt when nothing is installed, passes."""
+    if cat.is_empty:
+        return True
+    t = (text or "").strip()
+    m = _SLASH_COMMAND_RE.match(t)
+    if m is not None:
+        part = cat.find(m.group(1).rsplit(":", 1)[-1])
+        return part is not None and part.kind in ("skill", "workflow")
+    m = _USE_AGENT_RE.match(t)
+    if m is not None:
+        return cat.find(m.group(1), "agent") is not None
+    return True
 
 
 def lookup(cat: ToolkitCatalog, text: str, max_chars: int = 3000) -> str:

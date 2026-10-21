@@ -29,9 +29,11 @@ A background refresh never switches tabs and never touches the Assist tab. When 
 you are elsewhere, the Notes tab shows a dot (**Notes •**) until you look.
 
 **Dashboard mode** (`Ctrl+Alt+D`, the **▦** button) shows the same things as a board you can keep
-on a second screen: the notes, the questions (each tracked until the conversation answers it,
-then kept with its answer), the blind spots and follow-ups (tracked the same way), and the next
-steps with the prompts to type into Claude Code. While the dashboard tracks the session (the
+on a second screen: the notes, the action items as a tree (the tasks, their sub-tasks, and under
+each the prompt to type into Claude Code), the goals (acceptance criteria per task), the
+constraints and guardrails in force, the questions (each tracked until the conversation answers
+it, then kept with its answer) and the blind spots and follow-ups (tracked the same way); any
+column can be hidden under **⋯ › View**. While the dashboard tracks the session (the
 default), its refreshes replace the background insights passes described below, and the Insights
 pane shows the board's open items. The tracked items live in a small database in the session
 folder, not in the model's context, and dev-assist discovers a Claude Code toolkit installed in

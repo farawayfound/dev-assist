@@ -2,9 +2,12 @@
 
 :class:`ContextProvider` reads ``[context]`` live on every call: the toolkit catalog
 (:mod:`exocortex.context.toolkit`, re-scanned on the configured cadence by :meth:`refresh`) and
-the repository index (:mod:`exocortex.context.repo`, rebuilt when ``repo_root`` changes --
-:meth:`reconfigure`). Every method returns "" when its feature is off or has nothing to say, so
-a caller can always just append what it gets.
+the repository index (:mod:`exocortex.context.repo`, rebuilt when the repository changes --
+:meth:`reconfigure`, and on every :meth:`refresh`). The repository is ``[context].repo_root`` when
+set; otherwise, with ``repo_auto``, the directory Claude Code was most recently run in
+(:mod:`exocortex.context.detect`), so a toolkit installed in the project being worked on is found
+with no setup. Every method returns "" when its feature is off or has nothing to say, so a caller
+can always just append what it gets.
 """
 from __future__ import annotations
 
@@ -15,10 +18,14 @@ from collections.abc import Callable
 from pathlib import Path
 
 from exocortex.config import Config
+from exocortex.context.detect import detect_repo_root
 from exocortex.context.repo import RepoIndex, extract_terms, render_hits
-from exocortex.context.toolkit import ToolkitCatalog, ToolkitWatcher, lookup, render_catalog
+from exocortex.context.toolkit import ToolkitCatalog, ToolkitWatcher, check_prompt, lookup, render_catalog
 
 log = logging.getLogger(__name__)
+
+#: The auto-detected repository is looked up again at most this often (seconds).
+_AUTO_TTL_S = 15.0
 
 
 class ContextProvider:
@@ -28,8 +35,10 @@ class ContextProvider:
         self._lock = threading.RLock()
         self._home = home
         c = cfg.context
+        self._auto: str = ""
+        self._auto_at: float | None = None
         self._watcher = ToolkitWatcher(
-            lambda: self._cfg.context.repo_root, user_layer=lambda: self._cfg.context.toolkit_user_layer,
+            self.effective_root, user_layer=lambda: self._cfg.context.toolkit_user_layer,
             toolkit_dir=lambda: self._cfg.context.toolkit_dir, rescan_s=lambda: self._cfg.context.rescan_s,
             clock=self._clock, home=home,
         )
@@ -38,24 +47,68 @@ class ContextProvider:
         self._index_exclude: tuple[str, ...] = tuple(c.repo_exclude)
         self.reconfigure()
 
+    # ---- which repository ------------------------------------------------------------------
+    def effective_root(self) -> str:
+        """``[context].repo_root`` when set, else (``repo_auto``) the directory Claude Code last
+        ran in, else "". The auto-detected one is cached for a few seconds."""
+        c = self._cfg.context
+        explicit = (c.repo_root or "").strip()
+        if explicit:
+            return explicit
+        return self._auto_root() if c.repo_auto else ""
+
+    @property
+    def repo_source(self) -> str:
+        """"config" (an explicit repo_root), "auto" (detected from Claude Code) or "" (none)."""
+        c = self._cfg.context
+        if (c.repo_root or "").strip():
+            return "config"
+        return "auto" if c.repo_auto and self._auto_root() else ""
+
+    def _auto_root(self) -> str:
+        now = self._clock()
+        with self._lock:
+            if self._auto_at is not None and now - self._auto_at < _AUTO_TTL_S:
+                return self._auto
+        try:
+            hours = max(0, int(self._cfg.context.repo_auto_max_age_h))
+        except (TypeError, ValueError):
+            hours = 12
+        try:
+            found = detect_repo_root(self._home, max_age_s=hours * 3600.0)
+        except Exception:  # noqa: BLE001 - detection is best effort
+            log.debug("repo auto-detection failed", exc_info=True)
+            found = None
+        with self._lock:
+            self._auto = str(found) if found is not None else ""
+            self._auto_at = now
+            return self._auto
+
     # ---- configuration ------------------------------------------------------------------
     def reconfigure(self) -> None:
-        """Apply a changed ``[context]``: rebuild the repo index when the root (or the exclude
-        list) changed, and force the next :meth:`refresh` to rescan the toolkit."""
-        c = self._cfg.context
-        root = (c.repo_root or "").strip()
+        """Apply a changed ``[context]``: forget the auto-detected repository, rebuild the repo
+        index when the root (or the exclude list) changed, and force the next :meth:`refresh` to
+        rescan the toolkit."""
         with self._lock:
-            exclude = tuple(c.repo_exclude)
+            self._auto_at = None
+            self._sync_index()
+            self._watcher.refresh(force=True)
+
+    def _sync_index(self) -> None:
+        root = self.effective_root()
+        exclude = tuple(self._cfg.context.repo_exclude)
+        with self._lock:
             if root != self._index_root or exclude != self._index_exclude or (root and self._index is None):
                 self._index = RepoIndex(root, exclude=exclude, clock=self._clock) if root else None
                 self._index_root = root
                 self._index_exclude = exclude
-            self._watcher.refresh(force=True)
 
     def refresh(self, *, force: bool = False) -> bool:
-        """Rescan the toolkit when due; True when the catalog changed (an install / update)."""
+        """Re-check the repository and rescan the toolkit when due; True when the catalog (or the
+        repository it was found in) changed -- an install, an update, another project."""
         with self._lock:
             try:
+                self._sync_index()
                 return self._watcher.refresh(force=force)
             except Exception:  # noqa: BLE001 - a scan must never break a tick
                 log.exception("toolkit rescan failed")
@@ -79,6 +132,17 @@ class ContextProvider:
         parts = cat.summary() or "house rules only"
         return f"{parts} ({cat.root})" if cat.root else parts
 
+    def context_summary(self) -> str:
+        """One line for a toast: the repository and where it came from, then the toolkit found in
+        it -- "Scenario1 (detected from Claude Code): toolkit 8 skills, 5 agents"."""
+        root = self.repo_root
+        source = {"config": "[context].repo_root", "auto": "detected from Claude Code"}.get(self.repo_source, "")
+        if root is None:
+            return "no repository (set one: View > Repository, or [context].repo_root)"
+        cat = self.catalog
+        toolkit = (cat.summary() or "house rules only") if not cat.is_empty else "no toolkit installed"
+        return f"{root.name}" + (f" ({source})" if source else "") + f": {toolkit}"
+
     def toolkit_block(self) -> str:
         """The ``<toolkit>`` catalog for a system prompt, or ""."""
         if not self._cfg.context.toolkit:
@@ -88,6 +152,19 @@ class ContextProvider:
             return ""
         body = render_catalog(cat, max_chars=max(300, int(self._cfg.context.toolkit_max_chars)))
         return f"<toolkit>\n{body}\n</toolkit>" if body else ""
+
+    def toolkit_example(self) -> str:
+        """A real installed command (``/recon [topic]``) to show the model a prompt's shape."""
+        if not self._cfg.context.toolkit:
+            return ""
+        return self.catalog.example_command()
+
+    def check_prompt(self, text: str) -> bool:
+        """Whether a suggested prompt names only skills / agents that are installed (always True
+        when the toolkit catalog is off or empty)."""
+        if not self._cfg.context.toolkit:
+            return True
+        return check_prompt(self.catalog, text)
 
     def toolkit_lookup(self, *texts: str, max_chars: int = 3000) -> str:
         """The ``<toolkit_detail>`` block: the full text of the parts `texts` mention, or ""."""

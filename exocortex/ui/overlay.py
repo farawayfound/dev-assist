@@ -134,8 +134,10 @@ except Exception:  # pragma: no cover - models.py may be missing/mid-implementat
     log.warning("exocortex.ui.models unavailable; the Models window is disabled")
 
 try:
+    from exocortex.ui import dashboard as dashboard_mod
     from exocortex.ui.dashboard import DashboardView
 except Exception:  # pragma: no cover - dashboard.py may be missing/mid-implementation
+    dashboard_mod = None  # type: ignore[assignment]
     DashboardView = None  # type: ignore[assignment]
     log.warning("exocortex.ui.dashboard unavailable; dashboard mode is disabled")
 
@@ -182,6 +184,12 @@ _ROLE_LABELS: tuple[tuple[str, str], ...] = (
 _ROLE_AUDIENCE: dict[str, str] = {"driver": "the navigator / team", "navigator": "the driver", "participant": "the group"}
 #: Index of the Notes tab (Live / Assist / Notes / Screen = 0..3): the Insights pane lives there.
 _NOTES_TAB = 2
+#: The full overlay's tabs by index, and every view the View menu can switch to (2026-10-21).
+_TAB_KEYS: tuple[str, ...] = ("live", "assist", "notes", "screen")
+_VIEW_LABELS: tuple[tuple[str, str], ...] = (
+    ("live", "Live"), ("assist", "Assist"), ("notes", "Notes"), ("screen", "Screen"), ("dashboard", "Dashboard"),
+)
+_SCREEN_SOURCE_LABELS: tuple[tuple[str, str], ...] = (("off", "Off"), ("auto", "Active window"))
 
 
 def _hotkey_hint(binding: str) -> str:
@@ -581,6 +589,7 @@ class OverlayWindow(QWidget):
         # and the stacked tabs; the window widens to [dashboard].width and the normal geometry is
         # remembered and restored on exit, the way completion mode's slim bar does it.
         self._dashboard_mode = False
+        self._context_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
         self._dashboard_normal_geometry: QRect | None = None
 
         # Window flags must be set once, before the first show(). A visible copilot: a normal
@@ -1344,9 +1353,11 @@ class OverlayWindow(QWidget):
         except Exception:
             log.exception("actions.dashboard_item(%r, %r) failed", item_id, action)
 
-    def _on_dashboard_add(self, kind: str, text: str) -> None:
+    def _on_dashboard_add(self, kind: str, text: str, parent_id: int = -1) -> None:
+        """An item added by hand on the board; `parent_id` (-1 = none) is the action item a
+        sub-task, goal or prompt belongs to."""
         try:
-            self._actions.dashboard_add(str(kind), str(text))
+            self._actions.dashboard_add(str(kind), str(text), int(parent_id) if parent_id >= 0 else None)
         except Exception:
             log.exception("actions.dashboard_add(%r) failed", kind)
 
@@ -1879,6 +1890,7 @@ class OverlayWindow(QWidget):
             submenu.deleteLater()
         self._menu.clear()
         self._populate_assist_menu(self._menu.addMenu("Assist"))
+        self._populate_view_menu(self._menu.addMenu("View"))
         dashboard_action = self._menu.addAction(f"Dashboard mode{_hotkey_hint(self._cfg.hotkeys.toggle_dashboard)}")
         dashboard_action.setCheckable(True)
         dashboard_action.setChecked(self._dashboard_mode)
@@ -1905,12 +1917,6 @@ class OverlayWindow(QWidget):
             act.triggered.connect(
                 lambda checked=False, sid=speaker_id, cur=label: self._prompt_rename(sid, cur)
             )
-
-        self._menu.addSeparator()
-        region_action = self._menu.addAction("Screen region…")
-        region_action.triggered.connect(self._open_region_picker)
-        pause_action = self._menu.addAction("Screen: pause/resume")
-        pause_action.triggered.connect(self._on_toggle_screen)
 
         self._menu.addSeparator()
         quit_action = self._menu.addAction("Quit")
@@ -1966,6 +1972,186 @@ class OverlayWindow(QWidget):
         ).triggered.connect(lambda: self._prompt_session_context())
         menu.addSeparator()
         menu.addAction("Assist settings…").triggered.connect(lambda: self.open_settings("Assist"))
+
+    # ---------------------------------------------------------------- View menu ---
+    def _current_view(self) -> str:
+        """What is on screen: "dashboard", "completion" (the slim bar) or one of the full
+        overlay's tabs ("live" / "assist" / "notes" / "screen")."""
+        if self._dashboard_mode:
+            return "dashboard"
+        if self._completion_mode:
+            return "completion"
+        index = self.stack.currentIndex()
+        return _TAB_KEYS[index] if 0 <= index < len(_TAB_KEYS) else "assist"
+
+    def _populate_view_menu(self, menu: QMenu) -> None:
+        """The "⋯" menu's View submenu (2026-10-21), rebuilt each time the menu opens so every
+        check mark reads the live state: which view is on screen (switchable), that view's own
+        display options first -- the dashboard's columns, each one hideable; the Screen tab's
+        source and OCR readout; the Assist tab's history pane; the Live tab's partials -- then
+        the settings every view shares: the screen source (active window, a monitor, a region,
+        off; pause) and the repository the answers and the dashboard look things up in."""
+        cfg = self._cfg
+        view = self._current_view()
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for key, label in _VIEW_LABELS:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(key == view)
+            act.setEnabled(key != "dashboard" or self.dashboard_view is not None)
+            group.addAction(act)
+            act.triggered.connect(lambda _checked=False, k=key: self._switch_view(k))
+        if view == "completion":
+            here = menu.addAction("Completion mode (the slim bar)")
+            here.setCheckable(True)
+            here.setChecked(True)
+            here.setEnabled(False)
+        menu.addSeparator()
+        if view == "dashboard" and self.dashboard_view is not None:
+            head = menu.addAction("Dashboard columns")
+            head.setEnabled(False)
+            for key, title in dashboard_mod.COLUMNS:
+                flag = dashboard_mod.COLUMN_FLAGS[key]
+                act = menu.addAction(title)
+                act.setCheckable(True)
+                act.setChecked(bool(getattr(cfg.dashboard, flag, True)))
+                act.toggled.connect(lambda checked, f=flag: self._set_dashboard_option(f, checked))
+            prompts_action = menu.addAction("Suggested prompts under the action items")
+            prompts_action.setCheckable(True)
+            prompts_action.setChecked(bool(cfg.dashboard.show_prompts))
+            prompts_action.toggled.connect(lambda checked: self._set_dashboard_option("show_prompts", checked))
+            resolved_action = menu.addAction("Answered / done items (collapsed under the open ones)")
+            resolved_action.setCheckable(True)
+            resolved_action.setChecked(bool(cfg.dashboard.show_resolved))
+            resolved_action.toggled.connect(lambda checked: self._set_dashboard_option("show_resolved", checked))
+            menu.addSeparator()
+        elif view == "live":
+            partials = menu.addAction("In-progress speech (partial transcripts)")
+            partials.setCheckable(True)
+            partials.setChecked(bool(cfg.asr.partials_enabled))
+            partials.toggled.connect(lambda checked: setattr(cfg.asr, "partials_enabled", bool(checked)))
+            menu.addSeparator()
+        elif view == "assist":
+            history = menu.addAction("Answer history pane")
+            history.setCheckable(True)
+            history.setChecked(self.assist_view.history_toggle.isChecked())
+            history.toggled.connect(self.assist_view.history_toggle.setChecked)
+            explain = menu.addAction(f"Explanations (walkthrough · comments · explanation){_hotkey_hint(cfg.hotkeys.toggle_explanations)}")
+            explain.setCheckable(True)
+            explain.setChecked(self.explain_btn.isChecked())
+            explain.toggled.connect(self.explain_btn.setChecked)
+            menu.addSeparator()
+        elif view == "screen":
+            readout = menu.addAction("OCR readout (the raw screen text)")
+            readout.setCheckable(True)
+            readout.setChecked(self.screen_view.screen_text_toggle.isChecked())
+            readout.toggled.connect(self.screen_view.screen_text_toggle.setChecked)
+            menu.addSeparator()
+        self._populate_screen_source_menu(menu.addMenu("Screen source"))
+        pause_action = menu.addAction("Screen: pause/resume")
+        pause_action.triggered.connect(self._on_toggle_screen)
+        self._populate_repository_menu(menu.addMenu("Repository"))
+
+    def _populate_screen_source_menu(self, menu: QMenu) -> None:
+        """Off / the active window / one of the monitors / a region: the Screen tab's mode row
+        and ``[screen].monitor``, as a radio list. Monitors are numbered the way the capture
+        numbers them -- the primary one first, then the others -- with their size and position."""
+        cfg = self._cfg
+        group = QActionGroup(menu)
+        group.setExclusive(True)
+        for mode, label in _SCREEN_SOURCE_LABELS:
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self._screen_mode == mode)
+            group.addAction(act)
+            act.triggered.connect(lambda _checked=False, m=mode: self._on_screen_mode_requested(m))
+        screens = list(QGuiApplication.screens())
+        primary = QGuiApplication.primaryScreen()
+        ordered = ([primary] if primary in screens else []) + [s for s in screens if s is not primary]
+        for index, screen in enumerate(ordered):
+            geo = screen.geometry()
+            label = f"Monitor {index}" + (" (primary)" if screen is primary else "") + f" · {geo.width()}×{geo.height()}"
+            if screen is not primary:
+                label += f" at {geo.x()},{geo.y()}"
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(self._screen_mode == "monitor" and int(cfg.screen.monitor) == index)
+            group.addAction(act)
+            act.triggered.connect(lambda _checked=False, i=index: self._set_screen_monitor(i))
+        region = menu.addAction("Region…" if self._screen_mode != "region" else "Region… (change it)")
+        region.setCheckable(True)
+        region.setChecked(self._screen_mode == "region")
+        group.addAction(region)
+        region.triggered.connect(self._open_region_picker)
+
+    def _populate_repository_menu(self, menu: QMenu) -> None:
+        """Which repository the lookups and the toolkit discovery use: auto-detected from Claude
+        Code's own session logs (the default), or a folder chosen here / in the settings."""
+        c = self._cfg.context
+        current = menu.addAction(self._context_detail or "Context: not known yet")
+        current.setEnabled(False)
+        menu.addSeparator()
+        auto = menu.addAction("Auto-detect from Claude Code (the project of its latest session)")
+        auto.setCheckable(True)
+        auto.setChecked(bool(c.repo_auto))
+        auto.setEnabled(not (c.repo_root or "").strip())
+        auto.toggled.connect(lambda checked: self._apply_context_option("repo_auto", bool(checked)))
+        root = (c.repo_root or "").strip()
+        choose = menu.addAction(f"Folder: {root}" if root else "Choose a folder…")
+        choose.triggered.connect(self._choose_repo_root)
+        if root:
+            clear = menu.addAction("Clear the folder (back to auto-detect)")
+            clear.triggered.connect(lambda: self._apply_context_option("repo_root", ""))
+        menu.addSeparator()
+        menu.addAction("Context settings…").triggered.connect(lambda: self.open_settings("Context"))
+
+    def _switch_view(self, key: str) -> None:
+        if key == "dashboard":
+            self._set_dashboard_mode(True)
+            return
+        if self._dashboard_mode:
+            self._set_dashboard_mode(False)
+        if self._completion_mode:
+            self.completion_btn.setChecked(False)
+        if key in _TAB_KEYS:
+            self._show_tab(_TAB_KEYS.index(key))
+
+    def _set_dashboard_option(self, flag: str, value: bool) -> None:
+        """A View-menu switch for the board: the config, the view, and the engine (which saves)."""
+        setattr(self._cfg.dashboard, flag, bool(value))
+        if self.dashboard_view is not None:
+            self.dashboard_view.apply_config()
+        try:
+            self._actions.apply_settings({f"dashboard.{flag}": bool(value)})
+        except Exception:
+            log.exception("actions.apply_settings(dashboard.%s) failed", flag)
+
+    def _set_screen_monitor(self, index: int) -> None:
+        """Read monitor `index` (the capture's numbering, primary = 0) from now on."""
+        self._cfg.screen.monitor = int(index)
+        try:
+            self._actions.apply_settings({"screen.monitor": int(index)})
+        except Exception:
+            log.exception("actions.apply_settings(screen.monitor) failed")
+        self._on_screen_mode_requested("monitor")
+
+    def _apply_context_option(self, key: str, value: object) -> None:
+        setattr(self._cfg.context, key, value)
+        try:
+            self._actions.apply_settings({f"context.{key}": value})   # the engine re-detects and says what it found
+        except Exception:
+            log.exception("actions.apply_settings(context.%s) failed", key)
+
+    def _choose_repo_root(self) -> None:
+        from pathlib import Path
+
+        from PySide6.QtWidgets import QFileDialog
+
+        start = (self._cfg.context.repo_root or "").strip() or str(Path.home())
+        path = QFileDialog.getExistingDirectory(self, "Repository root (the project being worked on)", start)
+        if path:
+            self._apply_context_option("repo_root", path)
 
     def _on_insights_now(self, sections: tuple[str, ...] = ()) -> None:
         """Refresh the co-pilot insights now (an Assist-menu entry or the hotkey; the Notes tab's
@@ -2537,7 +2723,9 @@ class OverlayWindow(QWidget):
                 self.show_toast(f"Completion: {ev.detail or 'error'}")
             return
         elif ev.component in ("context", "dashboard"):
-            # A toolkit discovered / installed mid-session, a dashboard problem: say so, never a dot.
+            # A repository / toolkit found or changed mid-session, a dashboard problem: say so, never a dot.
+            if ev.component == "context" and ev.detail:
+                self._context_detail = ev.detail      # the View menu's Repository entry shows the latest
             self.show_toast(ev.detail or ev.component)
             return
         elif ev.state == "error":

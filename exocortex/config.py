@@ -392,8 +392,9 @@ class NotesConfig:
 
 @dataclass
 class DashboardConfig:
-    """Dashboard mode (2026-10-20): the overlay as a multi-column board -- session notes, questions
-    to ask, blind spots & follow-ups, next steps & suggested prompts -- fed by a small database
+    """Dashboard mode (2026-10-20): the overlay as a multi-column board -- session notes, action
+    items (primary tasks with their sub-tasks and suggested prompts), goals (acceptance criteria),
+    constraints, questions to ask, blind spots & follow-ups -- fed by a small database
     (exocortex.dashboard.store, SQLite in the session folder) that the model never holds: every
     refresh hands the model only the OPEN items plus what is new since the last refresh, and the
     model answers with the CHANGES (new / answered / done / dropped), which the store applies.
@@ -408,15 +409,20 @@ class DashboardConfig:
     track: bool = True
     refresh_interval_s: int = 90       # a background refresh at most this often (0 = on demand only)
     min_new_words: int = 40            # ... once this much new speech arrived -- or the screen changed a lot
-    max_open_items: int = 8            # open items per column handed to the model (oldest first)
-    max_new_items: int = 4             # new items the model may add per column per refresh
-    suggest_prompts: bool = True       # the Next steps column also suggests prompts to type into Claude Code
+    max_open_items: int = 8            # open items per column handed to the model (oldest first; x2 for tasks and goals)
+    max_new_items: int = 4             # new items the model may add per column (and per task) per refresh
+    suggest_prompts: bool = True       # action items also get suggested prompts to type into Claude Code
     show_resolved: bool = True         # answered / done items stay visible, collapsed under the open ones
     resolved_keep: int = 12            # ... how many of them each column keeps on screen
-    show_notes: bool = True            # which columns the view shows
+    # Which columns the view shows (also the View menu's check marks). show_nextsteps is the Action
+    # items column; show_prompts shows the suggested prompts under the action items they serve.
+    show_notes: bool = True
+    show_nextsteps: bool = True
+    show_goals: bool = True
+    show_constraints: bool = True
     show_questions: bool = True
     show_blindspots: bool = True
-    show_nextsteps: bool = True
+    show_prompts: bool = True
     width: int = 1180                  # window width in dashboard mode (the normal size is restored on exit)
     view_refresh_s: int = 5            # the view re-renders its timestamps this often (no model call)
     persist: bool = True               # keep the tracked items in <session folder>/dashboard.sqlite
@@ -434,6 +440,11 @@ class ContextConfig:
     # The project directory ("" = none): searched on demand, never read wholesale. Also where the
     # Claude Code toolkit is looked for (<repo_root>/.claude, <repo_root>/CLAUDE.local.md).
     repo_root: str = ""
+    # With no repo_root: use the directory Claude Code was most recently run in (read from its
+    # session logs under ~/.claude/projects), when that was within repo_auto_max_age_h hours. The
+    # toolkit installed in that repository is then discovered with no setup at all.
+    repo_auto: bool = True
+    repo_auto_max_age_h: int = 12
     repo_search: bool = True           # search the repo for files / identifiers mentioned; inject matching lines only
     repo_max_files: int = 6            # files per lookup
     repo_max_chars: int = 1800         # characters of matched lines handed to the model

@@ -7,10 +7,22 @@ items and answers with changes, never the whole table. Thread-safe: one connecti
 RLock, called from the assist-worker thread (a refresh), the Qt thread via the engine (a manual
 edit) and the dashboard timer (notes).
 
-Items carry a ``kind`` (``question`` / ``blindspot`` / ``nextstep`` / ``prompt``), a ``status``
-(``open`` / ``answered`` -- answered, done or resolved, with ``answer`` saying how -- / ``dropped``)
-and a normalised copy of their text used to fold duplicates: adding the wording of an item that
-is already open returns that item, of one already answered is ignored, of one dropped reopens it.
+Items carry a ``kind``:
+
+- ``nextstep`` -- an action item: a primary task, or (with ``parent_id``) a sub-task of one. The
+  tree is one level deep: a sub-task of a sub-task is attached to the task itself.
+- ``goal`` -- an acceptance criterion; ``parent_id`` is the action item it is for, none = the
+  whole session.
+- ``constraint`` -- a rule or guardrail that must be respected (open = in force, dropped = lifted).
+- ``question`` / ``blindspot`` -- to ask / to watch; ``prompt`` -- to type into Claude Code, with
+  ``parent_id`` = the action item it serves (or none).
+
+and a ``status`` (``open`` / ``answered`` -- answered, done, met or resolved, with ``answer`` saying
+how -- / ``dropped``) and a normalised copy of their text used to fold duplicates *within the same
+parent*: adding the wording of an item that is already open returns that item, of one already
+answered is ignored, of one dropped reopens it. Dismissing a task dismisses its open sub-tasks,
+goals and prompts with it; finishing a task finishes its open sub-tasks and retires their pending
+prompts (its goals are left for a separate "met").
 """
 from __future__ import annotations
 
@@ -26,14 +38,20 @@ from exocortex.bus import DashboardItem
 
 log = logging.getLogger(__name__)
 
-KINDS: tuple[str, ...] = ("question", "blindspot", "nextstep", "prompt")
+#: In the order the board lists them and a refresh renders them: tasks first, because goals and
+#: prompts refer to them by id.
+KINDS: tuple[str, ...] = ("nextstep", "goal", "constraint", "question", "blindspot", "prompt")
 STATUSES: tuple[str, ...] = ("open", "answered", "dropped")
 KIND_TITLES: dict[str, str] = {
+    "nextstep": "Action items",
+    "goal": "Goals",
+    "constraint": "Constraints",
     "question": "Questions to ask",
     "blindspot": "Blind spots & follow-ups",
-    "nextstep": "Next steps",
     "prompt": "Suggested prompts",
 }
+#: Kinds that may carry a ``parent_id`` (an action item).
+PARENTED_KINDS: tuple[str, ...] = ("nextstep", "goal", "prompt")
 
 _PUNCT_RE = re.compile(r"[^\w\s]")
 
@@ -47,7 +65,8 @@ CREATE TABLE IF NOT EXISTS items (
     answer TEXT NOT NULL DEFAULT '',
     source TEXT NOT NULL DEFAULT 'model',
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    parent_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS items_kind_status ON items (kind, status);
 CREATE TABLE IF NOT EXISTS notes (
@@ -104,10 +123,11 @@ class ApplyResult:
 
 
 def _row_item(row: sqlite3.Row) -> DashboardItem:
+    parent = row["parent_id"]
     return DashboardItem(
         id=int(row["id"]), kind=str(row["kind"]), text=str(row["text"]), status=str(row["status"]),
         answer=str(row["answer"]), created_at=float(row["created_at"]), updated_at=float(row["updated_at"]),
-        source=str(row["source"]),
+        source=str(row["source"]), parent_id=int(parent) if parent is not None else None,
     )
 
 
@@ -127,6 +147,14 @@ class DashboardStore:
                 except sqlite3.DatabaseError:
                     log.debug("dashboard store: WAL not available", exc_info=True)
             self._conn.executescript(_SCHEMA)
+            self._migrate()
+
+    def _migrate(self) -> None:
+        """A database written before tasks had sub-tasks lacks ``parent_id``: add it in place."""
+        cols = {str(r["name"]) for r in self._conn.execute("PRAGMA table_info(items)")}
+        if "parent_id" not in cols:
+            self._conn.execute("ALTER TABLE items ADD COLUMN parent_id INTEGER")
+        self._conn.execute("CREATE INDEX IF NOT EXISTS items_parent ON items (parent_id)")
 
     @property
     def path(self) -> Path | None:
@@ -140,9 +168,24 @@ class DashboardStore:
                 pass
 
     # ---- items ----------------------------------------------------------------------------
-    def add_item(self, kind: str, text: str, *, now: float, source: str = "model", answer: str = "") -> DashboardItem | None:
+    def _valid_parent(self, kind: str, parent_id: int | None) -> int | None:
+        """The parent a new `kind` item may really have: an existing, not dismissed action item.
+        A sub-task of a sub-task hangs off the task itself (the tree is one level deep)."""
+        if parent_id is None or kind not in PARENTED_KINDS:
+            return None
+        row = self._conn.execute("SELECT id, kind, status, parent_id FROM items WHERE id = ?", (int(parent_id),)).fetchone()
+        if row is None or row["kind"] != "nextstep" or row["status"] == "dropped":
+            return None
+        if kind == "nextstep" and row["parent_id"] is not None:
+            return self._valid_parent(kind, int(row["parent_id"]))
+        return int(row["id"])
+
+    def add_item(
+        self, kind: str, text: str, *, now: float, source: str = "model", answer: str = "", parent_id: int | None = None,
+    ) -> DashboardItem | None:
         """Add an open item; folds duplicates (see the module docstring). None for an empty text
-        or an unknown kind, or when the same wording was already answered."""
+        or an unknown kind, or when the same wording was already answered. `parent_id` is honoured
+        only for tasks (-> a sub-task), goals and prompts, and only when it names an action item."""
         text = " ".join((text or "").split())
         if not text or kind not in KINDS:
             return None
@@ -150,8 +193,10 @@ class DashboardStore:
         if not norm:
             return None
         with self._lock:
+            parent = self._valid_parent(kind, parent_id)
             row = self._conn.execute(
-                "SELECT * FROM items WHERE kind = ? AND norm = ? ORDER BY updated_at DESC LIMIT 1", (kind, norm)
+                "SELECT * FROM items WHERE kind = ? AND norm = ? AND COALESCE(parent_id, 0) = ? "
+                "ORDER BY updated_at DESC LIMIT 1", (kind, norm, parent or 0)
             ).fetchone()
             if row is not None:
                 existing = _row_item(row)
@@ -163,9 +208,9 @@ class DashboardStore:
                                    (float(now), existing.id))
                 return self.get(existing.id)
             cur = self._conn.execute(
-                "INSERT INTO items (kind, text, norm, status, answer, source, created_at, updated_at) "
-                "VALUES (?, ?, ?, 'open', ?, ?, ?, ?)",
-                (kind, text, norm, answer or "", source or "model", float(now), float(now)),
+                "INSERT INTO items (kind, text, norm, status, answer, source, created_at, updated_at, parent_id) "
+                "VALUES (?, ?, ?, 'open', ?, ?, ?, ?, ?)",
+                (kind, text, norm, answer or "", source or "model", float(now), float(now), parent),
             )
             return self.get(int(cur.lastrowid))
 
@@ -186,11 +231,40 @@ class DashboardStore:
             return self.get(item_id)
 
     def resolve(self, item_id: int, answer: str = "", *, now: float) -> DashboardItem | None:
-        """Mark answered / done / resolved, with `answer` saying how (may be empty)."""
-        return self._set(item_id, now=now, status="answered", answer=" ".join((answer or "").split()))
+        """Mark answered / done / met / resolved, with `answer` saying how (may be empty). A
+        finished primary task finishes its open sub-tasks with it and retires the prompts still
+        pending under them; its goals stay as they are (met is a separate claim)."""
+        with self._lock:
+            item = self._set(item_id, now=now, status="answered", answer=" ".join((answer or "").split()))
+            if item is None or item.kind != "nextstep" or item.parent_id is not None:
+                return item
+            steps = [i.id for i in self.children(item.id, "open") if i.kind == "nextstep"]
+            for step in steps:
+                self._set(step, now=now, status="answered", answer="with the task")
+            for owner in (item.id, *steps):
+                for p in self.children(owner, "open"):
+                    if p.kind == "prompt":
+                        self._set(p.id, now=now, status="dropped")
+            return item
 
     def drop(self, item_id: int, *, now: float) -> DashboardItem | None:
-        return self._set(item_id, now=now, status="dropped")
+        """Dismiss an item -- and, with it, everything still open that hangs off it (a task's
+        sub-tasks, goals and prompts)."""
+        with self._lock:
+            item = self._set(item_id, now=now, status="dropped")
+            if item is None:
+                return None
+            pending = [item.id]
+            while pending:
+                marks = ",".join("?" * len(pending))
+                rows = self._conn.execute(
+                    f"SELECT id FROM items WHERE parent_id IN ({marks}) AND status = 'open'", pending).fetchall()
+                pending = [int(r["id"]) for r in rows]
+                if pending:
+                    marks = ",".join("?" * len(pending))
+                    self._conn.execute(f"UPDATE items SET status = 'dropped', updated_at = ? WHERE id IN ({marks})",
+                                       (float(now), *pending))
+            return item
 
     def reopen(self, item_id: int, *, now: float) -> DashboardItem | None:
         return self._set(item_id, now=now, status="open", answer="")
@@ -222,6 +296,17 @@ class DashboardStore:
         out = self.items(kind, "open")
         return out[:limit] if limit is not None else out
 
+    def children(self, parent_id: int, status: str | None = None) -> list[DashboardItem]:
+        """Everything attached to an action item (sub-tasks, goals, prompts), oldest first."""
+        sql = "SELECT * FROM items WHERE parent_id = ?"
+        params: list[object] = [int(parent_id)]
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        with self._lock:
+            rows = self._conn.execute(sql + " ORDER BY created_at, id", params).fetchall()
+        return [_row_item(r) for r in rows]
+
     def counts(self) -> dict[str, tuple[int, int]]:
         """kind -> (open, answered) counts."""
         out = {k: (0, 0) for k in KINDS}
@@ -239,7 +324,7 @@ class DashboardStore:
 
     def apply(
         self,
-        adds: Sequence[tuple[str, str]],
+        adds: Sequence[tuple],
         resolves: Sequence[tuple[int, str]],
         drops: Sequence[int],
         *,
@@ -248,8 +333,11 @@ class DashboardStore:
         source: str = "model",
     ) -> ApplyResult:
         """Apply one refresh's changes: `resolves` (item id, answer) and `drops` first (they
-        refer to items shown to the model), then `adds` (kind, text), at most `max_new_per_kind`
-        genuinely new items per kind (duplicates do not count against it)."""
+        refer to items shown to the model), then `adds` -- ``(kind, text)``, ``(kind, text,
+        parent)`` or ``(kind, text, parent, ref)`` -- at most `max_new_per_kind` genuinely new
+        items per kind and parent (duplicates do not count against it). `parent` is an item id, or
+        the `ref` (a label such as "N4") of an item added earlier in this same batch: the model
+        writes a task and its sub-tasks together, before any of them has an id."""
         added = resolved = dropped = skipped = 0
         with self._lock:
             for item_id, answer in resolves:
@@ -266,23 +354,32 @@ class DashboardStore:
                     continue
                 self.drop(item_id, now=now)
                 dropped += 1
-            per_kind: dict[str, int] = {}
-            for kind, text in adds:
+            per_bucket: dict[tuple[str, int | None], int] = {}
+            refs: dict[str, int] = {}
+            for entry in adds:
+                kind, text = entry[0], entry[1]
+                parent = entry[2] if len(entry) > 2 else None
+                ref = entry[3] if len(entry) > 3 else None
+                if isinstance(parent, str):
+                    parent = refs.get(parent)
                 if kind not in KINDS:
                     skipped += 1
                     continue
-                if per_kind.get(kind, 0) >= max(0, max_new_per_kind):
+                parent = self._valid_parent(kind, parent)
+                if per_bucket.get((kind, parent), 0) >= max(0, max_new_per_kind):
                     skipped += 1
                     continue
                 before = self._conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
-                item = self.add_item(kind, text, now=now, source=source)
+                item = self.add_item(kind, text, now=now, source=source, parent_id=parent)
                 after = self._conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
+                if item is not None and ref:
+                    refs[str(ref)] = item.id        # also when it folded into an open duplicate
                 if item is None:
                     skipped += 1
                 elif after > before or (item.status == "open" and abs(item.updated_at - float(now)) < 1e-9
                                         and item.created_at != item.updated_at):
                     added += 1
-                    per_kind[kind] = per_kind.get(kind, 0) + 1
+                    per_bucket[(kind, parent)] = per_bucket.get((kind, parent), 0) + 1
                 else:
                     skipped += 1
         return ApplyResult(added=added, resolved=resolved, dropped=dropped, skipped=skipped)
@@ -330,21 +427,56 @@ class DashboardStore:
         return DashboardSnapshot(items=tuple(items), notes=notes, notes_at=at)
 
     def to_markdown(self, title: str = "Dashboard") -> str:
-        """The whole board as markdown (the session folder's dashboard.md): notes, then each
-        kind with ``- [ ]`` open and ``- [x]`` answered items (with their answers)."""
+        """The whole board as markdown (the session folder's dashboard.md): the notes, then the
+        action items as a tree (sub-tasks indented, each task's prompts under it), the goals
+        grouped as "for <task>", the constraints and the two question lists. ``- [ ]`` is open,
+        ``- [x]`` answered / done / met (with its answer)."""
         notes, _at = self.notes()
+        live = [i for i in self.items() if i.status != "dropped"]
+        live.sort(key=lambda i: i.id)
+        by_id = {i.id: i for i in live}
+        kids: dict[int, list[DashboardItem]] = {}
+        for i in live:
+            if i.parent_id is not None and i.parent_id in by_id:
+                kids.setdefault(i.parent_id, []).append(i)
+
+        def mark(i: DashboardItem) -> str:
+            return "[x]" if i.status == "answered" else "[ ]"
+
+        def line(i: DashboardItem, indent: str = "") -> str:
+            return f"{indent}- {mark(i)} {i.text}" + (f" — {i.answer}" if i.status == "answered" and i.answer else "")
+
         parts = [f"# {title}", "", "## Session notes", "", notes.strip() or "(no notes yet)", ""]
-        for kind in KINDS:
-            parts.append(f"## {KIND_TITLES[kind]}")
-            parts.append("")
-            open_items = self.items(kind, "open")
-            done_items = self.items(kind, "answered")
-            if not open_items and not done_items:
+        parts += [f"## {KIND_TITLES['nextstep']}", ""]
+        tasks = [i for i in live if i.kind == "nextstep" and (i.parent_id is None or i.parent_id not in by_id)]
+        if not tasks:
+            parts.append("- (none)")
+        for task in tasks:
+            parts.append(line(task))
+            parts.extend(f"  - Prompt: `{p.text}`" for p in kids.get(task.id, []) if p.kind == "prompt")
+            for sub in (k for k in kids.get(task.id, []) if k.kind == "nextstep"):
+                parts.append(line(sub, "  "))
+                parts.extend(f"    - Prompt: `{p.text}`" for p in kids.get(sub.id, []) if p.kind == "prompt")
+        parts.append("")
+        parts += [f"## {KIND_TITLES['goal']}", ""]
+        goals = [i for i in live if i.kind == "goal"]
+        if not goals:
+            parts.append("- (none)")
+        for g in goals:
+            owner = by_id.get(g.parent_id) if g.parent_id is not None else None
+            parts.append(line(g) + (f"  (for: {owner.text})" if owner is not None else ""))
+        parts.append("")
+        for kind in ("constraint", "question", "blindspot"):
+            parts += [f"## {KIND_TITLES[kind]}", ""]
+            rows = [i for i in live if i.kind == kind]
+            if not rows:
                 parts.append("- (none)")
-            for i in open_items:
-                parts.append(f"- [ ] {i.text}")
-            for i in done_items:
-                parts.append(f"- [x] {i.text}" + (f" — {i.answer}" if i.answer else ""))
+            parts.extend(f"- {i.text}" if kind == "constraint" else line(i) for i in rows)
+            parts.append("")
+        loose = [i for i in live if i.kind == "prompt" and (i.parent_id is None or i.parent_id not in by_id)]
+        if loose:
+            parts += [f"## {KIND_TITLES['prompt']}", ""]
+            parts.extend(f"- `{p.text}`" for p in loose)
             parts.append("")
         return "\n".join(parts).rstrip() + "\n"
 

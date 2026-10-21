@@ -794,27 +794,39 @@ def _check_context(r: _Report, cfg: Config) -> None:
     in it (exocortex.context.toolkit) and the dashboard's tracking settings."""
     r.section("Context: repository, Claude Code toolkit, dashboard")
     c, d = cfg.context, cfg.dashboard
-    root = (c.repo_root or "").strip()
-    if not root:
-        r.line(_WARN, "[context].repo_root not set: no repository lookups and no toolkit discovery "
-                      "(Settings > Context > Repository root)")
-    else:
-        p = Path(root).expanduser()
-        if p.is_dir():
-            r.line(_OK, f"repo root: {p} (lookups {'on' if c.repo_search else 'off'}: "
-                        f"{c.repo_max_files} files / {c.repo_max_chars} chars per lookup, on mention only)")
-        else:
-            r.line(_FAIL, f"[context].repo_root does not exist: {p}")
+    explicit = (c.repo_root or "").strip()
     try:
-        from exocortex.context.toolkit import discover, find_toolkit_dir
+        from exocortex.context.detect import recent_projects
+        from exocortex.context.provider import ContextProvider
+        from exocortex.context.toolkit import find_toolkit_dir
 
-        cat = discover(root or None, user_layer=bool(c.toolkit_user_layer), toolkit_dir=c.toolkit_dir)
+        provider = ContextProvider(cfg)
+        root = provider.repo_root
+        if root is None:
+            if explicit:
+                r.line(_FAIL, f"[context].repo_root does not exist: {explicit}")
+            elif not c.repo_auto:
+                r.line(_WARN, "no repository: [context].repo_root is empty and auto-detection is off -- no "
+                              "repository lookups and no toolkit discovery (Settings > Context)")
+            else:
+                r.line(_WARN, f"no repository: [context].repo_root is empty and Claude Code has not run in a project "
+                              f"in the last {c.repo_auto_max_age_h} h (View > Repository, or Settings > Context)")
+        else:
+            how = "[context].repo_root" if provider.repo_source == "config" else "auto-detected from Claude Code's session logs"
+            r.line(_OK, f"repo root: {root} ({how}; lookups {'on' if c.repo_search else 'off'}: "
+                        f"{c.repo_max_files} files / {c.repo_max_chars} chars per lookup, on mention only)")
+        if c.repo_auto and not explicit:
+            others = [p for p, _at in recent_projects(max_age_s=max(0, int(c.repo_auto_max_age_h)) * 3600.0, limit=4)
+                      if root is None or p != root]
+            if others:
+                r.line(_OK, "  other recent Claude Code projects: " + ", ".join(str(p) for p in others[:3]))
+        cat = provider.catalog
         if not c.toolkit:
             r.line(_WARN, "toolkit context off ([context].toolkit = false)")
         elif cat.is_empty:
-            where = f"{root}/.claude" if root else "(no repo root)"
+            where = f"{root}/.claude" if root is not None else "(no repository)"
             r.line(_WARN, f"no Claude Code toolkit found under {where}; install one in the repo with "
-                          "`bash ~/claude-toolkit/install.sh --set live`, or hand-copy skills into .claude/skills")
+                          "`node \"$HOME/claude-toolkit/install.mjs\" --set live`, or hand-copy skills into .claude/skills")
         else:
             extras = []
             if cat.loop:
@@ -826,6 +838,9 @@ def _check_context(r: _Report, cfg: Config) -> None:
                 names = [p.command for p in cat.by_kind(kind)]
                 if names:
                     r.line(_OK, f"  {kind}s: " + ", ".join(names))
+            example = cat.example_command()
+            if example:
+                r.line(_OK, f"  suggested prompts open with its commands, e.g. {example}")
         clone = find_toolkit_dir(c.toolkit_dir)
         if clone is not None:
             r.line(_OK, f"toolkit clone: {clone} (richer part descriptions)")

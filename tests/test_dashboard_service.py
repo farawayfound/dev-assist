@@ -27,16 +27,23 @@ from exocortex.llm.assistant import Assistant
 from exocortex.transcript import Transcript
 from tests.test_assistant import FakeClient, drain_until, make_segment
 
+#: A first refresh: a task and a sub-task written together (the sub-task names the task by the number
+#: the new item takes), a goal for the task, a constraint, the question / blind-spot lists and a
+#: prompt for the sub-task (N2 = the second new action item).
 FIRST = (
+    "## Action items\n- NEW: Task 1: export() rate limiting\n- NEW under N1: Write the failing test for export()\n"
+    "## Goals\n- NEW for N1: an empty tenant gets 200 and an empty page\n"
+    "## Constraints\n- NEW: no new dependencies\n"
     "## Questions to ask\n- NEW: Should export() paginate past 1000 rows?\n- NEW: Is the cache per tenant?\n"
     "## Blind spots & follow-ups\n- NEW: No test for an empty payload\n"
-    "## Next steps\n- NEW: Write the failing test for export()\n"
-    "## Suggested prompts\n- NEW: /repro-fix export() returns 500 on an empty tenant\n"
+    "## Suggested prompts\n- NEW for N2: /repro-fix export() returns 500 on an empty tenant\n"
 )
 SECOND = (
+    "## Action items\n- DONE N2: it is in and red\n- NEW under N1: Make it green\n"
+    "## Goals\n- (no change)\n"
+    "## Constraints\n- (no change)\n"
     "## Questions to ask\n- ANSWERED Q2: yes, keyed by tenant id\n"
     "## Blind spots & follow-ups\n- (no change)\n"
-    "## Next steps\n- DONE N1: it is in and red\n- NEW: Make it green\n"
     "## Suggested prompts\n- DROP P1\n"
 )
 
@@ -100,11 +107,17 @@ def test_a_refresh_shows_the_open_items_with_ids_and_applies_the_changes() -> No
         started = next(e for e in events if isinstance(e, AssistStartedEvent))
         assert started.kind == "dashboard" and started.question == "Dashboard refresh"
         updated = [e for e in events if isinstance(e, DashboardUpdatedEvent)]
-        assert updated and updated[-1].detail == "updated: +5 new" and not updated[-1].auto
+        assert updated and updated[-1].detail == "updated: +8 new" and not updated[-1].auto
         open_texts = [i.text for i in updated[-1].items if i.status == "open"]
-        assert open_texts == ["Should export() paginate past 1000 rows?", "Is the cache per tenant?",
-                              "No test for an empty payload", "Write the failing test for export()",
+        assert open_texts == ["Task 1: export() rate limiting", "Write the failing test for export()",
+                              "an empty tenant gets 200 and an empty page", "no new dependencies",
+                              "Should export() paginate past 1000 rows?", "Is the cache per tenant?",
+                              "No test for an empty payload",
                               "/repro-fix export() returns 500 on an empty tenant"]
+        by_text = {i.text: i for i in updated[-1].items}
+        task, step = by_text["Task 1: export() rate limiting"], by_text["Write the failing test for export()"]
+        assert step.parent_id == task.id and by_text["an empty tenant gets 200 and an empty page"].parent_id == task.id
+        assert by_text["/repro-fix export() returns 500 on an empty tenant"].parent_id == step.id and task.parent_id is None
         mirrored = next(e for e in events if isinstance(e, InsightsUpdatedEvent))
         assert mirrored.questions == "- Should export() paginate past 1000 rows?\n- Is the cache per tenant?"
         assert mirrored.blindspots == "- No test for an empty payload"
@@ -112,7 +125,7 @@ def test_a_refresh_shows_the_open_items_with_ids_and_applies_the_changes() -> No
         assert assistant.answers == []                                     # never an answer
         prompt = client.calls[0]["prompt"]
         assert "keeping a small DASHBOARD current" in prompt and "Session context (what the team is working on): billing service" in prompt
-        assert "<current>\nQuestions to ask:\n- (none yet)" in prompt and "per-tenant rate limiting" in prompt
+        assert "<current>\nAction items:\n- (none yet)" in prompt and "per-tenant rate limiting" in prompt
         assert "<transcript_earlier>\n" not in prompt and "def export(tenant):" in prompt
         assert client.calls[0]["max_tokens"] == cfg.llm.dashboard_max_tokens
 
@@ -120,32 +133,107 @@ def test_a_refresh_shows_the_open_items_with_ids_and_applies_the_changes() -> No
         job2 = service.refresh_now()
         events = drain_until(sub, _done(job2))
         prompt2 = client.calls[1]["prompt"]
-        assert "- Q1: Should export() paginate past 1000 rows?" in prompt2 and "- Q2: Is the cache per tenant?" in prompt2
-        assert "- N1: Write the failing test for export()" in prompt2 and "- P1: /repro-fix" in prompt2
+        assert ("<current>\nAction items:\n- N1: Task 1: export() rate limiting\n  - N2: Write the failing test for export()\n"
+                "Goals:\n- G1 (for N1): an empty tenant gets 200 and an empty page\nConstraints:\n- C1: no new dependencies\n"
+                "Questions to ask:\n- Q1: Should export() paginate past 1000 rows?\n- Q2: Is the cache per tenant?\n"
+                "Blind spots & follow-ups:\n- B1: No test for an empty payload\n"
+                "Suggested prompts:\n- P1 (for N2): /repro-fix export() returns 500 on an empty tenant\n</current>") in prompt2
         assert "<transcript_earlier>\n[00:01] Sam: We need per-tenant" in prompt2
         assert "<transcript_new>\n[00:02] Sam: The cache is keyed" in prompt2
         updated = [e for e in events if isinstance(e, DashboardUpdatedEvent)][-1]
         assert updated.detail == "updated: +1 new, 2 answered / done, 1 dropped"
         store = service.store
-        assert store.get(2).status == "answered" and store.get(2).answer == "yes, keyed by tenant id"
-        assert store.get(4).status == "answered" and store.get(4).answer == "it is in and red"
-        assert store.get(5).status == "dropped" and [i.text for i in store.open_items("nextstep")] == ["Make it green"]
+        assert store.get(6).status == "answered" and store.get(6).answer == "yes, keyed by tenant id"
+        assert store.get(2).status == "answered" and store.get(2).answer == "it is in and red"
+        assert store.get(8).status == "dropped"
+        assert [i.text for i in store.open_items("nextstep")] == ["Task 1: export() rate limiting", "Make it green"]
+        assert store.get(9).parent_id == 1            # "NEW under N1" resolved against the number it was shown under
         md = service.markdown()
-        assert "- [x] Is the cache per tenant? — yes, keyed by tenant id" in md and "- [ ] Make it green" in md
+        assert "- [x] Is the cache per tenant? — yes, keyed by tenant id" in md and "  - [ ] Make it green" in md
     finally:
         _stop(assistant, service)
 
 
 def test_a_refresh_can_be_limited_to_one_section() -> None:
     cfg = Config()
-    bus, transcript, client, assistant, service = _start(cfg, ["## Questions to ask\n- NEW: Only this?\n## Next steps\n- NEW: ignored\n"])
+    bus, transcript, client, assistant, service = _start(cfg, ["## Questions to ask\n- NEW: Only this?\n## Action items\n- NEW: ignored\n"])
     sub = bus.subscribe()
     try:
         job = service.refresh_now(("questions",))
         drain_until(sub, _done(job))
         prompt = client.calls[0]["prompt"]
-        assert "Questions to ask (Q1, Q2, ...)" in prompt and "Next steps (N1" not in prompt
+        assert "Questions to ask (Q1, Q2, ...)" in prompt and "Action items (N1" not in prompt
         assert [i.text for i in service.store.items()] == ["Only this?"]
+    finally:
+        _stop(assistant, service)
+
+
+def test_a_goals_refresh_shows_the_tasks_so_a_goal_can_name_one() -> None:
+    cfg = Config()
+    bus, transcript, client, assistant, service = _start(
+        cfg, ["## Action items\n- (no change)\n## Goals\n- NEW for N1: returns 404 when the segment is missing\n"])
+    sub = bus.subscribe()
+    try:
+        service.add_item("nextstep", "Task 1: lookup endpoint")
+        job = service.refresh_now(("goals",))
+        drain_until(sub, _done(job))
+        prompt = client.calls[0]["prompt"]
+        assert "Action items (N1, N2, ...), Goals (G1, G2, ...)" in prompt and "Questions to ask (Q1" not in prompt
+        assert "<current>\nAction items:\n- N1: Task 1: lookup endpoint\nGoals:\n- (none yet)\n</current>" in prompt
+        goal = service.store.items("goal")[0]
+        assert goal.text == "returns 404 when the segment is missing" and goal.parent_id == service.store.items("nextstep")[0].id
+    finally:
+        _stop(assistant, service)
+
+
+def test_a_constraint_the_model_marks_done_is_lifted_not_answered() -> None:
+    cfg = Config()
+    bus, transcript, client, assistant, service = _start(
+        cfg, ["## Constraints\n- DONE C1: the interviewer lifted it\n- NEW: stay under 200 changed lines\n"])
+    sub = bus.subscribe()
+    try:
+        service.add_item("constraint", "no new dependencies")
+        job = service.refresh_now(("constraints",))
+        drain_until(sub, _done(job))
+        assert service.store.get(1).status == "dropped"
+        assert [i.text for i in service.store.open_items("constraint")] == ["stay under 200 changed lines"]
+        assert service.item_action(2, "answer", "x") and service.store.get(2).status == "dropped"    # by hand too
+    finally:
+        _stop(assistant, service)
+
+
+def test_suggested_prompts_are_cleaned_and_must_name_installed_parts() -> None:
+    class _Toolkit:
+        def refresh(self) -> bool:
+            return False
+
+        def toolkit_block(self) -> str:
+            return "<toolkit>\nSkills: /recon [topic]: look around.\n</toolkit>"
+
+        def toolkit_example(self) -> str:
+            return "/recon [topic]"
+
+        def toolkit_lookup(self, *texts: str) -> str:
+            return ""
+
+        def repo_block(self, *texts: str, time_budget_s: float = 1.5) -> str:
+            return ""
+
+        def check_prompt(self, text: str) -> bool:
+            return not text.startswith(("/bogus", "Use the ghost"))
+
+    answer = ("## Action items\n- NEW: Task 1: export\n## Suggested prompts\n- NEW for N1: `/recon the export path`\n"
+              "- NEW for N1: /bogus do it\n- NEW for N1: Use the ghost agent on export()\n- NEW: \"/recon again\"\n")
+    cfg = Config()
+    bus, transcript, client, assistant, service = _start(cfg, [answer], context=_Toolkit())
+    sub = bus.subscribe()
+    try:
+        job = service.refresh_now()
+        drain_until(sub, _done(job))
+        prompts_ = service.store.items("prompt")
+        task = service.store.items("nextstep")[0]
+        assert [(p.text, p.parent_id) for p in prompts_] == [("/recon the export path", task.id), ("/recon again", None)]
+        assert "Start every prompt with a slash command from <toolkit> (like /recon [topic])" in client.calls[0]["prompt"]
     finally:
         _stop(assistant, service)
 
@@ -289,6 +377,23 @@ def test_manual_edits_add_resolve_dismiss_reopen_and_notes_land_in_the_store(tmp
         _stop(assistant, service)
 
 
+def test_manual_sub_tasks_goals_prompts_and_a_task_dismissed_with_what_hangs_off_it() -> None:
+    bus, transcript, client, assistant, service = _start(Config(), [FIRST])
+    try:
+        assert service.add_item("nextstep", "Task 1")
+        task = service.store.items("nextstep")[0]
+        assert service.add_item("nextstep", "step a", task.id) and service.add_item("goal", "it works", task.id)
+        assert service.add_item("prompt", "/scope Task 1", task.id) and service.add_item("constraint", "no new deps")
+        kids = service.store.children(task.id)
+        assert [(i.kind, i.text, i.source) for i in kids] == [("nextstep", "step a", "user"), ("goal", "it works", "user"),
+                                                              ("prompt", "/scope Task 1", "user")]
+        assert service.item_action(task.id, "dismiss")
+        assert all(service.store.get(i.id).status == "dropped" for i in kids)
+        assert [i.text for i in service.store.open_items("constraint")] == ["no new deps"]     # unrelated: stays
+    finally:
+        _stop(assistant, service)
+
+
 def test_reset_starts_a_fresh_store(tmp_path: Path) -> None:
     cfg = Config()
     first, second = tmp_path / "one", tmp_path / "two"
@@ -323,6 +428,9 @@ def test_the_context_provider_feeds_the_refresh_prompt(tmp_path: Path) -> None:
         def toolkit_block(self) -> str:
             return "<toolkit>\nSkills: /recon [topic]: look around.\n</toolkit>"
 
+        def toolkit_example(self) -> str:
+            return "/recon [topic]"
+
         def toolkit_lookup(self, *texts: str) -> str:
             self.calls.append("lookup")
             return "<toolkit_detail>\n### /recon [topic] (skill)\nbody\n</toolkit_detail>" if any("/recon" in t for t in texts) else ""
@@ -341,7 +449,7 @@ def test_the_context_provider_feeds_the_refresh_prompt(tmp_path: Path) -> None:
         drain_until(sub, _done(job))
         prompt = client.calls[0]["prompt"]
         system_part, user_part = prompt.split("<|im_start|>user\n", 1)
-        assert "<toolkit>\nSkills: /recon" in system_part and "Use ONLY the skills" in system_part
+        assert "<toolkit>\nSkills: /recon" in system_part and "Start every prompt with a slash command from <toolkit> (like /recon [topic])" in system_part
         assert '<repo root="r">' in user_part and "<toolkit_detail>\n### /recon" in user_part
         assert user_part.index("<current>") < user_part.index("<screen>") < user_part.index("<repo") < user_part.index("<toolkit_detail>")
         assert ctx.calls == ["lookup", "repo"]

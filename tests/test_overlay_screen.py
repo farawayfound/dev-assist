@@ -415,7 +415,13 @@ def test_suggest_now_hotkey_binding_calls_action_directly(actions: FakeActions) 
 # menu entries
 # =====================================================================================
 def test_menu_has_screen_entries(window: OverlayWindow) -> None:
+    """2026-10-21: the screen entries live in the View submenu (source as a radio list, pause)."""
     window._rebuild_menu()
-    texts = [a.text() for a in window._menu.actions() if a.text()]
-    assert any("Screen region" in t for t in texts)
-    assert any("Screen: pause/resume" in t for t in texts)
+    view = next(a.menu() for a in window._menu.actions() if a.menu() is not None and a.text() == "View")
+    texts = [a.text() for a in view.actions() if a.text()]
+    assert "Screen: pause/resume" in texts and "Screen source" in texts
+    source = next(a.menu() for a in view.actions() if a.menu() is not None and a.text() == "Screen source")
+    source_texts = [a.text() for a in source.actions()]
+    assert source_texts[:2] == ["Off", "Active window"] and source_texts[-1].startswith("Region")
+    assert any(t.startswith("Monitor 0 (primary)") for t in source_texts)
+    assert not any("Screen region" in a.text() or "Screen: pause" in a.text() for a in window._menu.actions())

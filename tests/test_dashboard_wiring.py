@@ -7,7 +7,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from exocortex.bus import DashboardModeEvent, EventBus, drain
+from exocortex.bus import ComponentStatusEvent, DashboardModeEvent, EventBus, drain
 from exocortex.config import Config, load_config, save_config
 
 
@@ -30,7 +30,9 @@ def test_the_new_sections_round_trip_through_toml(tmp_path: Path) -> None:
     assert loaded.context.toolkit_dir == "~/claude-toolkit" and loaded.llm.dashboard_max_tokens == 500
     defaults = Config()
     assert defaults.dashboard.track and defaults.dashboard.refresh_interval_s == 90 and defaults.dashboard.width == 1180
+    assert defaults.dashboard.show_goals and defaults.dashboard.show_constraints and defaults.dashboard.show_prompts
     assert defaults.context.toolkit and defaults.context.repo_search and defaults.context.repo_root == ""
+    assert defaults.context.repo_auto and defaults.context.repo_auto_max_age_h == 12
     assert defaults.hotkeys.toggle_dashboard == "ctrl+alt+d"
 
 
@@ -46,8 +48,8 @@ class _Service:
         self.calls.append(("item_action", item_id, action, text))
         return True
 
-    def add_item(self, kind: str, text: str) -> bool:
-        self.calls.append(("add_item", kind, text))
+    def add_item(self, kind: str, text: str, parent_id: int | None = None) -> bool:
+        self.calls.append(("add_item", kind, text, parent_id))
         return True
 
     def set_paused(self, paused: bool) -> None:
@@ -80,7 +82,9 @@ def test_dashboard_refresh_is_deferred_while_the_llm_starts_then_replayed() -> N
     assert service.calls[-1] == ("refresh_now", ())
     eng.dashboard_item(4, "answer", "yes")
     eng.dashboard_add("question", "Who?")
-    assert service.calls[-2:] == [("item_action", 4, "answer", "yes"), ("add_item", "question", "Who?")]
+    eng.dashboard_add("nextstep", "a step", 4)
+    assert service.calls[-3:] == [("item_action", 4, "answer", "yes"), ("add_item", "question", "Who?", None),
+                                  ("add_item", "nextstep", "a step", 4)]
 
 
 def test_insights_now_refreshes_the_dashboard_while_it_tracks() -> None:
@@ -140,8 +144,8 @@ def test_apply_settings_reconfigures_the_context_and_toggles_the_mode(tmp_path: 
         def reconfigure(self) -> None:
             self.reconfigured += 1
 
-        def toolkit_summary(self) -> str:
-            return ""
+        def context_summary(self) -> str:
+            return "repo: no toolkit installed"
 
     cfg = Config()
     cfg.path = tmp_path / "config.toml"
@@ -157,7 +161,13 @@ def test_apply_settings_reconfigures_the_context_and_toggles_the_mode(tmp_path: 
     cfg.screen.interval_s = 1.5
     eng.apply_settings({"context.repo_root": str(repo), "dashboard.enabled": True, "dashboard.track": True})
     assert ctx.reconfigured == 1
-    assert any(isinstance(e, DashboardModeEvent) and e.enabled for e in drain(sub))
+    events = drain(sub)
+    assert any(isinstance(e, DashboardModeEvent) and e.enabled for e in events)
+    assert any(isinstance(e, ComponentStatusEvent) and e.component == "context" and e.detail == "Context: repo: no toolkit installed"
+               for e in events)
+    cfg.screen.monitor = 1
+    eng.apply_settings({"screen.monitor": 1})               # no reader yet: nothing to re-point, no crash
+    assert load_config(cfg.path).screen.monitor == 1
     saved = load_config(cfg.path)
     assert saved.context.repo_root == str(repo) and saved.dashboard.enabled
     assert saved.screen.interval_s == 1.5                   # the view mode never touches the capture cadence

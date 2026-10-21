@@ -411,33 +411,43 @@ starts a model call by itself, so the GPU sits idle and no context is spent unti
 ### Dashboard mode
 
 The **▦** button at the left of the title-bar icons (`Ctrl+Alt+D`, `⋯ › Dashboard mode`,
-`[dashboard].enabled`) turns the overlay into a board: **Session notes**, **Questions to ask**,
-**Blind spots & follow-ups** and **Next steps & prompts**, side by side, each column kept current
-by itself. Questions and blind spots are *tracked*: once the conversation answers or settles
-one, it moves under **Answered (n)** with the answer; next steps are marked done the same way,
-and the prompts column holds what to type into Claude Code next, exactly as you would type it
-(copy it with **⧉**). The window widens to `[dashboard].width` and shrinks back when you leave
-the mode; the ask box and the bottom controls stay, so asking, pausing, **Text** and **Code**
-keep working.
+`[dashboard].enabled`) turns the overlay into a board: **Session notes**, **Action items**,
+**Goals**, **Constraints**, **Questions to ask** and **Blind spots & follow-ups**, side by side,
+each column kept current by itself and each one hideable (**⋯ › View**). The action items are a
+tree: the primary tasks the brief or the discussion asked for, their sub-tasks indented under
+them, and under the item they serve the prompts to type into Claude Code next, exactly as you
+would type them (copy one with **⧉**); the goals are the acceptance criteria, grouped by the
+task each is for; the constraints are the rules and guardrails in force. Everything is
+*tracked*: once the conversation answers a question or finishes a step, it moves under
+**Answered (n)** / **Done (n)** with the answer, a goal is marked **met** with the evidence, a
+constraint is lifted when it no longer applies. While the board is on, the running notes keep
+the narrative only (summary, key points, decisions, open questions). The window widens to
+`[dashboard].width` and shrinks back when you leave the mode; the ask box and the bottom
+controls stay, so asking, pausing, **Text** and **Code** keep working.
 
 The data is not the model's memory. A small database in the session folder (`dashboard.sqlite`,
 also written as `dashboard.md`) holds the items, and each refresh hands the model only the open
-items (under short ids) plus what was said since the last refresh, asking for the changes alone
-(`NEW: …` / `ANSWERED Q2: …` / `DONE N1: …` / `DROP B1`). A background refresh runs at most every
+items (under short ids, the sub-tasks indented under their task) plus what was said since the
+last refresh, asking for the changes alone (`NEW: …` / `NEW under N1: …` / `ANSWERED Q2: …` /
+`DONE N2: …` / `MET G1: …` / `DROP B1`). A background refresh runs at most every
 `[dashboard].refresh_interval_s` (90 s) once `min_new_words` (40) arrived or the code on screen
 changed substantially; it replaces the Notes tab's insights passes while `[dashboard].track` is
 on, and the Insights pane then mirrors the board's open items. Screen capture and OCR keep their
 own cadence (`[screen].interval_s`) in every view mode.
 
-If a Claude Code toolkit is installed in the repository (`[context].repo_root`), dev-assist
-discovers it by itself — the skills, agents, rules, workflows and hooks under `.claude/`, the
-house rules' working loop and the detected commands in `CLAUDE.local.md`, re-checked every
-`rescan_s` seconds, nothing hard-coded — and the suggested prompts (and answers, with
-`toolkit_in_answers` on) name its real `/skills` and agents, with a mentioned part's full text
-handed over on demand. The repository itself is never injected wholesale: with `repo_search` on,
+If a Claude Code toolkit is installed in the repository you are working in, dev-assist discovers
+it by itself — the skills, agents, rules, workflows and hooks under `.claude/`, the house rules'
+working loop and the detected commands in `CLAUDE.local.md`, re-checked every `rescan_s`
+seconds, nothing hard-coded — and every suggested prompt opens with one of its real `/skills` or
+agents, named exactly as installed, with the task's details and constraints as arguments (a
+prompt naming something not installed is thrown away); answers get the catalog too with
+`toolkit_in_answers` on, and a mentioned part's full text is handed over on demand. Which
+repository: the one Claude Code last ran in, read from its own session logs
+(`[context].repo_auto`, the default), or a folder you pin under **⋯ › View › Repository** /
+`[context].repo_root`. The repository itself is never injected wholesale: with `repo_search` on,
 the identifiers and file names a prompt mentions are looked up and only the matching lines go in.
 Both live on the Settings dialog's **Context** tab, everything else on its **Dashboard** tab.
-The card actions and every key: [docs/DASHBOARD.md](docs/DASHBOARD.md).
+The card actions, the View menu and every key: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ### Screen reading
 
@@ -664,7 +674,7 @@ back, is listed in [docs/SHORTCUTS.md](docs/SHORTCUTS.md).
 | `Ctrl+Alt+G` | Code: write the code for the task discussed / shown, right now |
 | `Ctrl+Alt+H` | hands-free mode on / off (auto read → checkpoint → text → code on screen change) |
 | `Ctrl+Alt+J` | manual advance on / off (generate only on a press-and-hold: left = Text, middle = Code) |
-| `Ctrl+Alt+D` | dashboard mode on / off (the ▦ button: notes, questions, blind spots, next steps & prompts as a board) |
+| `Ctrl+Alt+D` | dashboard mode on / off (the ▦ button: notes, action items with sub-tasks and prompts, goals, constraints, questions, blind spots as a board) |
 | *(tap)* Right Shift | pause / resume everything automatic (screen reading, auto-answer, auto-solve, hands-free) |
 | `Ctrl+Alt+X` | quit (saves the session) |
 
@@ -837,15 +847,18 @@ persona = ""                # e.g. "I am a backend engineer interviewing for a p
 
 [dashboard]
 enabled = false             # start in dashboard mode (the ▦ button / Ctrl+Alt+D); persisted with the toggle
-track = true                # background refreshes of the tracked questions / blind spots / next steps
+track = true                # background refreshes of the tracked action items / goals / constraints / questions / blind spots
 refresh_interval_s = 90     # at most this often, once min_new_words arrived or the screen changed a lot
 min_new_words = 40
+show_goals = true           # each column can be hidden (show_notes, show_nextsteps, show_goals, show_constraints,
+                            # show_questions, show_blindspots; show_prompts for the prompts under the action items)
 width = 1180                # window width in dashboard mode; the normal size is restored on exit
 
 [context]
 repo_root = ""              # the project directory: searched on demand for the names a prompt mentions,
                             # never read wholesale; also where the Claude Code toolkit (.claude/,
                             # CLAUDE.local.md) is auto-discovered and re-checked every rescan_s
+repo_auto = true            # with no repo_root: the project Claude Code last ran in (its session logs)
 repo_search = true          # look up files / identifiers mentioned (answers, dashboard); matching lines only
 toolkit = true              # the installed toolkit's catalog (skills, agents, rules, workflows, hooks)
 toolkit_in_answers = true   # ... also for answers / ask / recap, not only the dashboard

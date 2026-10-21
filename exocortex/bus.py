@@ -264,11 +264,13 @@ class InsightsUpdatedEvent(Event):
 
 
 # ---- dashboard mode (2026-10-20) ------------------------------------------------------
-#: One tracked item of the dashboard (exocortex.dashboard.store). `kind`: "question" (questions to
-#: ask), "blindspot" (blind spots & follow-ups), "nextstep" (next steps) or "prompt" (a prompt to
-#: type into Claude Code). `status`: "open", "answered" (answered / done / resolved -- `answer`
-#: carries the answer or how it was settled) or "dropped". `source`: "model" or "user". Times are
-#: the session clock.
+#: One tracked item of the dashboard (exocortex.dashboard.store). `kind`: "nextstep" (an action
+#: item: a primary task, or -- with `parent_id` -- a sub-task of one), "goal" (an acceptance
+#: criterion; `parent_id` = the action item it is for, none = the whole session), "constraint" (a
+#: rule or guardrail to respect), "question" (to ask), "blindspot" (blind spots & follow-ups) or
+#: "prompt" (to type into Claude Code; `parent_id` = the action item it serves). `status`: "open",
+#: "answered" (answered / done / met / resolved -- `answer` carries the answer or how it was
+#: settled) or "dropped". `source`: "model" or "user". Times are the session clock.
 @dataclass(frozen=True)
 class DashboardItem:
     id: int
@@ -279,6 +281,7 @@ class DashboardItem:
     created_at: float = 0.0
     updated_at: float = 0.0
     source: str = "model"
+    parent_id: int | None = None       # a sub-task's task; a goal's or prompt's action item
 
 
 @dataclass(frozen=True)

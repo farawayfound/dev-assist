@@ -156,6 +156,10 @@ class DashboardService:
         now = self._clock()
         store = self.store
         action = (action or "").strip().casefold()
+        current = store.get(int(item_id))
+        if action in ("answer", "answered", "done", "resolve", "resolved") and current is not None \
+                and current.kind == "constraint":
+            action = "dismiss"      # a rule is in force or lifted, never "answered"
         if action in ("answer", "answered", "done", "resolve", "resolved"):
             item = store.resolve(int(item_id), text, now=now)
             detail = "marked answered"
@@ -176,11 +180,14 @@ class DashboardService:
         self.publish(auto=False, detail=detail)
         return True
 
-    def add_item(self, kind: str, text: str) -> bool:
+    def add_item(self, kind: str, text: str, parent_id: int | None = None) -> bool:
+        """Add an item by hand; `parent_id` makes a task a sub-task, or attaches a goal / prompt
+        to an action item."""
         kind = (kind or "").strip().casefold()
         if kind not in KINDS:
             return False
-        item = self.store.add_item(kind, text, now=self._clock(), source="user")
+        item = self.store.add_item(kind, text, now=self._clock(), source="user",
+                                   parent_id=int(parent_id) if parent_id is not None else None)
         if item is None:
             return False
         self.publish(auto=False, detail="added")
@@ -243,8 +250,7 @@ class DashboardService:
         if self._context is not None:
             try:
                 if self._context.refresh():
-                    summary = self._context.toolkit_summary()
-                    detail = f"Claude Code toolkit: {summary}" if summary else "Claude Code toolkit: none found"
+                    detail = f"Context: {self._context.context_summary()}"
                     log.info("dashboard: %s", detail)
                     self._bus.publish(ComponentStatusEvent(component="context", state="info", detail=detail))
             except Exception:  # noqa: BLE001
@@ -302,29 +308,45 @@ class DashboardService:
         d, a = cfg.dashboard, cfg.assist
         kinds = dprompts.kinds_for(getattr(job, "sections", ()), suggest_prompts=bool(d.suggest_prompts))
         store = self.store
-        limit = max(1, int(d.max_open_items))
-        current, aliases = dprompts.render_current({k: store.open_items(k, limit) for k in kinds}, kinds)
+        current, aliases = dprompts.render_current(
+            {k: store.open_items(k) for k in kinds}, kinds, limit=max(1, int(d.max_open_items)))
         with self._lock:
             since_id = self._seg_id
             self._jobs[job.id] = (aliases, kinds)
         budget = max(400, int(cfg.llm.context_tokens) * 4)
         new = self._transcript.window_text(budget, until_id=until_id, since_id=since_id)
         earlier = self._transcript.window_text(EARLIER_CHARS, until_id=since_id) if since_id is not None else ""
-        repo = detail = toolkit = ""
+        repo = detail = toolkit = example = ""
         if self._context is not None:
             try:
                 toolkit = self._context.toolkit_block()
+                example = self._context.toolkit_example()
                 detail = self._context.toolkit_lookup(new, screen_text)
                 repo = self._context.repo_block(new, screen_text)
             except Exception:  # noqa: BLE001 - context is optional, never a reason to fail a refresh
                 log.exception("dashboard: context lookup failed")
         system = dprompts.system_dashboard(
             persona=a.persona, role=a.role, context=a.session_context, max_new=int(d.max_new_items),
-            kinds=kinds, toolkit=toolkit,
+            kinds=kinds, toolkit=toolkit, example=example,
         )
         user = dprompts.user_dashboard(current=current, new=new, earlier=earlier, screen=screen_text,
                                        repo=repo, toolkit_detail=detail)
         return system, user, int(cfg.llm.dashboard_max_tokens)
+
+    @staticmethod
+    def _clean_prompt(text: str) -> str:
+        """A suggested prompt as it would be typed: without the backticks or quotes a model wraps it in."""
+        return (text or "").strip().strip("`\"'").strip()
+
+    def _prompt_installed(self, text: str) -> bool:
+        """False for a prompt that opens with a slash command / agent the installed toolkit does not
+        have (a hallucinated one would only fail when typed). Always True without a toolkit."""
+        if self._context is None:
+            return True
+        try:
+            return bool(self._context.check_prompt(text))
+        except Exception:  # noqa: BLE001
+            return True
 
     def _settle(self, job: Any, *, ok: bool, text: str = "", until_id: int | None = None, screen_text: str = "") -> None:
         with self._lock:
@@ -346,12 +368,31 @@ class DashboardService:
         detail = "nothing new"
         if (text or "").strip() and not lprompts.is_skip(text):
             update = dprompts.parse_update(text, kinds, max_new=int(self._cfg.dashboard.max_new_items))
-            resolves = [(aliases[a], ans) for a, ans in update.resolves if a in aliases]
+            # A rule is never "done": a constraint the model resolves is lifted (dropped).
+            resolves = [(aliases[a], ans) for a, ans in update.resolves if a in aliases and not a.startswith("C")]
             drops = [aliases[a] for a in update.drops if a in aliases]
+            drops += [aliases[a] for a, _ in update.resolves if a in aliases and a.startswith("C")]
             unknown = [a for a, _ in update.resolves if a not in aliases] + [a for a in update.drops if a not in aliases]
             if unknown:
                 log.info("dashboard: the model named ids that were not shown: %s", ", ".join(unknown))
-            result = self.store.apply(update.adds, resolves, drops, now=now,
+            # A new action item takes the next free N number, in the order the model wrote them (the
+            # prompt says so): a sub-task, goal or prompt written after it can name it before it has
+            # an id. The store resolves such a label against the items added earlier in the batch.
+            next_n = 1 + max((int(a[1:]) for a in aliases if a.startswith("N") and a[1:].isdigit()), default=0)
+            adds: list[tuple] = []
+            for add in update.adds:
+                body = add.text
+                if add.kind == "prompt":
+                    body = self._clean_prompt(body)
+                    if not body or not self._prompt_installed(body):
+                        log.info("dashboard: dropped a suggested prompt that names something not installed: %r", add.text[:80])
+                        continue
+                ref = None
+                if add.kind == "nextstep":
+                    ref, next_n = f"N{next_n}", next_n + 1
+                parent = aliases[add.parent] if add.parent in aliases else (add.parent or None)
+                adds.append((add.kind, body, parent, ref))
+            result = self.store.apply(adds, resolves, drops, now=now,
                                       max_new_per_kind=int(self._cfg.dashboard.max_new_items))
             detail = "updated: " + result.describe() if result.changed else "nothing new"
             if update.unparsed:

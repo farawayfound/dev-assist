@@ -210,8 +210,11 @@ FIELDS: dict[str, tuple[Field, ...]] = {
     # ---- dashboard mode (2026-10-20): the multi-column board and its background tracking ----
     "Dashboard": (
         Field("dashboard", "enabled", "Dashboard mode on (also at the next launch)", "bool",
-              help="The overlay as a board: session notes, questions to ask, blind spots & follow-ups, next "
-                   "steps & suggested prompts, side by side. Same as the ▦ title-bar button (Ctrl+Alt+D)."),
+              help="The overlay as a board: session notes, action items (tasks with their sub-tasks and the "
+                   "prompts to type into Claude Code), goals (acceptance criteria), constraints, questions to "
+                   "ask, blind spots & follow-ups, side by side. Same as the ▦ title-bar button (Ctrl+Alt+D). "
+                   "While it is on, the running notes keep the narrative only: the tasks, goals, constraints "
+                   "and questions live on the board."),
         Field("dashboard", "track", "Track questions, blind spots & next steps in the background", "bool",
               help="A small database (the session folder's dashboard.sqlite) holds the items; each refresh "
                    "hands the model only the open ones plus what is new, and applies the changes it reports. "
@@ -222,18 +225,25 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "something new: the speech below, or the screen changing substantially. Screen capture "
                    "and OCR keep their own cadence (the Screen tab) in every view mode."),
         Field("dashboard", "min_new_words", "... once this many new words were said", "int", 0, 1000, 10),
-        Field("dashboard", "max_open_items", "Open items per column handed to the model", "int", 2, 20),
-        Field("dashboard", "max_new_items", "New items per column per refresh", "int", 1, 8),
-        Field("dashboard", "suggest_prompts", "Suggest prompts for Claude Code (Next steps column)", "bool",
-              help="Exactly what to type into Claude Code next. With a toolkit installed in the repository "
-                   "(the Context tab), only its skills and agents are named."),
-        Field("dashboard", "show_resolved", "Keep answered / done items visible, collapsed", "bool"),
+        Field("dashboard", "max_open_items", "Open items per column handed to the model", "int", 2, 20,
+              help="Twice that for action items (a task comes with its sub-tasks) and goals."),
+        Field("dashboard", "max_new_items", "New items per column (and per task) per refresh", "int", 1, 8),
+        Field("dashboard", "suggest_prompts", "Suggest prompts for Claude Code under the action items", "bool",
+              help="Exactly what to type into Claude Code next, one per task that needs one. With a toolkit "
+                   "installed in the repository (the Context tab) every prompt starts with one of its slash "
+                   "commands or agents, named exactly as installed; a prompt naming something that is not "
+                   "installed is thrown away."),
+        Field("dashboard", "show_resolved", "Keep answered / done / met items visible, collapsed", "bool"),
         Field("dashboard", "resolved_keep", "... how many per column", "int", 0, 50),
         Field("dashboard", "show_notes", "Column: Session notes", "bool",
-              help="The running notes (the Notes tab's cadence: every [notes].auto_interval_s)."),
+              help="The running notes (the Notes tab's cadence: every [notes].auto_interval_s). The ⋯ menu's "
+                   "View entry switches every column too."),
+        Field("dashboard", "show_nextsteps", "Column: Action items (tasks, sub-tasks, prompts)", "bool"),
+        Field("dashboard", "show_goals", "Column: Goals (acceptance criteria)", "bool"),
+        Field("dashboard", "show_constraints", "Column: Constraints (rules and guardrails)", "bool"),
         Field("dashboard", "show_questions", "Column: Questions to ask", "bool"),
         Field("dashboard", "show_blindspots", "Column: Blind spots & follow-ups", "bool"),
-        Field("dashboard", "show_nextsteps", "Column: Next steps & suggested prompts", "bool"),
+        Field("dashboard", "show_prompts", "Show the suggested prompts under their action items", "bool"),
         Field("dashboard", "width", "Window width in dashboard mode (px)", "int", 600, 4000, 20,
               help="The normal size is restored when you leave dashboard mode; resizing the board updates this."),
         Field("dashboard", "view_refresh_s", "Re-render the board every (s)", "int", 1, 60,
@@ -247,7 +257,13 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("context", "repo_root", "Repository root (the project being worked on)", "text",
               help="A directory. Searched on demand for the file names and identifiers a prompt mentions; "
                    "never read wholesale. Also where the Claude Code toolkit is looked for (.claude/, "
-                   "CLAUDE.local.md). Empty = none."),
+                   "CLAUDE.local.md). Empty = the auto-detected one below, when that is on."),
+        Field("context", "repo_auto", "Auto-detect the repository from Claude Code", "bool",
+              help="With no root above: the directory Claude Code was most recently run in, read from its own "
+                   "session logs (~/.claude/projects), re-checked every few seconds -- so the toolkit installed "
+                   "in the project you are working in is found with no setup. The ⋯ menu's View > Repository "
+                   "shows what was found."),
+        Field("context", "repo_auto_max_age_h", "... only a session active within (hours; 0 = any)", "int", 0, 720),
         Field("context", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
               help="Only the matching lines go to the model, only when something identifier-like was said, "
                    "typed or shown. Not for inline completions (latency)."),
@@ -270,6 +286,8 @@ FIELDS: dict[str, tuple[Field, ...]] = {
     ),
     "Screen": (
         Field("screen", "interval_s", "Capture interval (s)", "float", 0.5, 10.0, 0.5),
+        Field("screen", "monitor", "Monitor to read in monitor mode (0 = primary)", "int", 0, 8,
+              help="The ⋯ menu's View > Screen source lists the monitors by number with their size and position."),
         Field("screen", "auto_suggest", "Solve / suggest when the screen changes", "bool",
               help="Off by default while you drive: your editor changes all the time, and every change "
                    "would start an unrequested solve that takes over the Assist tab. On for an interview / "

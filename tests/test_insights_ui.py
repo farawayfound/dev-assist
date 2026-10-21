@@ -237,7 +237,7 @@ def test_rebuilding_the_menu_does_not_pile_up_submenus(window: OverlayWindow, qa
         QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
         qapp.processEvents()
     direct = window._menu.findChildren(QMenu, options=Qt.FindChildOption.FindDirectChildrenOnly)
-    assert len(direct) <= 2          # the current Assist + Rename speakers submenus only
+    assert len(direct) <= 3          # the current Assist + View + Rename speakers submenus only
 
 
 def test_hotkey_hint() -> None:

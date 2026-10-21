@@ -1822,7 +1822,10 @@ class Assistant:
         tip = self._transcript.last_id()
         new_text, last_included = self._transcript.head_text(self._cfg.llm.context_tokens * 4, since_id=since_id)
         until_id = last_included if last_included is not None else since_id   # nothing new: stay put
-        system = prompts.system_notes(self._cfg.notes.template)
+        # Dashboard mode keeps the tasks, goals, constraints and questions in its own database:
+        # the notes are then narrative only (the notes prompt's `tracked` form).
+        dash = self._cfg.dashboard
+        system = prompts.system_notes(self._cfg.notes.template, tracked=bool(dash.enabled and dash.track))
         user = prompts.user_notes(previous, new_text)
         try:
             text = self._stream_text(system, user, max_tokens=self._cfg.llm.notes_max_tokens)

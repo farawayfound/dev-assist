@@ -22,7 +22,5 @@ models/*/
 
 # --- Debug / scratch artifacts ---
 *.out
-.wda_*
-.stealth_*
 # --- OpenVINO compiled-kernel cache for RapidOCR on the iGPU / NPU (exocortex/screen/ocr.py) ---
 models/ov_cache/

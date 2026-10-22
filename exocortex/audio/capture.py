@@ -25,6 +25,8 @@ import queue
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
 
@@ -56,6 +58,46 @@ _KEEPALIVE_AMPLITUDE = 1e-4  # ~ -80 dBFS
 # below. Only a pure default-device change with no device-count change (e.g. picking a
 # different already-connected device as default in Settings) waits up to this cadence.
 _DEVICE_POLL_INTERVAL_S = 10.0
+
+#: PortAudio's control calls -- Pa_Initialize (inside ``mod.PyAudio()``), device enumeration,
+#: opening / stopping / closing a stream, Pa_Terminate -- are not thread-safe, and two threads in
+#: Pa_Initialize at once is an access violation that takes the whole process down. Every one of
+#: them in this package runs inside :func:`pa_guard`: each capture's watchdog re-enumerates on its
+#: own thread, and Settings > Audio opens devices, lists them and runs the routing check while the
+#: pipeline's captures run. Reentrant (``_open`` resolves inside it). Audio callbacks never take it.
+PA_LOCK = threading.RLock()
+
+_COINIT_APARTMENTTHREADED = 0x2
+_com_threads = threading.local()
+
+
+def _ensure_com() -> None:
+    """Initialise COM on this thread once, for PortAudio's WASAPI host API.
+
+    PortAudio initialises COM only on the thread whose Pa_Initialize takes its reference count
+    from 0 to 1. While another PyAudio instance keeps it initialised (the other source's capture),
+    opening a stream from any other thread without COM fails with ``[Errno -9999] Unanticipated
+    host error`` -- the watchdog's reopen, a live device switch and the Settings check all open from
+    their own threads (verified on this machine: fails without, opens with STA or MTA). STA, the
+    mode PortAudio's own init and comtypes' import both use: an MTA thread would make a later
+    ``import comtypes`` on it fail with RPC_E_CHANGED_MODE. A thread that already has COM is left
+    as it is. Never uninitialised: streams opened on the thread may outlive any scope here.
+    """
+    if sys.platform != "win32" or getattr(_com_threads, "done", False):
+        return
+    _com_threads.done = True
+    try:
+        ctypes.windll.ole32.CoInitializeEx(None, _COINIT_APARTMENTTHREADED)  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - PortAudio then reports its own error on open
+        log.debug("CoInitializeEx failed", exc_info=True)
+
+
+@contextmanager
+def pa_guard() -> Iterator[None]:
+    """Hold :data:`PA_LOCK` with COM ready on this thread: wrap every PortAudio control call."""
+    with PA_LOCK:
+        _ensure_com()
+        yield
 
 
 def _winmm_device_count() -> int | None:
@@ -139,7 +181,9 @@ def _enumerate_wasapi(pa: Any, mod: Any) -> tuple[list[DeviceInfo], int | None, 
 
     Returns ``(devices, default_loopback_index, default_mic_name)``. The default mic is
     identified by *name* (not index) because ``get_default_input_device_info()`` can
-    report a different, non-WASAPI host-API entry for the same physical device.
+    report a different, non-WASAPI host-API entry for the same physical device -- an MME
+    one whose name is cut at 31 characters ("Microphone Array (Realtek(R) Au"). The WASAPI
+    host API's own ``defaultInputDevice`` gives the full WASAPI name, so it is asked first.
     """
     wasapi = pa.get_host_api_info_by_type(mod.paWASAPI)
     wasapi_index = wasapi["index"]
@@ -151,10 +195,17 @@ def _enumerate_wasapi(pa: Any, mod: Any) -> tuple[list[DeviceInfo], int | None, 
         log.debug("no default WASAPI loopback device", exc_info=True)
 
     default_mic_name: str | None = None
-    try:
-        default_mic_name = str(pa.get_default_input_device_info()["name"])
-    except Exception:
-        log.debug("no default input device", exc_info=True)
+    wasapi_default_in = wasapi.get("defaultInputDevice")
+    if isinstance(wasapi_default_in, int) and wasapi_default_in >= 0:
+        try:
+            default_mic_name = str(pa.get_device_info_by_index(wasapi_default_in)["name"])
+        except Exception:
+            log.debug("WASAPI default input %r not readable", wasapi_default_in, exc_info=True)
+    if default_mic_name is None:
+        try:
+            default_mic_name = str(pa.get_default_input_device_info()["name"])
+        except Exception:
+            log.debug("no default input device", exc_info=True)
 
     devices: list[DeviceInfo] = []
     for i in range(pa.get_device_count()):
@@ -191,12 +242,13 @@ def list_devices(pa_module: Any | None = None) -> list[DeviceInfo]:
     omit it and the real module is imported lazily.
     """
     mod = _resolve_pa_module(pa_module)
-    pa = mod.PyAudio()
-    try:
-        devices, _, _ = _enumerate_wasapi(pa, mod)
-        return devices
-    finally:
-        _safe_terminate(pa)
+    with pa_guard():
+        pa = mod.PyAudio()
+        try:
+            devices, _, _ = _enumerate_wasapi(pa, mod)
+            return devices
+        finally:
+            _safe_terminate(pa)
 
 
 def resolve_device(kind: Literal["mic", "system"], spec: str, pa_module: Any | None = None) -> DeviceInfo:
@@ -212,11 +264,12 @@ def resolve_device(kind: Literal["mic", "system"], spec: str, pa_module: Any | N
     Raises ``ValueError`` with the available devices listed when nothing matches.
     """
     mod = _resolve_pa_module(pa_module)
-    pa = mod.PyAudio()
-    try:
-        devices, default_loopback_index, default_mic_name = _enumerate_wasapi(pa, mod)
-    finally:
-        _safe_terminate(pa)
+    with pa_guard():
+        pa = mod.PyAudio()
+        try:
+            devices, default_loopback_index, default_mic_name = _enumerate_wasapi(pa, mod)
+        finally:
+            _safe_terminate(pa)
 
     if kind == "system":
         candidates = [d for d in devices if d.is_loopback]
@@ -473,6 +526,10 @@ class AudioCapture:
         return self._pa_module if self._pa_module is not None else _import_pyaudiowpatch()
 
     def _open(self) -> None:
+        with pa_guard():
+            self._open_locked()
+
+    def _open_locked(self) -> None:
         mod = self._get_pa_module()
         pa = mod.PyAudio()
         try:
@@ -546,19 +603,20 @@ class AudioCapture:
         self._stream = None
         self._keepalive_stream = None
         self._pa = None
-        for s in (stream, ka_stream):
-            if s is None:
-                continue
-            try:
-                s.stop_stream()
-            except Exception:
-                log.debug("stream.stop_stream() raised", exc_info=True)
-            try:
-                s.close()
-            except Exception:
-                log.debug("stream.close() raised", exc_info=True)
-        if pa is not None:
-            _safe_terminate(pa)
+        with pa_guard():
+            for s in (stream, ka_stream):
+                if s is None:
+                    continue
+                try:
+                    s.stop_stream()
+                except Exception:
+                    log.debug("stream.stop_stream() raised", exc_info=True)
+                try:
+                    s.close()
+                except Exception:
+                    log.debug("stream.close() raised", exc_info=True)
+            if pa is not None:
+                _safe_terminate(pa)
 
     # ---- consumer thread: downmix -> resample -> chunk -> on_frames ----- #
 

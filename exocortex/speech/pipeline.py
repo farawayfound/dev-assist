@@ -69,6 +69,12 @@ _GAP_REALIGN_S = 1.0
 _ECHO_WINDOW_S = 8.0
 _ECHO_OVERLAP_THRESHOLD = 0.8
 
+#: A mic whose peak stays under this (~ -100 dBFS, digital silence) for `_MIC_SILENCE_WARN_S`
+#: while not muted by the app is muted in Windows (or blocked): the stream opened fine but hears
+#: nothing, which nothing else would ever report.
+_MIC_SILENCE_PEAK = 1e-5
+_MIC_SILENCE_WARN_S = 8.0
+
 _QUEUE_POLL_S = 0.2
 _VAD_JOIN_TIMEOUT_S = 3.0
 _ASR_JOIN_TIMEOUT_S = 10.0
@@ -282,6 +288,8 @@ class SpeechPipeline:
 
         self._last_level_ts: dict[Source, float] = {}
         self._level_lock = threading.Lock()
+        self._mic_silent_since: float | None = None
+        self._mic_silence_warned = False
 
     # ------------------------------------------------------------------ #
     # lifecycle
@@ -330,7 +338,12 @@ class SpeechPipeline:
         thread = threading.Thread(target=self._vad_worker, args=(source,), name=f"vad-{source.value}", daemon=True)
         self._vad_threads[source] = thread
         thread.start()
+        self._open_capture(source, started_names)
 
+    def _open_capture(self, source: Source, started_names: dict[Source, str]) -> None:
+        if source is Source.MIC:
+            self._mic_silent_since = None
+            self._mic_silence_warned = False
         try:
             capture = self._capture_factory(
                 source,
@@ -351,8 +364,37 @@ class SpeechPipeline:
             return
 
         with self._captures_lock:
-            self._captures[source] = capture
+            orphaned = not self._running   # stop() ran while this capture was opening
+            if not orphaned:
+                self._captures[source] = capture
+        if orphaned:
+            try:
+                capture.stop()
+            except Exception:  # noqa: BLE001
+                log.exception("pipeline: error stopping an orphaned %s capture", source.value)
+            return
         started_names[source] = getattr(device, "name", "")
+
+    def restart_capture(self, source: Source) -> None:
+        """Reopen `source`'s capture on the device `cfg.audio.mic_device` / `system_device` names
+        now -- how Settings > Audio applies a device choice without a restart. The VAD worker,
+        its queue and the transcript carry on; only the stream changes. Blocks while the old
+        stream closes and the new one opens (WASAPI init): call it off the UI thread. A no-op
+        when the pipeline is stopped or `source` was not started at all."""
+        if not self._running or source not in self._frame_queues:
+            return
+        with self._captures_lock:
+            old = self._captures.pop(source, None)
+        if old is not None:
+            try:
+                old.stop()
+            except Exception:  # noqa: BLE001 - the new stream matters more than a clean old one
+                log.exception("pipeline: error stopping the old %s capture", source.value)
+        self._open_capture(source, {})
+        with self._captures_lock:
+            names = {s: getattr(c.device, "name", "") for s, c in self._captures.items() if c.device is not None}
+        self._publish_audio_ready(names)
+        log.info("pipeline: %s capture reopened on %r", source.value, names.get(source, ""))
 
     def _spec_for(self, source: Source) -> str:
         return self._cfg.audio.system_device if source is Source.SYSTEM else self._cfg.audio.mic_device
@@ -476,6 +518,8 @@ class SpeechPipeline:
     def _make_on_level(self, source: Source) -> Callable[[float, float], None]:
         def _on_level(rms: float, peak: float) -> None:
             now = time.monotonic()
+            if source is Source.MIC:
+                self._watch_mic_silence(now, peak)
             with self._level_lock:
                 last = self._last_level_ts.get(source, 0.0)
                 if now - last < _LEVEL_THROTTLE_S:
@@ -484,6 +528,27 @@ class SpeechPipeline:
             self._bus.publish(AudioLevelEvent(source=source, rms=rms, peak=peak))
 
         return _on_level
+
+    def _watch_mic_silence(self, now: float, peak: float) -> None:
+        """Warn once per stretch of digital silence from a mic not muted here (sound re-arms it)."""
+        if self._mic_muted or peak >= _MIC_SILENCE_PEAK:
+            self._mic_silent_since = None
+            self._mic_silence_warned = False
+            return
+        if self._mic_silent_since is None:
+            self._mic_silent_since = now
+            return
+        if self._mic_silence_warned or now - self._mic_silent_since < _MIC_SILENCE_WARN_S:
+            return
+        self._mic_silence_warned = True
+        with self._captures_lock:
+            capture = self._captures.get(Source.MIC)
+        name = getattr(capture.device, "name", "") if capture is not None and capture.device is not None else ""
+        log.warning("pipeline: mic %r has delivered digital silence for %.0fs", name, now - self._mic_silent_since)
+        self._bus.publish(ComponentStatusEvent(
+            component="audio", state="error",
+            detail=f"mic {name!r} hears nothing (muted in Windows?) - Settings > Audio > Test devices",
+        ))
 
     def _make_on_status(self, source: Source) -> Callable[[str, str, str], None]:
         def _on_status(state: str, device_name: str, detail: str = "") -> None:

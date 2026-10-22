@@ -277,6 +277,16 @@ def _check_audio(r: _Report, cfg: Config) -> None:
             r.line(_OK, f"{kind} -> [{d.index}] {d.name} ({d.sample_rate} Hz, {d.channels} ch)")
         except Exception as e:  # noqa: BLE001
             r.line(_FAIL, f"{kind} device '{spec}' not resolvable: {e}")
+            continue
+        if kind == "mic":
+            from exocortex.audio.endpoint import capture_endpoint_state
+
+            state = capture_endpoint_state(d.name)
+            if state is not None and state.muted:
+                r.line(_FAIL, f"mic '{state.name}' is muted in Windows: it opens fine but delivers silence "
+                              "(Settings > Audio > Test devices > Unmute)")
+            elif state is not None and state.volume < 0.05:
+                r.line(_WARN, f"mic '{state.name}' input volume is {round(state.volume * 100)}% in Windows")
 
 
 def _timed_completion(r: _Report, client: "object") -> None:

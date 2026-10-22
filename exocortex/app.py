@@ -40,6 +40,7 @@ from exocortex.bus import (
     NotesUpdatedEvent,
     ScreenStatusEvent,
     ScreenTextEvent,
+    Source,
     SpeakerRenamedEvent,
     drain,
 )
@@ -1031,6 +1032,11 @@ class Engine(EngineActions):
             self.set_explanations(bool(changed["explain.enabled"]))
         if "audio.mic_start_muted" in changed:
             self.set_mic_muted(bool(changed["audio.mic_start_muted"]))
+        for key, source in (("audio.mic_device", Source.MIC), ("audio.system_device", Source.SYSTEM)):
+            if key in changed and self.pipeline is not None:
+                # reopening a WASAPI stream takes a moment: never on the UI thread
+                threading.Thread(target=self.pipeline.restart_capture, args=(source,),
+                                 name=f"capture-{source.value}-switch", daemon=True).start()
         if any(k.startswith("completion.") for k in changed) and self.completer is not None:
             self.completer.reset()          # lines / hint / timing changed: forget the current suggestion
         if "screen.interval_s" in changed and self.screen is not None:

@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
 )
 
 from exocortex.config import Config
+from exocortex.ui.audio_check import AudioCheckPanel
 from exocortex.ui.theme import COLORS, build_qss
 
 log = logging.getLogger(__name__)
@@ -57,7 +59,8 @@ log = logging.getLogger(__name__)
 
 @dataclass(frozen=True)
 class Field:
-    """One editable config value. ``kind``: bool | int | float | choice | text | model."""
+    """One editable config value. ``kind``: bool | int | float | choice | text | model |
+    mic_device | system_device."""
 
     section: str
     key: str
@@ -315,12 +318,25 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("ui", "start_hidden", "Start hidden", "bool"),
         Field("ui", "font_size", "Font size (pt)", "int", 8, 18, restart=True),
     ),
+    # ---- 2026-10-21: device pickers (applied at once) + the Check panel below them ----
     "Audio": (
-        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool", restart=True),
-        Field("audio", "echo_suppression", "Echo suppression (drop mic text that echoes the other side)", "bool"),
-        Field("audio", "capture_system", "Capture system audio", "bool", restart=True),
+        Field("audio", "mic_device", "Microphone (you)", "mic_device",
+              help="Everything this device hears is transcribed as Me and never clustered. default = the "
+                   "Windows default input, followed when it changes; or pick a device (part of a name, or a "
+                   "device number, works too). Applied at once. Test devices below shows whether it hears you."),
+        Field("audio", "system_device", "Output feed (everyone else)", "system_device",
+              help="The [Loopback] of the device your speakers or headset play through: what it plays is "
+                   "transcribed and clustered into Speaker 1, 2, ... default = the Windows default output, "
+                   "followed when it changes. Applied at once."),
         Field("audio", "capture_mic", "Capture the microphone", "bool", restart=True),
+        Field("audio", "capture_system", "Capture system audio", "bool", restart=True),
         Field("audio", "mic_start_muted", "Start with the mic muted", "bool"),
+        Field("audio", "echo_suppression", "Echo suppression (drop mic text that echoes the other side)", "bool",
+              help="For a mic that hears the speakers (laptop speakers, no headset): a line that repeats what "
+                   "the other feed said in the last 8 s is dropped. With clean routing (Check speaker routing "
+                   "below) there is no echo to catch, and it can only drop real lines -- both sides saying "
+                   "\"okay\"."),
+        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool", restart=True),
     ),
 }
 
@@ -399,14 +415,86 @@ class _ModelCombo(QComboBox):
         super().showPopup()
 
     def _widen_list(self) -> None:
-        """Size the drop-down to its longest id, up to what fits on this screen."""
-        view = self.view()
-        metrics = QFontMetrics(view.font())
-        widest = max((metrics.horizontalAdvance(self.itemText(i)) for i in range(self.count())),
-                     default=0)
-        screen = self.screen() or QApplication.primaryScreen()
-        cap = screen.availableGeometry().width() - 80 if screen is not None else widest
-        view.setMinimumWidth(max(self.width(), min(widest + _LIST_CHROME_PX, cap)))
+        _widen_popup(self)
+
+
+def _widen_popup(combo: QComboBox) -> None:
+    """Size ``combo``'s drop-down to its longest item, up to what fits on this screen."""
+    view = combo.view()
+    metrics = QFontMetrics(view.font())
+    widest = max((metrics.horizontalAdvance(combo.itemText(i)) for i in range(combo.count())),
+                 default=0)
+    screen = combo.screen() or QApplication.primaryScreen()
+    cap = screen.availableGeometry().width() - 80 if screen is not None else widest
+    view.setMinimumWidth(max(combo.width(), min(widest + _LIST_CHROME_PX, cap)))
+
+
+def _list_audio_devices() -> list[Any]:
+    """Every WASAPI device PortAudio knows (imported lazily: pyaudiowpatch is Windows-only)."""
+    from exocortex.audio.capture import list_devices
+
+    return list_devices()
+
+
+class _DeviceCombo(QComboBox):
+    """Editable audio device picker for a ``mic_device`` / ``system_device`` field.
+
+    The items are values the config takes: ``default`` (the Windows default, which capture follows
+    when it changes), then every WASAPI device of that kind by its full name; part of a name or a
+    PortAudio index can be typed too, exactly as in config.toml. Like :class:`_ModelCombo`, the list
+    is re-read every time it drops down -- a headset plugged in while the dialog is open shows up on
+    the next click -- and widened to the longest name; each row's tool tip has its rate, channels
+    and whether Windows uses it by default. Nothing is enumerated until the first drop-down."""
+
+    def __init__(self, kind: str, help_text: str = "", parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setEditable(True)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)   # device names are long
+        self.kind = kind             # "mic" | "system"
+        self._help = help_text
+        self.addItem("default")
+        self.currentTextChanged.connect(lambda _text: self.sync_tooltip())
+        # a picked name shows from its start (the field is narrower than most names)
+        self.currentIndexChanged.connect(lambda _i: self.lineEdit().setCursorPosition(0))
+        self.sync_tooltip()
+
+    def refresh(self) -> None:
+        """Re-read the devices, keeping whatever is selected or typed."""
+        current = self.currentText().strip()
+        try:
+            devices = _list_audio_devices()
+        except Exception:  # noqa: BLE001 - keep the items there are
+            log.warning("audio device list unavailable", exc_info=True)
+            return
+        if self.kind == "system":
+            picks = [d for d in devices if d.is_loopback]
+        else:
+            picks = [d for d in devices if d.is_input and not d.is_loopback]
+        default = next((d for d in picks if d.is_default), None)
+        self.blockSignals(True)
+        self.clear()
+        self.addItem("default")
+        self.setItemData(0, "The Windows default" + (f": {default.name}" if default else "")
+                         + " -- followed when it changes", Qt.ItemDataRole.ToolTipRole)
+        for d in picks:
+            self.addItem(d.name)
+            tip = f"{d.name}\n{d.sample_rate} Hz, {d.channels} ch" + ("\nthe Windows default" if d.is_default else "")
+            self.setItemData(self.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+        idx = self.findText(current)
+        if idx >= 0:
+            self.setCurrentIndex(idx)
+        else:
+            self.setEditText(current)
+        self.blockSignals(False)
+        self.sync_tooltip()
+
+    def sync_tooltip(self) -> None:
+        self.setToolTip("\n".join(t for t in (self.currentText().strip(), self._help) if t))
+
+    def showPopup(self) -> None:  # noqa: N802 - Qt override
+        self.refresh()
+        _widen_popup(self)
+        super().showPopup()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -445,6 +533,8 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
             except Exception:  # noqa: BLE001
                 log.exception("list_models() failed")
         return w
+    if f.kind in ("mic_device", "system_device"):
+        return _DeviceCombo("mic" if f.kind == "mic_device" else "system", f.help, parent)
     return QLineEdit(parent)
 
 
@@ -513,6 +603,11 @@ class FieldForm:
             form.addRow(label, widget)
         scroll.setWidget(inner)
         self.widget = scroll
+        self._layout = form
+
+    def add_row(self, widget: QWidget) -> None:
+        """Append a full-width widget below the fields (the Audio tab's Check panel)."""
+        self._layout.addRow(widget)
 
     def load(self) -> None:
         """Fill every widget from the current config."""
@@ -574,10 +669,17 @@ class SettingsDialog(QDialog):
         outer.setSpacing(8)
         self.tabs = QTabWidget(self)
         outer.addWidget(self.tabs, 1)
+        self.audio_check: AudioCheckPanel | None = None
         for name, group in FIELDS.items():
             form = FieldForm(group, cfg, self.tabs)
             self._forms[name] = form
             self.tabs.addTab(form.widget, name)
+            if name == "Audio":
+                self.audio_check = AudioCheckPanel(
+                    form.widgets["audio.mic_device"], form.widgets["audio.system_device"],
+                    form.widgets["audio.echo_suppression"], form.widget,
+                )
+                form.add_row(self.audio_check)
 
         self.note = QLabel("", self)
         self.note.setObjectName("restart")

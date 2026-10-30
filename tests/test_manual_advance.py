@@ -113,8 +113,8 @@ def _make_hook(**kw: Any) -> tuple["llhooks.PressHoldMouseHook", FakeUser32, Hoo
     hook_clock = HookClock()
     scheduler = ManualScheduler()
     bindings = kw.pop("bindings", None) or {
-        "left": lambda: fired.__setitem__("text", fired["text"] + 1),
-        "middle": lambda: fired.__setitem__("code", fired["code"] + 1),
+        "mouse_left": lambda: fired.__setitem__("text", fired["text"] + 1),
+        "mouse_middle": lambda: fired.__setitem__("code", fired["code"] + 1),
     }
     hook = llhooks.PressHoldMouseHook(
         bindings, user32=fake, clock=hook_clock,
@@ -209,7 +209,7 @@ def test_middle_hold_fires_code_when_its_hold_is_required() -> None:
 def test_quick_middle_click_fires_code_only_without_its_hold_requirement() -> None:
     for hold_code, expected in ((False, 1), (True, 0)):
         hook, fake, hook_clock, scheduler, fired = _make_hook(
-            hold_s=0.8, require_hold={"left": True, "middle": hold_code})
+            hold_s=0.8, require_hold={"mouse_left": True, "mouse_middle": hold_code})
         _send(fake, llhooks.WM_MBUTTONDOWN, 10, 10)
         hook_clock.t += 0.1
         _send(fake, llhooks.WM_MBUTTONUP, 10, 10)
@@ -218,7 +218,7 @@ def test_quick_middle_click_fires_code_only_without_its_hold_requirement() -> No
 
 def test_quick_left_click_never_fires_while_its_hold_is_required() -> None:
     hook, fake, hook_clock, scheduler, fired = _make_hook(
-        hold_s=0.8, require_hold={"left": True, "middle": False})   # the shipped defaults
+        hold_s=0.8, require_hold={"mouse_left": True, "mouse_middle": False})   # the shipped defaults
     _send(fake, llhooks.WM_LBUTTONDOWN, 10, 10)
     hook_clock.t += 0.1
     _send(fake, llhooks.WM_LBUTTONUP, 10, 10)
@@ -227,7 +227,7 @@ def test_quick_left_click_never_fires_while_its_hold_is_required() -> None:
 
 def test_quick_left_click_fires_when_its_hold_is_not_required() -> None:
     hook, fake, hook_clock, scheduler, fired = _make_hook(
-        hold_s=0.8, require_hold={"left": False, "middle": False})
+        hold_s=0.8, require_hold={"mouse_left": False, "mouse_middle": False})
     _send(fake, llhooks.WM_LBUTTONDOWN, 10, 10)
     hook_clock.t += 0.1
     _send(fake, llhooks.WM_LBUTTONUP, 10, 10)
@@ -238,7 +238,7 @@ def test_injected_middle_click_is_processed_like_real_input() -> None:
     """A touchpad three-finger tap mapped to a middle click arrives INJECTED (Windows sends it
     through SendInput); it must fire like a real quick middle-click."""
     hook, fake, hook_clock, scheduler, fired = _make_hook(
-        hold_s=0.8, require_hold={"left": True, "middle": False})
+        hold_s=0.8, require_hold={"mouse_left": True, "mouse_middle": False})
     _send(fake, llhooks.WM_MBUTTONDOWN, 10, 10, flags=llhooks._LLMHF_INJECTED)
     hook_clock.t += 0.05
     _send(fake, llhooks.WM_MBUTTONUP, 10, 10, flags=llhooks._LLMHF_INJECTED)
@@ -249,7 +249,7 @@ def test_hold_seconds_and_require_hold_are_read_live() -> None:
     knobs = {"hold": 2.0, "hold_code": True}
     hook, fake, hook_clock, scheduler, fired = _make_hook(
         hold_s=lambda: knobs["hold"],
-        require_hold=lambda button: True if button == "left" else knobs["hold_code"])
+        require_hold=lambda button: True if button == "mouse_left" else knobs["hold_code"])
     _send(fake, llhooks.WM_LBUTTONDOWN, 10, 10)
     assert scheduler.scheduled[-1][0] == pytest.approx(2.0)
     hook_clock.t += 1.0
@@ -276,7 +276,7 @@ def test_messages_are_never_swallowed() -> None:
     fired: list[str] = []
     fake = FakeUser32(call_next=42)
     hook_clock = HookClock()
-    hook = llhooks.PressHoldMouseHook({"left": lambda: fired.append("x")},
+    hook = llhooks.PressHoldMouseHook({"mouse_left": lambda: fired.append("x")},
                                       hold_s=0.2, schedule=None, user32=fake, clock=hook_clock)
     hook.install()
     assert _send(fake, llhooks.WM_LBUTTONDOWN, 10, 10) == 42
@@ -287,7 +287,7 @@ def test_messages_are_never_swallowed() -> None:
 
 def test_unbound_button_is_not_armed() -> None:
     hook, fake, hook_clock, scheduler, fired = _make_hook(
-        bindings={"left": lambda: None})
+        bindings={"mouse_left": lambda: None})
     _send(fake, llhooks.WM_MBUTTONDOWN, 10, 10)
     assert not scheduler.scheduled
 
@@ -592,12 +592,14 @@ class RecordingAssistant:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    def text(self, focus: str = "", label: str = "") -> int:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int:
         self.calls.append(("text", focus))
         return 1
 
-    def code(self, focus: str = "", label: str = "") -> int:
-        self.calls.append(("code", focus))
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int:
+        # 2026-10-29: `read_now` (read the screen afresh) is accepted and ignored here -- the
+        # routing is what these tests check; tests/test_handsfree_readnow.py covers the flag.
+        self.calls.append(("code", focus) if not fresh else ("code_fresh", focus))
         return 2
 
 
@@ -680,13 +682,21 @@ def test_manual_config_defaults_and_round_trip(tmp_path: Path) -> None:
     assert hf.manual_hold_s == 0.8
     assert hf.manual_hold_text is True     # left clicks happen constantly: the hold is required
     assert hf.manual_hold_code is False    # a quick middle press / three-finger tap triggers
+    assert hf.manual_hold_code_fresh is False   # 2026-10-29: the third gesture is a click too
     assert Config().hotkeys.toggle_manual == "ctrl+alt+j"
+    # 2026-10-29: the gestures themselves are [hotkeys] bindings (Settings > Shortcuts)
+    assert (Config().hotkeys.manual_text, Config().hotkeys.manual_code, Config().hotkeys.manual_code_fresh) == (
+        "mouse_left", "mouse_middle", "mouse4")
+    assert Config().hotkeys.swallow_thumb_buttons is True
 
     cfg = Config()
     cfg.handsfree.manual = True
     cfg.handsfree.manual_hold_s = 1.5
     cfg.handsfree.manual_hold_text = False
     cfg.handsfree.manual_hold_code = True
+    cfg.handsfree.manual_hold_code_fresh = True
+    cfg.hotkeys.manual_code_fresh = "ctrl+mouse5"
+    cfg.hotkeys.swallow_thumb_buttons = False
     p = tmp_path / "config.toml"
     p.write_text(to_toml(cfg), encoding="utf-8")
     loaded = load_config(p)
@@ -705,6 +715,60 @@ def test_old_config_without_manual_fields_loads_with_defaults(tmp_path: Path) ->
     assert cfg.handsfree.manual_hold_s == 0.8
     assert cfg.handsfree.manual_hold_text is True
     assert cfg.handsfree.manual_hold_code is False
+    assert cfg.handsfree.manual_hold_code_fresh is False
+    assert cfg.hotkeys.manual_code_fresh == "mouse4"
+
+
+def test_manual_advance_code_fresh_routes_to_the_controller_or_a_fresh_code() -> None:
+    """2026-10-29: the third gesture. With hands-free on it is the controller's "code_fresh" step;
+    otherwise a plain code(fresh=True) -- never a text."""
+    eng = _bare_engine()
+    eng.handsfree = FakeHandsFree(enabled=True)
+    eng.manual_advance("code_fresh")
+    assert eng.handsfree.steps == ["code_fresh"]
+    assert eng.assistant.calls == []
+
+    eng2 = _bare_engine()
+    eng2.manual_advance("code_fresh")
+    assert eng2.assistant.calls == [("code_fresh", "")]
+
+    eng3 = _bare_engine()
+    eng3.handsfree = FakeHandsFree(enabled=True)
+    eng3._paused = True
+    eng3.manual_advance("code_fresh")
+    assert eng3.handsfree.steps == [] and eng3.assistant.calls == [("code_fresh", "")]
+
+
+def test_engine_code_fresh_is_deferred_and_replayed_with_its_flag() -> None:
+    """A fresh code request made before the model is ready keeps its flag through the replay."""
+    eng = app_mod.Engine(Config(), EventBus())
+    eng.assistant = RecordingAssistant()
+    assert eng.code(fresh=True) is None                # deferred: the LLM is not ready
+    assert eng.assistant.calls == []
+    eng._llm_ready.set()
+    eng._replay_pending()
+    assert eng.assistant.calls == [("code_fresh", "")]
+
+
+def test_trigger_step_code_fresh_runs_a_fresh_code_step(
+    bus: EventBus, hooks: FakeHooks, clock: FakeClock, cfg: Config, make_controller
+) -> None:
+    """The controller's "code_fresh" step is a "code" step whose hook call carries fresh=True (the
+    phase published is "code"), and the task stays armed afterwards like any gesture."""
+    cfg.handsfree.manual = True
+    c = make_controller(cfg, bus, hooks, clock)
+    start_and_settle(bus, clock, hooks, c, TRIGGER_LINES)
+    expect_checkpoint(bus, hooks, 1)
+    assert wait_until(lambda: c.state == "armed")
+    sub = bus.subscribe()
+    c.trigger_step("code_fresh")
+    complete_step(bus, hooks, "code", 1)
+    assert wait_until(lambda: c.state == "armed")
+    assert hooks.code_calls == 1 and hooks.text_calls == 0
+    # TRIGGER_LINES is a code task: the fresh step keeps the code-task ask, plus the flag
+    assert [call for call in hooks.calls if call[0] == "code"] == [
+        ("code", HANDS_FREE_CODE_FOCUS, HANDS_FREE_CODE_LABEL, "fresh")]
+    assert any(isinstance(e, HandsFreeEvent) and e.state == "code" for e in drain(sub))
 
 
 # =====================================================================================
@@ -723,7 +787,7 @@ def test_manual_settings_fields_exist_on_the_hands_free_tab() -> None:
     assert hold.kind == "float"
     assert hold.lo == pytest.approx(0.2) and hold.hi == pytest.approx(3.0)
     assert hold in FIELDS["Hands-free"]
-    for key in ("handsfree.manual_hold_text", "handsfree.manual_hold_code"):
+    for key in ("handsfree.manual_hold_text", "handsfree.manual_hold_code", "handsfree.manual_hold_code_fresh"):
         f = by_path[key]
         assert f.kind == "bool"
         assert f in FIELDS["Hands-free"]

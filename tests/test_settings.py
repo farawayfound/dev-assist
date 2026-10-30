@@ -40,7 +40,7 @@ def qapp() -> QApplication:
 def test_every_field_names_a_real_config_value_of_the_right_kind() -> None:
     cfg = Config()
     kinds = {"bool": bool, "int": int, "float": float, "choice": str, "text": str, "model": str,
-             "mic_device": str, "system_device": str}
+             "device": str, "binding": str}
     seen: set[str] = set()
     for f in all_fields():
         assert f.path not in seen, f.path
@@ -60,9 +60,18 @@ def test_every_field_names_a_real_config_value_of_the_right_kind() -> None:
                  "audio.loopback_keepalive", "audio.echo_suppression",
                  "ui.opacity"):
         assert path in seen, path
-    assert {"completion", "explain", "assist", "screen", "ui", "audio"} <= sections_covered()
+    assert {"completion", "explain", "assist", "screen", "ui", "audio", "monitor"} <= sections_covered()
     assert "llm" not in sections_covered()
     assert list(FIELDS)[0] == "Completion" and FIELDS["Completion"][0].key == "max_lines"
+
+
+def test_monitor_tab_configures_the_monitor_section() -> None:
+    """The View -> Monitor section's contents are editable on a "Monitor" settings tab."""
+    assert "Monitor" in FIELDS
+    keys = [f.key for f in FIELDS["Monitor"]]
+    assert keys == ["show_performance", "show_context", "show_cpu", "show_ram",
+                    "show_gpu", "show_igpu", "show_npu"]
+    assert all(f.section == "monitor" and f.kind == "bool" for f in FIELDS["Monitor"])
 
 
 def test_dialog_loads_edits_and_applies_only_the_changes(qapp: QApplication) -> None:

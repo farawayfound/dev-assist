@@ -1,6 +1,7 @@
-"""SpeechPipeline device handling: switching a source's device live (Settings > Audio) and the
-warning for a mic that delivers digital silence (muted in Windows: it opens, but hears nothing).
-Plus the Engine side: `apply_settings` reopens the capture whose device changed, off the UI thread.
+"""SpeechPipeline device handling: switching a source's device live (Settings > Audio, through
+exo-cortex's `restart_source`, whose own cases are tests/test_pipeline_restart.py) and the warning
+for a mic that delivers digital silence (muted in Windows: it opens, but hears nothing). Plus the
+Engine side: `apply_settings` reopens the capture whose device changed, off the UI thread.
 """
 from __future__ import annotations
 
@@ -68,7 +69,7 @@ def _status(events: list[Any], state: str) -> list[ComponentStatusEvent]:
     return [e for e in events if isinstance(e, ComponentStatusEvent) and e.component == "audio" and e.state == state]
 
 
-def test_restart_capture_reopens_one_source_on_the_new_device(two_speakers_audio, silero_path) -> None:
+def test_restart_source_reopens_one_source_on_the_new_device(two_speakers_audio, silero_path) -> None:
     audio, _sr = two_speakers_audio
     cfg = _make_cfg(capture_system=True, capture_mic=True, echo_suppression=False, partials_enabled=False)
     bus = EventBus()
@@ -82,7 +83,7 @@ def test_restart_capture_reopens_one_source_on_the_new_device(two_speakers_audio
         drain(q)
 
         cfg.audio.mic_device = "Headset"
-        pipe.restart_capture(Source.MIC)
+        assert pipe.restart_source(Source.MIC) == "mic:Headset"
 
         new_mic = factory.latest(Source.MIC)
         assert new_mic is not old_mic and new_mic.spec == "Headset" and new_mic.running
@@ -105,22 +106,15 @@ def test_restart_capture_reopens_one_source_on_the_new_device(two_speakers_audio
         pipe.stop()
 
 
-def test_restart_capture_is_a_noop_for_a_source_never_started(silero_path) -> None:
+def test_restart_source_is_a_noop_while_the_pipeline_is_stopped(silero_path) -> None:
     cfg = _make_cfg(capture_system=True, capture_mic=False)
     factory = _Factory()
     pipe = _make_pipeline(cfg, EventBus(), FakeTranscriber(), None, factory)
-    pipe.restart_capture(Source.SYSTEM)                         # not running yet
+    assert pipe.restart_source(Source.SYSTEM) is None            # not running yet
     assert factory.made == []
-    pipe.start()
-    try:
-        cfg.audio.capture_mic = True                            # a restart-only setting
-        pipe.restart_capture(Source.MIC)
-        assert [c.source for c in factory.made] == [Source.SYSTEM]
-    finally:
-        pipe.stop()
 
 
-def test_a_capture_that_finishes_opening_after_stop_is_closed(silero_path) -> None:
+def test_stop_during_a_slow_reopen_waits_for_it_and_closes_the_new_capture(silero_path) -> None:
     cfg = _make_cfg(capture_system=False, capture_mic=True)
     gate = threading.Event()
     made: list[_LevelCapture] = []
@@ -138,13 +132,17 @@ def test_a_capture_that_finishes_opening_after_stop_is_closed(silero_path) -> No
     pipe = _make_pipeline(cfg, EventBus(), FakeTranscriber(), None, factory)
     pipe.start()
     cfg.audio.mic_device = "Headset"
-    switch = threading.Thread(target=pipe.restart_capture, args=(Source.MIC,))
+    switch = threading.Thread(target=pipe.restart_source, args=(Source.MIC,))
     switch.start()
     assert _wait_until(lambda: len(made) == 2, timeout=5.0)
-    pipe.stop()
+    stopper = threading.Thread(target=pipe.stop)
+    stopper.start()
+    stopper.join(0.2)
+    assert stopper.is_alive()                                   # stop() waits for the reopen in flight...
     gate.set()
     switch.join(5.0)
-    assert made[1].stopped and not made[1].running
+    stopper.join(5.0)
+    assert not stopper.is_alive() and made[1].stopped and not made[1].running   # ...then closes it
 
 
 # --------------------------------------------------------------------------- #
@@ -219,7 +217,7 @@ def test_engine_reopens_the_capture_whose_device_changed(tmp_path: Path) -> None
     done = threading.Event()
 
     class _Pipeline:
-        def restart_capture(self, source: Source) -> None:
+        def restart_source(self, source: Source) -> None:
             calls.append((source, threading.current_thread().name))
             if len(calls) == 2:
                 done.set()

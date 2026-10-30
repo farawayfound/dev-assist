@@ -24,9 +24,9 @@ SPEAKER_MODEL = MODELS / "wespeaker_en_voxceleb_CAM++.onnx"
 
 @pytest.fixture(autouse=True)
 def _no_repo_auto_detect(monkeypatch: pytest.MonkeyPatch) -> None:
-    """[context].repo_auto reads the real ~/.claude/projects: keep every test independent of the
+    """[project].repo_auto reads the real ~/.claude/projects: keep every test independent of the
     repository the developer happens to be working in (a test that exercises it passes `home`)."""
-    monkeypatch.setattr("exocortex.context.provider.detect_repo_root", lambda *a, **k: None)
+    monkeypatch.setattr("exocortex.project.provider.detect_repo_root", lambda *a, **k: None)
 
 
 @pytest.fixture(scope="session")
@@ -98,3 +98,17 @@ def _no_real_swap_unload(monkeypatch):
     import exocortex.instance as _inst
 
     monkeypatch.setattr(_inst, "free_llama_swap", lambda *a, **k: "")
+
+
+@pytest.fixture(autouse=True)
+def _no_real_audio_device_scan(monkeypatch: pytest.MonkeyPatch) -> None:
+    """2026-10-29 (Settings > Audio): every ``SettingsDialog`` starts a background WASAPI device scan
+    (``exocortex.ui.audio_panel.list_devices``) for the Audio tab's pickers. Unit tests must not touch
+    audio devices (SPEC.md), and dozens of dialogs built back to back would overlap PortAudio
+    init/terminate cycles on worker threads -- so the scan answers "no devices" everywhere. Tests of
+    the Audio page replace this with their own fakes; the ``live`` tests exercise the real thing."""
+    try:
+        from exocortex.ui import audio_panel
+    except Exception:  # noqa: BLE001 - no PySide6 / no Qt platform in this environment: nothing to stub
+        return
+    monkeypatch.setattr(audio_panel, "list_devices", lambda: [])

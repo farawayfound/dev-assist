@@ -8,6 +8,7 @@ Offline: tests/test_assistant.py's FakeClient. The background-pass rules are tes
 """
 from __future__ import annotations
 
+import threading
 import time
 from typing import Any
 
@@ -440,3 +441,47 @@ def test_the_session_context_reaches_answers_too(bus: EventBus, transcript: Tran
         assert "Session context (what the team is working on): payments API" in client.calls[0]["prompt"]
     finally:
         a.stop()
+
+
+# --------------------------------------------------------------------------------------------
+# next to exo-cortex's context window and tools (2026-10-29)
+# --------------------------------------------------------------------------------------------
+
+
+def _job(kind: str, **kw: Any) -> Any:
+    return assistant_mod._AssistJob(id=1, kind=kind, question=kind.capitalize(), cancel=threading.Event(), **kw)
+
+
+def test_recap_and_insights_carry_the_context_managers_blocks(bus: EventBus, transcript: Transcript) -> None:
+    """The reference documents, the earlier-session summary and the looked-up passages (exo-cortex
+    6b90e21) reach the recap and the insights passes where every other user turn has them, and the
+    project lookups follow the passages; with none of them a recap renders as it always did."""
+    a = Assistant(Config(), bus, FakeClient(token_batches=[]), transcript, clock=time.monotonic)
+    blocks = {"reference": "DOC", "earlier": "EARLY", "lookup": "PASSAGE"}
+    recap = a._user_for(_job("recap"), "T", "screen.py", previous="", extra="<repo>\nhit\n</repo>", **blocks)
+    order = [recap.index(tag) for tag in ("<reference>", "<earlier>", "<transcript>", "<screen>", "<lookup>", "<repo>")]
+    assert order == sorted(order)
+    insights = a._user_for(_job("insights", sections=("questions",)), "T", "", previous="", **blocks)
+    order = [insights.index(tag) for tag in ("<reference>", "<earlier>", "<transcript>", "<lookup>")]
+    assert order == sorted(order)
+    assert a._user_for(_job("recap"), "T", "", previous="") == prompts.user_recap("T", "", "", "")
+
+
+def test_the_background_kinds_never_get_tools_but_answers_keep_the_session_context(
+        bus: EventBus, transcript: Transcript) -> None:
+    """exo-cortex's tool loop (2026-10-07) serves the answer kinds; the insights, recap and
+    dashboard jobs never get it, even from a runner that offers tools to every kind. A job that does
+    carries the session context and the tools block in one system prompt."""
+    from tests.test_assistant_tools import FakeRunner
+
+    cfg = Config()
+    cfg.assist.session_context = "payments API"
+    a = Assistant(cfg, bus, FakeClient(token_batches=[]), transcript, clock=time.monotonic,
+                  tools=FakeRunner(wants=True))
+    for kind in ("insights", "recap", "dashboard"):
+        assert a._job_tools(_job(kind)) is None, kind
+    ask = _job("ask")
+    assert a._job_tools(ask) is not None
+    system = a._system_for(ask)
+    assert "Session context (what the team is working on): payments API" in system
+    assert "<tools>" in system and system.index("Session context") < system.index("<tools>")

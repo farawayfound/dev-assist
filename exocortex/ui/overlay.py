@@ -10,9 +10,16 @@ under ``QT_QPA_PLATFORM=offscreen``).
 """
 from __future__ import annotations
 
+import dataclasses
 import logging
 import sys
 import time
+from collections.abc import Callable
+
+try:
+    from ctypes import wintypes as _wintypes   # WM_MOUSEACTIVATE decoding (see nativeEvent)
+except Exception:  # pragma: no cover - a platform without ctypes.wintypes
+    _wintypes = None  # type: ignore[assignment]
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
@@ -44,10 +51,15 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QAbstractButton,
     QAbstractScrollArea,
+    QAbstractSlider,
+    QAbstractSpinBox,
+    QComboBox,
 )
 
 from exocortex.actions import EngineActions
+from exocortex.bindings import describe_binding, manual_gesture_summary, normalize_binding, parse_binding
 from exocortex.bus import (
     AssistDeltaEvent,
     AssistDoneEvent,
@@ -55,10 +67,13 @@ from exocortex.bus import (
     AssistStartedEvent,
     AudioLevelEvent,
     AutoAssistChangedEvent,
+    CapabilityMapEvent,
     CheckpointEvent,
     CompletionEvent,
     CompletionModeEvent,
     ComponentStatusEvent,
+    ContextLibraryEvent,
+    ContextUsageEvent,
     DashboardModeEvent,
     DashboardUpdatedEvent,
     Event,
@@ -67,6 +82,7 @@ from exocortex.bus import (
     HandsFreeEvent,
     InsightsUpdatedEvent,
     ManualAdvanceEvent,
+    McpToolsEvent,
     ModelInfoEvent,
     ModelLibraryEvent,
     ModelPullEvent,
@@ -78,14 +94,25 @@ from exocortex.bus import (
     ScreenTextEvent,
     SessionEvent,
     SpeakerRenamedEvent,
+    ToolCallEvent,
     drain,
 )
 from exocortex.config import Config
 from exocortex.llm.prompts import normalize_role
 from exocortex.plan import split_plan
 from exocortex.ui.markdown_lite import md_to_html
+from exocortex.ui.resources import ResourceSampler
 from exocortex.ui.theme import COLORS, build_qss
-from exocortex.ui.widgets import AskBox, AssistView, NotesView, ScreenView, StatusBar, ToggleSwitch, TranscriptView
+from exocortex.ui.widgets import (
+    AskBox,
+    AssistView,
+    MonitorView,
+    NotesView,
+    ScreenView,
+    StatusBar,
+    ToggleSwitch,
+    TranscriptView,
+)
 
 log = logging.getLogger(__name__)
 
@@ -164,6 +191,9 @@ _POLL_MS = 30
 _START_TAB = 1
 _TOPMOST_MS = 1500
 _TOAST_MS = 2500
+#: The Monitor section samples CPU / RAM / VRAM and re-reads the context snapshot every Nth poll
+#: tick (`_POLL_MS` each), i.e. about once a second -- cheap readings that never need 30 ms cadence.
+_MONITOR_SAMPLE_TICKS = 33
 _EDGE_MARGIN = 24
 _NUDGE_PX = 40
 _MIN_WIDTH = 340
@@ -172,6 +202,12 @@ _GRIP_PX = 6          # resize band; inside the root layout's 8 px margin, so it
 _GRIP_CORNER_PX = 18  # this close to the end of an edge band, the drag resizes the corner
 _TITLE_STRIP_PX = 40  # top strip (title bar: drag handle + menu) that must stay on a screen
 _KEEP_VISIBLE_PX = 120
+#: WM_MOUSEACTIVATE -- Windows asking, on a click, whether this window may become the active one
+#: (take the keyboard) -- and the answer that says no. HIWORD(lParam) is the mouse message.
+_WM_MOUSEACTIVATE = 0x0021
+_MA_NOACTIVATE = 3
+_LEFT_BUTTON_MSGS = frozenset({0x0201, 0x0203, 0x00A1, 0x00A3})    # WM_(NC)LBUTTONDOWN / DBLCLK
+_RIGHT_BUTTON_MSGS = frozenset({0x0204, 0x0206, 0x00A4, 0x00A6})   # WM_(NC)RBUTTONDOWN / DBLCLK
 
 
 #: The Assist menu's Role submenu, in display order (keys: exocortex.llm.prompts.ROLES).
@@ -547,6 +583,10 @@ class OverlayWindow(QWidget):
         self._actions = actions
         self._closing_programmatically = False
         self._component_states: dict[str, str] = {}
+        # Monitor section (View -> Monitor): a resource sampler and a tick counter so the poll
+        # loop refreshes it about once a second rather than every 30 ms.
+        self._resource_sampler = ResourceSampler()
+        self._monitor_tick = 0
         self._click_through = cfg.ui.click_through
         self._hotkeys = None
         self._screen_mode = cfg.screen.mode
@@ -579,18 +619,21 @@ class OverlayWindow(QWidget):
         self._wheel_hook: "MouseWheelHook | None" = None
         self._nav_key_hook: "BareKeyHook | None" = None
         self._pause_key_hook: "BareKeyHook | None" = None
-        # Manual advance ([handsfree].manual): the Manual switch next to Hands-free. While on, a
-        # fourth hook watches for the press-and-hold gesture anywhere on screen (left button held
-        # `manual_hold_s` = Text, middle = Code); installed only then, and only on the real
-        # Windows platform (the offscreen QPA tests must never hook the developer's real mouse).
+        # Manual advance ([handsfree].manual): the Manual switch next to Hands-free. While on, the
+        # mouse hook below watches for the gestures anywhere on screen ([hotkeys].manual_*: the left
+        # button held `manual_hold_s` = Text, middle = Code, mouse 4 = Code from scratch by default).
+        # Since 2026-10-29 the same hook serves any other shortcut bound to a mouse button, so it is
+        # installed whenever something is bound -- only on the real Windows platform (the offscreen
+        # QPA tests must never hook the developer's real mouse).
         self._manual = bool(cfg.handsfree.manual)
         self._manual_hook: "PressHoldMouseHook | None" = None
         # Dashboard mode (2026-10-20): the board (exocortex.ui.dashboard) replaces the tab strip
         # and the stacked tabs; the window widens to [dashboard].width and the normal geometry is
         # remembered and restored on exit, the way completion mode's slim bar does it.
         self._dashboard_mode = False
-        self._context_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
+        self._project_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
         self._dashboard_normal_geometry: QRect | None = None
+        self._binding_problems: list[str] = []    # 2026-10-29: invalid / duplicate [hotkeys] entries
 
         # Window flags must be set once, before the first show(). A visible copilot: a normal
         # top-level window (it appears in the taskbar / Alt-Tab), frameless and always-on-top.
@@ -598,6 +641,11 @@ class OverlayWindow(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
         )
+        # 2026-10-29: shown -- by a hotkey, focus_ask -- without taking the keyboard from the window
+        # the user is working in (a normal top-level window is activated when shown; the attribute
+        # shows it without that, on every platform). Which CLICKS on the panel may take the keyboard
+        # is decided in `_click_activates`.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(build_qss(cfg.ui.font_size))
         self.setWindowOpacity(cfg.ui.opacity)
@@ -640,12 +688,11 @@ class OverlayWindow(QWidget):
             QTimer.singleShot(0, self, lambda: self.dashboard_btn.setChecked(True))
 
         self._install_hotkeys()
-        if self._manual:
-            self._install_manual_hook()
-        if self._hotkeys is not None and self._hotkeys.failed:
-            failed = list(self._hotkeys.failed)
+        self._install_manual_hook()          # every mouse-bound shortcut; the gestures only while manual is on
+        problems = self._binding_problem_text()
+        if problems:
             # Receiver context as above: no orphaned callback into a destroyed window.
-            QTimer.singleShot(0, self, lambda: self.show_toast("Hotkey conflict: " + ", ".join(failed)))
+            QTimer.singleShot(0, self, lambda: self.show_toast(problems))
 
     # ---------------------------------------------------------------- UI building --
     def _build_ui(self) -> None:
@@ -703,6 +750,13 @@ class OverlayWindow(QWidget):
         self.control_row = self._build_control_row()
         root_layout.addWidget(self.control_row)
 
+        # The Monitor section (View -> Monitor): performance / context / resources, at the bottom
+        # just above the status strip. Hidden by default ([ui].show_monitor); _apply_view() below
+        # applies the saved View preferences.
+        self.monitor = MonitorView(self._cfg, self.root)
+        self.monitor.set_model(self._cfg.llm.model)
+        root_layout.addWidget(self.monitor)
+
         bottom = QHBoxLayout()
         self.status = StatusBar(self.root)
         bottom.addWidget(self.status, 1)
@@ -712,6 +766,7 @@ class OverlayWindow(QWidget):
 
         self.toast = QLabel("", self)
         self.toast.setObjectName("toast")
+        self.toast.setTextFormat(Qt.TextFormat.PlainText)   # a map's name / an engine error is not markup
         self.toast.hide()
 
         self._edge_grips = [
@@ -729,6 +784,10 @@ class OverlayWindow(QWidget):
             self._text_menu_owners[line_edit] = line_edit
         for target in self._text_menu_owners:
             target.installEventFilter(self)
+
+        # Apply the saved View preferences (which strips are shown). Safe here: completion and
+        # hands-free are both off at construction, so this just hides the Monitor by default.
+        self._apply_view()
 
     def _build_titlebar(self) -> QFrame:
         bar = _TitleBar(self.root)
@@ -921,8 +980,8 @@ class OverlayWindow(QWidget):
             act.setChecked(on)
             act.toggled.connect(lambda checked, k=key: self._actions.set_completion_context({k: checked}))
         menu.addSeparator()
-        # 2026-10-20: the on-demand lookups (exocortex.context) that answers and the dashboard get.
-        ctx = self._cfg.context
+        # 2026-10-20: the on-demand lookups (exocortex.project) that answers and the dashboard get.
+        ctx = self._cfg.project
         repo_action = menu.addAction("Repository lookup (answers, dashboard)")
         repo_action.setCheckable(True)
         repo_action.setChecked(bool(ctx.repo_search))
@@ -953,11 +1012,17 @@ class OverlayWindow(QWidget):
         manual_action.toggled.connect(lambda checked: self._set_manual(checked))
         checkpoint_action = menu.addAction("Checkpoint (new coding task)")
         checkpoint_action.triggered.connect(self._on_checkpoint)
+        compact_action = menu.addAction("Compact context now")
+        compact_action.triggered.connect(self._on_compact)
         code_action = menu.addAction("Code now")
         code_action.triggered.connect(self._on_code)
         menu.addSeparator()
         menu.addAction("Settings…").triggered.connect(self.open_settings)
         menu.addAction("Models…").triggered.connect(lambda: self.open_models())
+        # 2026-10-06: the reference-document library lives on the Models window's Context tab.
+        menu.addAction("Context documents…").triggered.connect(lambda: self.open_models("Context"))
+        # 2026-10-07: what the model may do on its own (files / commands / web / MCP) and the maps.
+        menu.addAction("Capabilities…").triggered.connect(lambda: self.open_models("Capabilities"))
 
     # ---------------------------------------------------------------- settings ---------
     def open_settings(self, tab: str | None = None) -> None:
@@ -980,7 +1045,8 @@ class OverlayWindow(QWidget):
 
     def open_models(self, tab: str | None = None) -> None:
         """Show the (non-modal) Models window, reusing it if it is already open. ``tab`` jumps
-        straight to one of its tabs (Library / Discover / Tuning / Server / Hardware)."""
+        straight to one of its tabs (Library / Discover / Tuning / Server / Context / Capabilities /
+        Hardware)."""
         if ModelsDialog is None:
             self.show_toast("Models window unavailable")
             return
@@ -1022,6 +1088,12 @@ class OverlayWindow(QWidget):
             self._set_dashboard_mode(bool(cfg.dashboard.enabled), notify_engine=False)
         if any(str(key).startswith("dashboard.") for key in changed) and self.dashboard_view is not None:
             self.dashboard_view.apply_config()
+        if any(str(k).startswith("ui.show_") for k in changed):
+            self._apply_view()
+        if any(str(k).startswith("monitor.") for k in changed):
+            self.monitor.apply_config()
+        if any(str(k).startswith("hotkeys.") for k in changed):
+            self._reinstall_hotkeys()       # 2026-10-29: the Shortcuts tab applies at once
         try:
             self._actions.apply_settings(dict(changed))
         except Exception:
@@ -1176,7 +1248,7 @@ class OverlayWindow(QWidget):
         self.completion_btn.setChecked(enabled)
         self.completion_btn.blockSignals(False)
         full_widgets = (self.titlebar, self.tabstrip, self.stack, self.askbox, self.control_row,
-                        self.status, self.size_grip)
+                        self.monitor, self.status, self.size_grip)
         if enabled:
             self._normal_geometry = QRect(self.geometry())
             self._restore_click_through()   # the slim bar must be clickable everywhere
@@ -1212,11 +1284,16 @@ class OverlayWindow(QWidget):
                 w.show()
             self.setMaximumHeight(_QWIDGETSIZE_MAX)
             self.setMinimumSize(0, 0)
-            if self._normal_geometry is not None:
-                self.setGeometry(self._normal_geometry)
             if self._ghost is not None:
                 self._ghost.hide_completion()
-            self._apply_layout()   # back to the hands-free view if that is on
+            # Settle which strips show (the View prefs / hands-free view) BEFORE restoring the
+            # geometry: `full_widgets` includes the Monitor, so showing it unconditionally would
+            # raise the layout's minimum height and clamp the restored height upward. `_apply_layout`
+            # hides it again when its pref is off; activate() makes that take effect first.
+            self._apply_layout()   # back to the hands-free view if that is on; applies the View prefs
+            if self._normal_geometry is not None:
+                self.root.layout().activate()
+                self.setGeometry(self._normal_geometry)
         try:
             self._actions.set_completion_mode(enabled)
         except Exception:
@@ -1288,12 +1365,14 @@ class OverlayWindow(QWidget):
             self._dashboard_normal_geometry = QRect(self.geometry())
             self._restore_click_through()
             self._release_hover_hooks()
-            for w in (self.askbox, self.control_row, self.status, self.size_grip, self.clickthrough_btn):
+            for w in (self.askbox, self.size_grip, self.clickthrough_btn):
                 w.setVisible(True)   # the hands-free view may have hidden them
             self.dashboard_view.apply_config()
         self.tabstrip.setVisible(not enabled)
         self.stack.setVisible(not enabled)
         self.dashboard_view.setVisible(enabled)
+        if enabled:
+            self._apply_view()   # the control row / status / Monitor as the View menu has them
         # The layout recomputes its minimum size only on the next event-loop pass; forcing it now
         # lets the window take the board's width at once, and shrink back at once on exit (the
         # stale, board-sized minimum would otherwise clamp the restored geometry -- the same
@@ -1368,20 +1447,18 @@ class OverlayWindow(QWidget):
     def _build_control_row(self) -> QWidget:
         """Always-visible bottom controls, one row, left -> right: read the screen now, revert to
         the previous answer, reset the session, pause/resume all automatic activity, checkpoint
-        the coding context, then -- right-aligned, accent colour, Text left of Code -- Text (a
-        plain-English walkthrough of the task discussed/shown now) and Code (write the code for
-        it now). Text lives only here: the slim bar (completion mode) hides this row and does not
-        carry it (see `_build_slim_bar`).
+        the coding context, compact the context window, then -- right-aligned, accent colour,
+        Text left of Code -- Text (a plain-English walkthrough of the task discussed/shown now)
+        and Code (write the code for it now). Text and Compact live only here: the slim bar
+        (completion mode) hides this row and does not carry them (see `_build_slim_bar`). The row
+        can also be hidden entirely from the View menu ([ui].show_controls).
 
-        Seven labelled buttons measure 363 px under the real Windows platform plugin (Segoe UI
-        Variable 9 pt, padding 3px 6px): the six before Text were 322 px, inside the 330 px the
-        title bar's 346 px floor leaves after the root margins, and Text adds 41 px, so at the
-        very floor the right-hand Code button clips a little (at the 460 px default width there
-        is ~80 px to spare). The row's horizontal size policy is *Ignored* so it can never raise
-        the window's minimum width itself: the offscreen QPA's fallback font is ~60 % wider (512
-        px for the six-button row) and would otherwise push the floor to ~530 px under tests, and
-        a machine without Segoe UI is better served by a slightly clipped right-hand button than
-        by a wider minimum window."""
+        The row holds eight labelled buttons now (Compact was added 2026-10-07, after Checkpoint).
+        Its horizontal size policy is *Ignored* so it can never raise the window's own minimum
+        width: at the 340 px floor the right-hand buttons clip a little (there is ~80 px of slack
+        at the 460 px default width), and the offscreen QPA's ~60 %-wider fallback font must not
+        push the test-time floor out. A machine without Segoe UI is better served by a slightly
+        clipped right-hand button than by a wider minimum window."""
         row = QWidget(self.root)
         row.setStyleSheet("QPushButton { padding: 3px 6px; font-size: 9pt; }")
         row.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -1413,6 +1490,14 @@ class OverlayWindow(QWidget):
         )
         self.checkpoint_btn.clicked.connect(self._on_checkpoint)
 
+        self.compact_btn = QPushButton("Compact", row)
+        self.compact_btn.setToolTip(
+            "Compact the context window now: fold everything but the newest lines of the current "
+            "context into a short running summary (frees room without losing the thread), like the "
+            "/compact command. The summary is written in the background."
+        )
+        self.compact_btn.clicked.connect(self._on_compact)
+
         self.text_btn = QPushButton("Text", row)
         self.text_btn.setObjectName("primary")
         self.text_btn.setToolTip(
@@ -1428,7 +1513,8 @@ class OverlayWindow(QWidget):
         )
         self.code_btn.clicked.connect(self._on_code)
 
-        for btn in (self.read_btn, self.revert_btn, self.reset_btn, self.pause_btn, self.checkpoint_btn):
+        for btn in (self.read_btn, self.revert_btn, self.reset_btn, self.pause_btn,
+                    self.checkpoint_btn, self.compact_btn):
             h.addWidget(btn)
         h.addStretch(1)
         h.addWidget(self.text_btn)
@@ -1452,6 +1538,23 @@ class OverlayWindow(QWidget):
             self._actions.checkpoint()
         except Exception:
             log.exception("actions.checkpoint() failed")
+
+    def _on_compact(self) -> None:
+        """Compact the context window now (the Controls row's Compact button, the ⋯/Context menu
+        entry): fold all but the newest lines of the current context into a running summary. The
+        engine returns how many characters were folded; the summary itself is written in the
+        background, so the Monitor's context readout catches up on the next answer."""
+        try:
+            dropped = self._actions.compact()
+        except Exception:
+            log.exception("actions.compact() failed")
+            return
+        if dropped:
+            self.show_toast("Compacting context…")
+        elif self._cfg.context.compaction != "summary":
+            self.show_toast("Compaction is off (Models › Context)")
+        else:
+            self.show_toast("Nothing to compact yet")
 
     def _on_code(self) -> None:
         """Ask the engine to write the code for the task discussed/shown, right now."""
@@ -1492,6 +1595,7 @@ class OverlayWindow(QWidget):
         if self.dashboard_view is not None:
             self.dashboard_view.clear()
         self.screen_view.finish_suggestion("", cancelled=True, footer="")
+        self.monitor.clear()
         self._plan_text = self._explain_text = ""
         self._plan_job = self._explain_job = None
         self.slim_panel.clear()
@@ -1535,9 +1639,11 @@ class OverlayWindow(QWidget):
         manual_tip = (
             "Manual advance: generate only on the mouse gesture, anywhere on screen -- hold the left "
             "button for Text; click (or hold) the middle button / three-finger-tap the touchpad for "
-            "Code. Which action needs the hold is set on the Hands-free settings tab. Transcript, "
-            "screen reading and checkpoints keep running; the overlay never comes to the front. "
-            "Off = Auto: everything automatic works as usual (Ctrl+Alt+J)."
+            "Code; click mouse button 4 (the rear thumb button) for Code from scratch, ignoring the "
+            "code on screen. The buttons are set on the Shortcuts settings tab, which gestures need "
+            "the hold on the Hands-free tab. Transcript, screen reading and checkpoints keep running; "
+            "the overlay never comes to the front. Off = Auto: everything automatic works as usual "
+            "(Ctrl+Alt+J)."
         )
         self.manual_label.setToolTip(manual_tip)
         self.manual_switch.setToolTip(manual_tip)
@@ -1603,22 +1709,70 @@ class OverlayWindow(QWidget):
     def _apply_layout(self) -> None:
         """Show / hide the full overlay's parts for the hands-free view (a no-op in completion
         mode, whose slim bar owns the layout, and in dashboard mode, whose board does;
-        ``_set_completion_mode`` / ``_set_dashboard_mode`` re-apply this on exit)."""
+        ``_set_completion_mode`` / ``_set_dashboard_mode`` re-apply this on exit).
+
+        Hands-free wins over the View preferences: it shows only the Assist output, the title bar
+        and the Manual / Hands-free switches (so there is always a way back out), hiding the
+        control row, status strip, Monitor and the tab *buttons* while keeping the tab *strip*
+        (the switches live there). When hands-free is off, which strips show is left to
+        ``_apply_view`` (the View menu)."""
         if self._completion_mode or self._dashboard_mode:
             return
         hf = self._hands_free
-        for w in (self.askbox, self.control_row, self.status, self.size_grip, self.clickthrough_btn):
-            w.setVisible(not hf)
-        for btn in self._tab_buttons:
-            btn.setVisible(not hf)
         self.assist_view.set_hands_free_view(hf)
         if hf:
+            self.askbox.setVisible(False)
+            self.clickthrough_btn.setVisible(False)
+            self.control_row.setVisible(False)
+            self.status.setVisible(False)
+            self.size_grip.setVisible(False)
+            self.monitor.setVisible(False)
+            self.tabstrip.setVisible(True)              # keep the strip -- its switches are the way out
+            for btn in self._tab_buttons:
+                btn.setVisible(False)                   # but not the tab buttons
             self.stack.setCurrentIndex(1)
         else:
+            self.askbox.setVisible(True)
+            self.clickthrough_btn.setVisible(True)
+            self.size_grip.setVisible(True)
             self._restore_click_through()
             self._release_hover_hooks()
+            self._apply_view()                          # control row / status / tabs / monitor per [ui].show_*
         self._update_handsfree_switch_enabled()
         self._apply_hands_free_subtitle()
+
+    def _apply_view(self) -> None:
+        """Apply the View preferences ([ui].show_tabs / show_controls / show_status / show_monitor)
+        to the full overlay. A no-op in completion mode (the slim bar owns the layout) and while
+        hands-free is on (``_apply_layout`` forces its minimal view there). Each strip hides
+        independently; the title bar is never touched, so the panel is always reachable, and when
+        the tab strip is hidden the content stack keeps whatever tab was last selected. In
+        dashboard mode the board stands in for the tab strip (left hidden here) and the hands-free
+        view waits for the board to close, so only the control row / status / Monitor apply."""
+        if self._completion_mode or (self._hands_free and not self._dashboard_mode):
+            return
+        ui = self._cfg.ui
+        if not self._dashboard_mode:
+            self.tabstrip.setVisible(bool(ui.show_tabs))
+            for btn in self._tab_buttons:
+                btn.setVisible(bool(ui.show_tabs))
+        self.control_row.setVisible(bool(ui.show_controls))
+        self.status.setVisible(bool(ui.show_status))
+        self.monitor.setVisible(bool(ui.show_monitor))
+
+    def _set_view_option(self, key: str, shown: bool) -> None:
+        """A View-menu toggle changed: mirror it on ``[ui]``, re-apply the layout, and persist it
+        through the engine (``apply_settings`` writes the config file; the key is UI-only, so the
+        engine simply saves it)."""
+        attr = f"show_{key}"
+        if not hasattr(self._cfg.ui, attr):
+            return
+        setattr(self._cfg.ui, attr, bool(shown))
+        self._apply_view()
+        try:
+            self._actions.apply_settings({f"ui.{attr}": bool(shown)})
+        except Exception:
+            log.exception("actions.apply_settings() failed for ui.%s", attr)
 
     def _update_handsfree_switch_enabled(self) -> None:
         """The switch is usable from the Assist tab, and always while hands-free is on (it is
@@ -1644,48 +1798,158 @@ class OverlayWindow(QWidget):
         self._set_manual(checked)
 
     def _set_manual(self, enabled: bool, *, notify_engine: bool = True) -> None:
-        """Manual / Auto advance. Mirrors the switch, installs / removes the press-and-hold mouse
-        hook, and (unless mirroring a bus event) tells the engine, which flips
-        ``[handsfree].manual`` -- the flag the assistant's automatic lanes and the hands-free
-        controller read live -- and publishes the `ManualAdvanceEvent` every other surface follows."""
+        """Manual / Auto advance. Mirrors the switch, rebinds the mouse hook (and, when a gesture is
+        bound to a key, re-registers the keyboard shortcuts) for the gestures, and (unless mirroring
+        a bus event) tells the engine, which flips ``[handsfree].manual`` -- the flag the assistant's
+        automatic lanes and the hands-free controller read live -- and publishes the
+        `ManualAdvanceEvent` every other surface follows."""
         changed = enabled != self._manual
         self._manual = enabled
         if self.manual_switch.isChecked() != enabled:
             self.manual_switch.blockSignals(True)
             self.manual_switch.setChecked(enabled)
             self.manual_switch.blockSignals(False)
-        if enabled:
-            self._install_manual_hook()
-        else:
-            self._uninstall_manual_hook()
+        # 2026-10-29: the gestures are [hotkeys] bindings like any other -- mouse buttons by default
+        # (the one mouse hook, rebound in place and dropped when nothing is bound), or keys, which
+        # are registered with the keyboard shortcuts only while manual advance is on.
+        self._install_manual_hook()
+        if changed and self._manual_gestures_use_keys():
+            self._reinstall_hotkeys(mouse=False)
         if notify_engine:
             try:
                 self._actions.set_manual_advance(enabled)
             except Exception:
                 log.exception("actions.set_manual_advance(%r) failed", enabled)
         if changed:
-            self.show_toast("Manual advance ON — hold left = Text, click middle = Code" if enabled
-                            else "Auto advance")
+            if enabled:
+                gestures = manual_gesture_summary(self._cfg) or "no gesture bound (Settings > Shortcuts)"
+                self.show_toast("Manual advance ON \u2014 " + gestures)
+            else:
+                self.show_toast("Auto advance")
+
+    def _trigger_table(self) -> list[tuple[str, str, Callable[[], None], bool]]:
+        """Every ``[hotkeys]`` shortcut as ``(name, binding text, callback, manual-only)`` -- what
+        `_install_hotkeys` registers (keys) and `_install_manual_hook` hooks (mouse buttons). The
+        three manual-advance gestures are manual-only: bound while the Manual switch is on."""
+        h = self._cfg.hotkeys
+        return [
+            ("toggle_visible", h.toggle_visible, self.toggle_visible, False),
+            ("answer_last", h.answer_last, self._actions.answer_last, False),
+            ("ask_focus", h.ask_focus, self.focus_ask, False),
+            ("notes", h.notes, self._actions.generate_notes, False),
+            ("toggle_auto", h.toggle_auto, lambda: self.auto_btn.setChecked(not self.auto_btn.isChecked()), False),
+            ("toggle_mic", h.toggle_mic, lambda: self.mic_btn.setChecked(not self.mic_btn.isChecked()), False),
+            ("click_through", h.click_through, lambda: self.set_click_through(not self._click_through), False),
+            ("move_left", h.move_left, lambda: self.nudge(-_NUDGE_PX, 0), False),
+            ("move_right", h.move_right, lambda: self.nudge(_NUDGE_PX, 0), False),
+            ("move_up", h.move_up, lambda: self.nudge(0, -_NUDGE_PX), False),
+            ("move_down", h.move_down, lambda: self.nudge(0, _NUDGE_PX), False),
+            ("select_region", h.select_region, self._open_region_picker, False),
+            ("suggest_now", h.suggest_now, lambda: self._actions.suggest_now(), False),
+            ("toggle_screen", h.toggle_screen, self._on_toggle_screen, False),
+            ("toggle_completion", h.toggle_completion,
+             lambda: self.completion_btn.setChecked(not self.completion_btn.isChecked()), False),
+            ("toggle_explanations", h.toggle_explanations,
+             lambda: self.explain_btn.setChecked(not self.explain_btn.isChecked()), False),
+            ("checkpoint", h.checkpoint, self._on_checkpoint, False),
+            ("toggle_pause", h.toggle_pause, self._toggle_pause_hotkey, False),
+            ("code", h.code, self._on_code, False),
+            ("toggle_handsfree", h.toggle_handsfree, lambda: self._set_hands_free(not self._hands_free), False),
+            ("toggle_manual", h.toggle_manual, lambda: self._set_manual(not self._manual), False),
+            ("insights", h.insights, lambda: self._on_insights_now(()), False),
+            ("recap", h.recap, self._on_recap, False),
+            ("toggle_dashboard", h.toggle_dashboard, lambda: self._set_dashboard_mode(not self._dashboard_mode), False),
+            ("quit", h.quit, self.close, False),
+            ("manual_text", h.manual_text, lambda: self._manual_fire("text"), True),
+            ("manual_code", h.manual_code, lambda: self._manual_fire("code"), True),
+            ("manual_code_fresh", h.manual_code_fresh, lambda: self._manual_fire("code_fresh"), True),
+        ]
+
+    def _mouse_bindings(self) -> dict[str, Callable[[], None]]:
+        """The mouse-bound shortcuts to hook right now, ``{binding text: deferred callback}``: every
+        general shortcut on a mouse button, plus the manual-advance gestures while manual advance is
+        on. Callbacks are deferred off the hook with ``QTimer.singleShot`` (a hook callback must
+        return within ~300 ms). Invalid texts are left out here and reported by `_install_hotkeys`."""
+        out: dict[str, Callable[[], None]] = {}
+        for _name, text, callback, manual_only in self._trigger_table():
+            if manual_only and not self._manual:
+                continue
+            try:
+                binding = parse_binding(text)
+            except ValueError:
+                continue
+            if binding.kind != "mouse" or binding.text in out:
+                continue
+            out[binding.text] = (lambda cb=callback: QTimer.singleShot(0, self, cb))
+        return out
+
+    def _manual_gestures_use_keys(self) -> bool:
+        """Whether a manual-advance gesture is bound to a KEY: flipping the Manual switch must then
+        re-register the keyboard shortcuts, not only rebind the mouse hook."""
+        h = self._cfg.hotkeys
+        for text in (h.manual_text, h.manual_code, h.manual_code_fresh):
+            try:
+                if parse_binding(text).kind != "mouse":
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _mouse_hold_required(self, text: str) -> bool:
+        """`PressHoldMouseHook`'s per-binding hold rule, read live at every release: the manual
+        gestures follow ``[handsfree].manual_hold_text`` / ``manual_hold_code`` /
+        ``manual_hold_code_fresh``; any other shortcut on a mouse button is a click."""
+        h, hf = self._cfg.hotkeys, self._cfg.handsfree
+        for binding, hold in ((h.manual_text, hf.manual_hold_text), (h.manual_code, hf.manual_hold_code),
+                              (h.manual_code_fresh, hf.manual_hold_code_fresh)):
+            try:
+                if normalize_binding(binding) == text:
+                    return bool(hold)
+            except ValueError:
+                continue
+        return False
+
+    def _mouse_swallow(self, text: str) -> bool:
+        """`PressHoldMouseHook`'s per-binding swallow rule, read live at every press: a thumb button
+        (mouse 4 / 5) is kept from the app underneath when ``[hotkeys].swallow_thumb_buttons`` is on
+        (a browser or an editor would otherwise go Back / Forward), a modified click always (it is a
+        hotkey), a bare left / middle / right press never (it must reach the app)."""
+        try:
+            binding = parse_binding(text)
+        except ValueError:
+            return False
+        if binding.key in ("mouse4", "mouse5"):
+            return bool(self._cfg.hotkeys.swallow_thumb_buttons)
+        return bool(binding.modifiers)
 
     def _install_manual_hook(self) -> None:
-        """The press-and-hold gesture hook (``llhooks.PressHoldMouseHook``): installed only while
-        manual advance is on (its per-move callback cost is paid only then), only on the real
-        Windows platform. The hold time and the quick-middle-click option are read live from the
-        config at every press, so a settings change needs nothing here."""
+        """The mouse hook (``llhooks.PressHoldMouseHook``): every ``[hotkeys]`` binding that names a
+        mouse button -- the manual-advance gestures while manual advance is on, any other shortcut
+        bound to a mouse button at all times (2026-10-29). Installed only while something is bound
+        (its per-move callback cost is paid only then), only on the real Windows platform, and
+        rebound in place when the table changes. The hold time, which gestures need the hold and the
+        swallow rule are read live from the config at every press / release."""
         if PressHoldMouseHook is None or not _is_windows_platform():
+            return
+        bindings = self._mouse_bindings()
+        if not bindings:
+            self._uninstall_manual_hook()
             return
         if self._manual_hook is None:
             cfg = self._cfg
             self._manual_hook = PressHoldMouseHook(
-                {
-                    "left": lambda: QTimer.singleShot(0, self, lambda: self._manual_fire("text")),
-                    "middle": lambda: QTimer.singleShot(0, self, lambda: self._manual_fire("code")),
-                },
+                bindings,
                 hold_s=lambda: cfg.handsfree.manual_hold_s,
-                require_hold=lambda button: (cfg.handsfree.manual_hold_text if button == "left"
-                                             else cfg.handsfree.manual_hold_code),
+                require_hold=self._mouse_hold_required,
+                swallow=self._mouse_swallow,
                 schedule=lambda delay_s, check: QTimer.singleShot(int(delay_s * 1000), self, check),
             )
+        else:
+            try:
+                self._manual_hook.rebind(bindings)
+            except Exception:
+                log.exception("the mouse hook could not be rebound")
+                return
         if not self._manual_hook.installed and not self._manual_hook.failed:
             if not self._manual_hook.install():
                 self.show_toast("Manual advance: the mouse hook could not be installed")
@@ -1698,14 +1962,15 @@ class OverlayWindow(QWidget):
                 log.exception("failed to uninstall the manual-advance mouse hook")
 
     def _manual_fire(self, kind: str) -> None:
-        """A press-and-hold fired (deferred off the hook callback): generate now. Never touches
-        the window -- no show / raise / focus -- so the overlay keeps its translucent, background
-        state; the output streams into the Assist view like any other answer."""
+        """A gesture fired (deferred off the hook callback): generate now. Never touches the window
+        -- no show / raise / focus -- so the overlay keeps its translucent, background state; the
+        output streams into the Assist view like any other answer. ``kind`` is "text", "code" or
+        "code_fresh" (Code from scratch: the code on screen ignored)."""
         if not self._manual:
             return
         if self._gesture_blocked_at(QCursor.pos()):
             return   # a long press on the app's own UI (a scrollbar, the title bar) is not the gesture
-        self.show_toast("Manual · Code" if kind == "code" else "Manual · Text")
+        self.show_toast({"code": "Manual \u00b7 Code", "code_fresh": "Manual \u00b7 Code from scratch"}.get(kind, "Manual \u00b7 Text"))
         try:
             self._actions.manual_advance(kind)
         except Exception:
@@ -1905,6 +2170,15 @@ class OverlayWindow(QWidget):
         settings_action.triggered.connect(self.open_settings)
         models_action = self._menu.addAction("Models…")
         models_action.triggered.connect(lambda: self.open_models())
+        context_action = self._menu.addAction("Context documents…")   # 2026-10-06: the Context tab
+        context_action.triggered.connect(lambda: self.open_models("Context"))
+        capabilities_action = self._menu.addAction("Capabilities…")   # 2026-10-07: the Capabilities tab
+        capabilities_action.triggered.connect(lambda: self.open_models("Capabilities"))
+
+        self._menu.addSeparator()
+        compact_action = self._menu.addAction("Compact context now")
+        compact_action.triggered.connect(self._on_compact)
+
         self._menu.addSeparator()
 
         rename_menu = self._menu.addMenu("Rename speakers...")
@@ -1990,7 +2264,8 @@ class OverlayWindow(QWidget):
         display options first -- the dashboard's columns, each one hideable; the Screen tab's
         source and OCR readout; the Assist tab's history pane; the Live tab's partials -- then
         the settings every view shares: the screen source (active window, a monitor, a region,
-        off; pause) and the repository the answers and the dashboard look things up in."""
+        off; pause) and the repository the answers and the dashboard look things up in. Between
+        the two, which strips of the full overlay show (2026-10-07, `_build_view_submenu`)."""
         cfg = self._cfg
         view = self._current_view()
         group = QActionGroup(menu)
@@ -2048,6 +2323,10 @@ class OverlayWindow(QWidget):
             readout.setChecked(self.screen_view.screen_text_toggle.isChecked())
             readout.toggled.connect(self.screen_view.screen_text_toggle.setChecked)
             menu.addSeparator()
+        head = menu.addAction("Overlay strips")
+        head.setEnabled(False)
+        self._build_view_submenu(menu)
+        menu.addSeparator()
         self._populate_screen_source_menu(menu.addMenu("Screen source"))
         pause_action = menu.addAction("Screen: pause/resume")
         pause_action.triggered.connect(self._on_toggle_screen)
@@ -2088,23 +2367,23 @@ class OverlayWindow(QWidget):
     def _populate_repository_menu(self, menu: QMenu) -> None:
         """Which repository the lookups and the toolkit discovery use: auto-detected from Claude
         Code's own session logs (the default), or a folder chosen here / in the settings."""
-        c = self._cfg.context
-        current = menu.addAction(self._context_detail or "Context: not known yet")
+        c = self._cfg.project
+        current = menu.addAction(self._project_detail or "Project: not known yet")
         current.setEnabled(False)
         menu.addSeparator()
         auto = menu.addAction("Auto-detect from Claude Code (the project of its latest session)")
         auto.setCheckable(True)
         auto.setChecked(bool(c.repo_auto))
         auto.setEnabled(not (c.repo_root or "").strip())
-        auto.toggled.connect(lambda checked: self._apply_context_option("repo_auto", bool(checked)))
+        auto.toggled.connect(lambda checked: self._apply_project_option("repo_auto", bool(checked)))
         root = (c.repo_root or "").strip()
         choose = menu.addAction(f"Folder: {root}" if root else "Choose a folder…")
         choose.triggered.connect(self._choose_repo_root)
         if root:
             clear = menu.addAction("Clear the folder (back to auto-detect)")
-            clear.triggered.connect(lambda: self._apply_context_option("repo_root", ""))
+            clear.triggered.connect(lambda: self._apply_project_option("repo_root", ""))
         menu.addSeparator()
-        menu.addAction("Context settings…").triggered.connect(lambda: self.open_settings("Context"))
+        menu.addAction("Project settings…").triggered.connect(lambda: self.open_settings("Project"))
 
     def _switch_view(self, key: str) -> None:
         if key == "dashboard":
@@ -2136,22 +2415,22 @@ class OverlayWindow(QWidget):
             log.exception("actions.apply_settings(screen.monitor) failed")
         self._on_screen_mode_requested("monitor")
 
-    def _apply_context_option(self, key: str, value: object) -> None:
-        setattr(self._cfg.context, key, value)
+    def _apply_project_option(self, key: str, value: object) -> None:
+        setattr(self._cfg.project, key, value)
         try:
-            self._actions.apply_settings({f"context.{key}": value})   # the engine re-detects and says what it found
+            self._actions.apply_settings({f"project.{key}": value})   # the engine re-detects and says what it found
         except Exception:
-            log.exception("actions.apply_settings(context.%s) failed", key)
+            log.exception("actions.apply_settings(project.%s) failed", key)
 
     def _choose_repo_root(self) -> None:
         from pathlib import Path
 
         from PySide6.QtWidgets import QFileDialog
 
-        start = (self._cfg.context.repo_root or "").strip() or str(Path.home())
+        start = (self._cfg.project.repo_root or "").strip() or str(Path.home())
         path = QFileDialog.getExistingDirectory(self, "Repository root (the project being worked on)", start)
         if path:
-            self._apply_context_option("repo_root", path)
+            self._apply_project_option("repo_root", path)
 
     def _on_insights_now(self, sections: tuple[str, ...] = ()) -> None:
         """Refresh the co-pilot insights now (an Assist-menu entry or the hotkey; the Notes tab's
@@ -2233,6 +2512,27 @@ class OverlayWindow(QWidget):
             btn = self._tab_buttons[_NOTES_TAB]
             btn.setText("Notes •" if on else "Notes")
             btn.setToolTip("New co-pilot insights: questions to ask, blind spots & follow-ups" if on else "")
+
+    def _build_view_submenu(self, menu: QMenu) -> None:
+        """Populate a "View" menu with one checkable entry per overlay strip, reflecting the
+        current ``[ui].show_*`` preferences and toggling them through ``_set_view_option``. Shared
+        by the ⋯ menu and the completion-mode context menu."""
+        menu.setToolTipsVisible(True)
+        for key, label, tip in (
+            ("tabs", "Tabs", "The top strip: the Live / Assist / Notes / Screen tabs and the "
+                              "Manual / Hands-free switches (the current tab's content stays)"),
+            ("controls", "Controls", "The bottom button row: Read, Revert, Reset, Pause, "
+                                     "Checkpoint, Compact, Text, Code"),
+            ("status", "Status", "The bottom status strip: audio levels, ASR / LLM state, capture "
+                                 "and screen status"),
+            ("monitor", "Monitor", "The performance monitor: LLM speed, the context window and its "
+                                   "contents, and CPU / RAM / VRAM use"),
+        ):
+            act = menu.addAction(label)
+            act.setCheckable(True)
+            act.setChecked(bool(getattr(self._cfg.ui, f"show_{key}", True)))
+            act.setToolTip(tip)
+            act.toggled.connect(lambda checked, k=key: self._set_view_option(k, checked))
 
     def contextMenuEvent(self, event: QContextMenuEvent) -> None:  # noqa: N802 - Qt override
         """Right-click anywhere on the panel's chrome opens the "..." menu (which has Quit), so
@@ -2324,78 +2624,108 @@ class OverlayWindow(QWidget):
 
     # ---------------------------------------------------------------- hotkeys -----
     def _install_hotkeys(self) -> None:
+        """Register every KEYBOARD shortcut of the ``[hotkeys]`` table (2026-10-29: one grammar for all
+        of them, `exocortex.bindings`): a key with modifiers through ``RegisterHotKey``
+        (``GlobalHotkeys``), a single key as a TAP through one ``llhooks.BareKeyHook``
+        (``_pause_key_hook`` -- the pause key's hook, which now carries every tap binding). Mouse
+        bindings belong to the mouse hook (`_install_manual_hook`). The manual-advance gestures are
+        included only while manual advance is on. An invalid entry, or a binding used twice, is
+        skipped and remembered in ``_binding_problems`` for the toast."""
         if GlobalHotkeys is None or not _is_windows_platform():
             # RegisterHotKey is a real, machine-wide Win32 call: only ever make it on the
             # real "windows" Qt platform, never under the "offscreen" plugin tests use (even
             # on a Windows dev box), so pytest never grabs the user's actual global hotkeys.
             return
-        h = self._cfg.hotkeys
-        bindings = {
-            h.toggle_visible: self.toggle_visible,
-            h.answer_last: self._actions.answer_last,
-            h.ask_focus: self.focus_ask,
-            h.notes: self._actions.generate_notes,
-            h.toggle_auto: lambda: self.auto_btn.setChecked(not self.auto_btn.isChecked()),
-            h.toggle_mic: lambda: self.mic_btn.setChecked(not self.mic_btn.isChecked()),
-            h.click_through: lambda: self.set_click_through(not self._click_through),
-            h.move_left: lambda: self.nudge(-_NUDGE_PX, 0),
-            h.move_right: lambda: self.nudge(_NUDGE_PX, 0),
-            h.move_up: lambda: self.nudge(0, -_NUDGE_PX),
-            h.move_down: lambda: self.nudge(0, _NUDGE_PX),
-            h.select_region: self._open_region_picker,
-            h.suggest_now: lambda: self._actions.suggest_now(),
-            h.toggle_screen: self._on_toggle_screen,
-            h.toggle_completion: lambda: self.completion_btn.setChecked(not self.completion_btn.isChecked()),
-            h.toggle_explanations: lambda: self.explain_btn.setChecked(not self.explain_btn.isChecked()),
-            h.checkpoint: self._on_checkpoint,
-            h.code: self._on_code,
-            h.toggle_handsfree: lambda: self._set_hands_free(not self._hands_free),
-            h.toggle_manual: lambda: self._set_manual(not self._manual),
-            h.insights: lambda: self._on_insights_now(()),
-            h.recap: self._on_recap,
-            h.toggle_dashboard: lambda: self._set_dashboard_mode(not self._dashboard_mode),
-            h.quit: self.close,
-        }
-        # A hotkey left empty is off (see HotkeysConfig): never hand "" to RegisterHotKey, where it
-        # would only come back as a bogus "Hotkey conflict" toast.
-        bindings = {key: callback for key, callback in bindings.items() if str(key or "").strip()}
-        pause_key = str(getattr(h, "toggle_pause", "") or "").strip()
-        if pause_key and is_bare_key is not None and is_bare_key(pause_key):
-            self._install_pause_key(pause_key)
-        elif pause_key:
-            bindings[pause_key] = self._toggle_pause_hotkey
+        combos: dict[str, Callable[[], None]] = {}
+        taps: dict[str, Callable[[], None]] = {}
+        owners: dict[str, str] = {}
+        problems: list[str] = []
+        for name, text, callback, manual_only in self._trigger_table():
+            if manual_only and not self._manual:
+                continue
+            if not (text or "").strip():
+                continue                                   # unbound
+            try:
+                binding = parse_binding(text)
+            except ValueError:
+                problems.append(f"{name}: '{text}' is not a valid shortcut")
+                continue
+            if binding.text in owners:
+                problems.append(f"{describe_binding(binding.text)} is bound to both {owners[binding.text]} and {name}")
+                continue
+            owners[binding.text] = name
+            if binding.kind == "mouse":
+                continue                                   # the mouse hook's
+            (combos if binding.kind == "hotkey" else taps)[binding.text] = callback
+        self._binding_problems = problems
         try:
-            self._hotkeys = GlobalHotkeys(bindings)
+            self._hotkeys = GlobalHotkeys(combos)
         except Exception:
             log.exception("failed to construct GlobalHotkeys")
             self._hotkeys = None
-            return
-        app = QApplication.instance()
-        if app is None:
-            log.warning("no QApplication instance; hotkeys not installed")
-            return
-        try:
-            self._hotkeys.install(app)
-        except Exception:
-            log.exception("failed to install global hotkeys")
+        else:
+            app = QApplication.instance()
+            if app is None:
+                log.warning("no QApplication instance; hotkeys not installed")
+            else:
+                try:
+                    self._hotkeys.install(app)
+                except Exception:
+                    log.exception("failed to install global hotkeys")
+        self._install_tap_keys(taps)
 
-    def _install_pause_key(self, key: str) -> None:
-        """``[hotkeys].toggle_pause`` as a bare key (``llhooks.BareKeyHook``): a TAP of that key
-        -- pressed and released with no other key in between -- toggles Pause / Resume. The right
-        Shift key by default: Shift held for a capital letter is never a tap, and a modifier key
-        is never swallowed. Only on the real Windows platform (like the hotkeys)."""
-        if BareKeyHook is None:
+    def _install_tap_keys(self, taps: dict[str, Callable[[], None]]) -> None:
+        """The single-key TAP bindings (``llhooks.BareKeyHook``, one hook for all of them): the
+        pause / resume key by default (``[hotkeys].toggle_pause`` = ``rshift``: Shift held for a
+        capital letter is never a tap, and a modifier key is never swallowed) and, since 2026-10-29,
+        any other shortcut bound to a single key. Only on the real Windows platform (like the
+        hotkeys); each callback is deferred off the hook with ``QTimer.singleShot``."""
+        if BareKeyHook is None or not taps:
             return
+        deferred = {key: (lambda cb=cb: QTimer.singleShot(0, self, cb)) for key, cb in taps.items()}
         try:
-            hook = BareKeyHook(key, lambda: QTimer.singleShot(0, self._toggle_pause_hotkey))
+            hook = BareKeyHook(deferred)
         except ValueError:
-            log.warning("cannot use %r as the pause / resume key", key)
+            log.warning("cannot hook the tap keys %r", sorted(taps))
             return
         if hook.install():
             self._pause_key_hook = hook
-            log.info("pause / resume: a tap of the %s key", key)
+            log.info("tap keys: %s", ", ".join(sorted(taps)))
         else:
-            log.warning("the pause / resume key %r could not be hooked", key)
+            log.warning("the tap keys %r could not be hooked", sorted(taps))
+
+    def _reinstall_hotkeys(self, *, mouse: bool = True) -> None:
+        """2026-10-29 (Shortcuts tab): ``[hotkeys]`` changed at runtime, or the Manual switch flipped
+        with a gesture bound to a key -- unregister every keyboard shortcut and the tap hook, register
+        the current table, rebind (or drop) the mouse hook, and toast any conflict or invalid entry
+        the way the start-up does."""
+        if self._hotkeys is not None:
+            try:
+                self._hotkeys.uninstall()
+            except Exception:
+                log.exception("failed to uninstall hotkeys")
+            self._hotkeys = None
+        if self._pause_key_hook is not None:
+            try:
+                self._pause_key_hook.uninstall()
+            except Exception:
+                log.exception("failed to uninstall the tap-key hook")
+            self._pause_key_hook = None
+        self._install_hotkeys()
+        if mouse:
+            self._install_manual_hook()
+        problems = self._binding_problem_text()
+        if problems:
+            self.show_toast(problems)
+
+    def _binding_problem_text(self) -> str:
+        """What the start-up / re-install toast says: registrations another app owns ("Hotkey
+        conflict: ..."), then the invalid and doubly-used entries; "" when all is well."""
+        parts: list[str] = []
+        if self._hotkeys is not None and self._hotkeys.failed:
+            parts.append("Hotkey conflict: " + ", ".join(self._hotkeys.failed))
+        parts.extend(self._binding_problems)
+        return "; ".join(parts)
 
     def _toggle_pause_hotkey(self) -> None:
         """The pause / resume hotkey: flips the Pause button (which pauses everything automatic,
@@ -2473,6 +2803,77 @@ class OverlayWindow(QWidget):
         super().resizeEvent(event)
         for grip in self._edge_grips:
             grip.place(self.size())
+
+    # ---------------------------------------------------------------- focus -------
+    #: Parts of the panel a LEFT click keeps activating (taking the keyboard): the text panes and
+    #: inputs (typing, selecting, Ctrl+C), the drag handles (title bar, slim bar, edges, corner grip)
+    #: and the sliders -- a drag that leaves the window keeps its mouse capture only while the
+    #: window is the foreground one.
+    _ACTIVATING_WIDGETS: tuple[type, ...] = (
+        QAbstractScrollArea, QLineEdit, QAbstractSpinBox, QComboBox, QAbstractSlider, QSizeGrip, _TitleBar, _EdgeGrip,
+    )
+
+    def _click_activates(self, mouse_msg: int, pos: QPoint) -> bool:
+        """Whether a click arriving on this window (``mouse_msg`` the button message from
+        ``WM_MOUSEACTIVATE``, ``pos`` the cursor in global logical pixels) may make it the active
+        window -- that is, take the keyboard focus away from the app the user is working in.
+
+        2026-10-29: the panel sits over the user's work, so a click on one of its buttons or
+        switches (Manual, Hands-free, Code, Pause, the tabs, the title-bar icons...) must not move
+        the focus: the button works without it. The focus is taken only where it is needed -- a
+        right click (the context menus are popups whose outside-click dismissal needs this window
+        to be the foreground one), a left click on the ask box or a text pane (typing, selecting,
+        Ctrl+C), on a drag handle or a slider (a drag keeps its mouse capture outside the window
+        only while the window is foreground), or on a button that opens a menu. A middle or thumb
+        button click never activates (it has no use for the keyboard here; it is usually a manual-
+        advance gesture). In the hands-free view a click on the click-through content never
+        activates either: it is a click meant for the app underneath that arrived before the
+        cursor-tracking flag caught up (`_update_hands_free_click_through` runs every poll tick),
+        and the gesture code, not the panel, owns it."""
+        if mouse_msg in _RIGHT_BUTTON_MSGS:
+            return True
+        if mouse_msg not in _LEFT_BUTTON_MSGS:
+            return False
+        try:
+            if self._hands_free and not self._completion_mode and not self._hands_free_clickable_at(pos):
+                return False
+            w = self.childAt(self.mapFromGlobal(pos))
+            while w is not None and w is not self:
+                if isinstance(w, QAbstractButton):
+                    menu = getattr(w, "menu", None)
+                    return callable(menu) and menu() is not None
+                if isinstance(w, self._ACTIVATING_WIDGETS):
+                    return True
+                w = w.parentWidget()
+        except Exception:
+            log.exception("click activation check failed")
+            return True    # fail open: the behaviour of every ordinary window
+        return False
+
+    def _mouse_activate_answer(self, address: int, pos: QPoint | None = None) -> int | None:
+        """Decode the native message at ``address``: ``MA_NOACTIVATE`` when it is a
+        ``WM_MOUSEACTIVATE`` whose click `_click_activates` refuses, else None (Qt and Windows
+        decide as usual). ``pos`` defaults to the cursor position."""
+        if _wintypes is None or not address:
+            return None
+        msg = _wintypes.MSG.from_address(int(address))
+        if msg.message != _WM_MOUSEACTIVATE:
+            return None
+        mouse_msg = (int(msg.lParam) >> 16) & 0xFFFF
+        if self._click_activates(mouse_msg, QCursor.pos() if pos is None else pos):
+            return None
+        return _MA_NOACTIVATE
+
+    def nativeEvent(self, eventType: object, message: object) -> object:  # noqa: N802 - Qt override
+        """Answer ``WM_MOUSEACTIVATE`` (see `_click_activates`); everything else goes to Qt."""
+        try:
+            if eventType == b"windows_generic_MSG":
+                answer = self._mouse_activate_answer(int(message))  # type: ignore[call-overload]
+                if answer is not None:
+                    return True, answer
+        except Exception:
+            log.exception("WM_MOUSEACTIVATE handling failed")
+        return super().nativeEvent(eventType, message)
 
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         self._save_geometry()
@@ -2563,7 +2964,33 @@ class OverlayWindow(QWidget):
             self._handle_event(ev)
         if self._completion_mode and not self.slim_panel.isHidden():
             self.slim_panel.flush()
+        self._refresh_monitor()
         self._update_hands_free_click_through()
+
+    def _refresh_monitor(self) -> None:
+        """Sample resources and re-read the context snapshot for the Monitor, about once a second
+        while it is on screen. A no-op while the Monitor's View
+        pref is off, or the whole overlay is hidden (``isVisibleTo`` ignores the window's own hidden
+        state, so the window is checked explicitly) -- no sampling runs behind a hidden panel."""
+        if not self.isVisible() or not self.monitor.isVisibleTo(self):
+            self._monitor_tick = 0
+            # Drop the CPU baseline so the first reading after the Monitor is shown again is a
+            # fresh interval, not an average over the hidden period.
+            self._resource_sampler.reset()
+            return
+        if self._monitor_tick % _MONITOR_SAMPLE_TICKS == 0:
+            try:
+                self.monitor.set_resources(self._resource_sampler.sample())
+            except Exception:  # noqa: BLE001 - the sampler already fails soft; never break the poll
+                log.debug("monitor resource sample failed", exc_info=True)
+            try:
+                snap = self._actions.context_usage()
+            except Exception:  # noqa: BLE001
+                log.debug("context_usage() failed", exc_info=True)
+                snap = None
+            if snap:
+                self.monitor.set_context(snap)
+        self._monitor_tick += 1
 
     def _handle_event(self, ev: Event) -> None:
         if isinstance(ev, PartialTranscriptEvent):
@@ -2589,6 +3016,10 @@ class OverlayWindow(QWidget):
                 self._on_plan_delta(ev, kind)
         elif isinstance(ev, AssistDoneEvent):
             kind = self._assist_job_kinds.pop(ev.job_id, None)
+            if kind != "complete":
+                # Every real answer (including inline suggestions) carries fresh timing for the
+                # Monitor's performance readout; inline completions never report through here.
+                self.monitor.on_assist_done(ev.ttft_s, ev.tokens, ev.tok_per_s, ev.cancelled)
             if kind == "complete":
                 pass
             elif kind == "dashboard":
@@ -2660,8 +3091,23 @@ class OverlayWindow(QWidget):
                 self._set_manual(ev.enabled, notify_engine=False)
         elif isinstance(ev, ModelLibraryEvent):
             self._on_model_library_event(ev)
-        elif isinstance(ev, (ModelPullEvent, ModelSearchEvent, ModelInfoEvent)):
+        elif isinstance(ev, ContextUsageEvent):
+            # The Monitor shows the live context breakdown for every assist job; the per-poll
+            # `context_usage()` snapshot fills in the running summary the event does not carry
+            # (set_context leaves the summary alone when the key is absent, and normalises the
+            # document count so the event's contributing-count and the snapshot agree).
+            self.monitor.set_context(dataclasses.asdict(ev))
             self._forward_to_models_dialog(ev)
+        elif isinstance(ev, (ModelPullEvent, ModelSearchEvent, ModelInfoEvent, ContextLibraryEvent)):
+            # 2026-10-06: the Context tab re-reads the library on ContextLibraryEvent and renders
+            # the usage panel from ContextUsageEvent; like the model events, they only matter
+            # while the Models window exists.
+            self._forward_to_models_dialog(ev)
+        elif isinstance(ev, ToolCallEvent):
+            # 2026-10-07 (capabilities): the Assist tab's footer shows the tool call in flight.
+            self.assist_view.on_tool(ev)
+        elif isinstance(ev, (CapabilityMapEvent, McpToolsEvent)):
+            self._on_capability_event(ev)
         else:
             log.debug("overlay: unhandled event type %s", type(ev).__name__)
 
@@ -2670,6 +3116,23 @@ class OverlayWindow(QWidget):
         window; dropped on the floor while it has never been opened."""
         if self._models_dialog is not None:
             self._models_dialog.on_event(ev)
+
+    def _on_capability_event(self, ev: CapabilityMapEvent | McpToolsEvent) -> None:
+        """The Capabilities tab re-reads its map list / MCP tools on these (only while the Models
+        window exists); a map that finished indexing, or failed to, also says so in a toast, since
+        the index runs in the background and the window may be closed by then. The toast names the
+        feature, and the launch-time refresh (`automatic`) raises one only when the tree changed:
+        2026-10-29, "Map 'BloomingHealth': 28 files" at every launch read as 28 documents loaded
+        into the context, while a map only lists paths for the tools."""
+        self._forward_to_models_dialog(ev)
+        if isinstance(ev, CapabilityMapEvent):
+            if ev.reason == "indexed":
+                if ev.automatic and not ev.changed:
+                    return
+                verb = "refreshed" if ev.automatic else "indexed"
+                self.show_toast(f"Capabilities map '{ev.name}' {verb}: {ev.files} files")
+            elif ev.reason.startswith("error"):
+                self.show_toast(f"Capabilities map {ev.reason}")
 
     def _on_model_library_event(self, ev: ModelLibraryEvent) -> None:
         self._forward_to_models_dialog(ev)
@@ -2716,16 +3179,17 @@ class OverlayWindow(QWidget):
             self.status.set_asr_status(ev.state, ev.detail)
         elif ev.component == "llm":
             self.status.set_llm_status(ev.state, ev.detail)
+            self.monitor.set_llm_state(ev.state, ev.detail)
             self._forward_to_models_dialog(ev)
         elif ev.component == "completion":
             self._set_completion_status(ev.state, ev.detail)
             if ev.state == "error":
                 self.show_toast(f"Completion: {ev.detail or 'error'}")
             return
-        elif ev.component in ("context", "dashboard"):
+        elif ev.component in ("project", "dashboard"):
             # A repository / toolkit found or changed mid-session, a dashboard problem: say so, never a dot.
-            if ev.component == "context" and ev.detail:
-                self._context_detail = ev.detail      # the View menu's Repository entry shows the latest
+            if ev.component == "project" and ev.detail:
+                self._project_detail = ev.detail      # the View menu's Repository entry shows the latest
             self.show_toast(ev.detail or ev.component)
             return
         elif ev.state == "error":
@@ -2756,6 +3220,10 @@ class OverlayWindow(QWidget):
         """Ensure the overlay is visible and give the ask box keyboard focus."""
         if not self.isVisible():
             self.show()
+        # The one shortcut whose job is to take the keyboard: typing must land in the ask box, so
+        # the window is activated explicitly (setFocus alone only records the focus child while the
+        # window is inactive). Every other shortcut leaves the focus where it is (2026-10-29).
+        self.activateWindow()
         self.askbox.focus()
 
     def nudge(self, dx: int, dy: int) -> None:

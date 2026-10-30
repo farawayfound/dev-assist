@@ -284,7 +284,7 @@ def _check_audio(r: _Report, cfg: Config) -> None:
             state = capture_endpoint_state(d.name)
             if state is not None and state.muted:
                 r.line(_FAIL, f"mic '{state.name}' is muted in Windows: it opens fine but delivers silence "
-                              "(Settings > Audio > Test devices > Unmute)")
+                              "(Settings > Audio: Test the microphone, then Unmute in Windows)")
             elif state is not None and state.volume < 0.05:
                 r.line(_WARN, f"mic '{state.name}' input volume is {round(state.volume * 100)}% in Windows")
 
@@ -335,8 +335,17 @@ def _check_llm_llamacpp(r: _Report, cfg: Config) -> None:
         vendor = "none"
 
     try:
+        # The runtime settings the app itself starts llama-server with -- [llm].llama_source /
+        # llama_upstream_build / runtime_dir, as in exocortex.llm.route and hardware.py's probe --
+        # and still offline (no `ensure`: nothing is downloaded). Without them this section named,
+        # and ran --list-devices against, an LM Studio pack the app never starts once llama_source
+        # is "upstream", reporting a working setup as a GPU-less one.
+        find_kwargs: dict = {"vendor": vendor, "backend": cfg.llm.llama_backend, "source": cfg.llm.llama_source,
+                             "upstream_build": cfg.llm.llama_upstream_build}
+        if cfg.llm.runtime_dir:
+            find_kwargs["upstream_root"] = Path(cfg.llm.runtime_dir).expanduser()
         try:
-            b = llm_server.find_server_binary(cfg.llm.llama_server_path, vendor=vendor, backend=cfg.llm.llama_backend)
+            b = llm_server.find_server_binary(cfg.llm.llama_server_path, **find_kwargs)
         except TypeError:
             b = llm_server.find_server_binary(cfg.llm.llama_server_path)
         framework = getattr(b, "framework", None) or b.flavor
@@ -799,30 +808,30 @@ def _check_completion(r: _Report, cfg: Config) -> None:
                 + (" - starts in completion mode" if cfg.completion.enabled else ""))
 
 
-def _check_context(r: _Report, cfg: Config) -> None:
-    """2026-10-20: the repository root ([context].repo_root), the Claude Code toolkit discovered
-    in it (exocortex.context.toolkit) and the dashboard's tracking settings."""
-    r.section("Context: repository, Claude Code toolkit, dashboard")
-    c, d = cfg.context, cfg.dashboard
+def _check_project(r: _Report, cfg: Config) -> None:
+    """2026-10-20: the repository root ([project].repo_root), the Claude Code toolkit discovered
+    in it (exocortex.project.toolkit) and the dashboard's tracking settings."""
+    r.section("Project: repository, Claude Code toolkit, dashboard")
+    c, d = cfg.project, cfg.dashboard
     explicit = (c.repo_root or "").strip()
     try:
-        from exocortex.context.detect import recent_projects
-        from exocortex.context.provider import ContextProvider
-        from exocortex.context.toolkit import find_toolkit_dir
+        from exocortex.project.detect import recent_projects
+        from exocortex.project.provider import ProjectContext
+        from exocortex.project.toolkit import find_toolkit_dir
 
-        provider = ContextProvider(cfg)
+        provider = ProjectContext(cfg)
         root = provider.repo_root
         if root is None:
             if explicit:
-                r.line(_FAIL, f"[context].repo_root does not exist: {explicit}")
+                r.line(_FAIL, f"[project].repo_root does not exist: {explicit}")
             elif not c.repo_auto:
-                r.line(_WARN, "no repository: [context].repo_root is empty and auto-detection is off -- no "
-                              "repository lookups and no toolkit discovery (Settings > Context)")
+                r.line(_WARN, "no repository: [project].repo_root is empty and auto-detection is off -- no "
+                              "repository lookups and no toolkit discovery (Settings > Project)")
             else:
-                r.line(_WARN, f"no repository: [context].repo_root is empty and Claude Code has not run in a project "
-                              f"in the last {c.repo_auto_max_age_h} h (View > Repository, or Settings > Context)")
+                r.line(_WARN, f"no repository: [project].repo_root is empty and Claude Code has not run in a project "
+                              f"in the last {c.repo_auto_max_age_h} h (View > Repository, or Settings > Project)")
         else:
-            how = "[context].repo_root" if provider.repo_source == "config" else "auto-detected from Claude Code's session logs"
+            how = "[project].repo_root" if provider.repo_source == "config" else "auto-detected from Claude Code's session logs"
             r.line(_OK, f"repo root: {root} ({how}; lookups {'on' if c.repo_search else 'off'}: "
                         f"{c.repo_max_files} files / {c.repo_max_chars} chars per lookup, on mention only)")
         if c.repo_auto and not explicit:
@@ -832,7 +841,7 @@ def _check_context(r: _Report, cfg: Config) -> None:
                 r.line(_OK, "  other recent Claude Code projects: " + ", ".join(str(p) for p in others[:3]))
         cat = provider.catalog
         if not c.toolkit:
-            r.line(_WARN, "toolkit context off ([context].toolkit = false)")
+            r.line(_WARN, "toolkit context off ([project].toolkit = false)")
         elif cat.is_empty:
             where = f"{root}/.claude" if root is not None else "(no repository)"
             r.line(_WARN, f"no Claude Code toolkit found under {where}; install one in the repo with "
@@ -855,7 +864,7 @@ def _check_context(r: _Report, cfg: Config) -> None:
         if clone is not None:
             r.line(_OK, f"toolkit clone: {clone} (richer part descriptions)")
         else:
-            r.line(_WARN, "toolkit clone not found (~/claude-toolkit, ~/.claude/dev-toolkit, [context].toolkit_dir): "
+            r.line(_WARN, "toolkit clone not found (~/claude-toolkit, ~/.claude/dev-toolkit, [project].toolkit_dir): "
                           "descriptions come from the installed files only -- fine")
     except Exception as e:  # noqa: BLE001
         r.line(_WARN, f"toolkit discovery failed: {e}")
@@ -874,7 +883,7 @@ def run_doctor(cfg: Config) -> int:
     _check_audio(r, cfg)
     _check_screen(r, cfg)
     _check_completion(r, cfg)
-    _check_context(r, cfg)
+    _check_project(r, cfg)
     _check_llm(r, cfg)
     _check_overlay(r, cfg)
     print()

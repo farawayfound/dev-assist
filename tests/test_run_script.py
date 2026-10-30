@@ -113,6 +113,22 @@ def _write_fake_py_launcher(bin_dir: Path) -> None:
     (bin_dir / "py.bat").write_text(script, encoding="utf-8")
 
 
+def _seed_broken_venv(dest: Path, *, home: Path, uv: bool) -> None:
+    """A ``.venv`` whose interpreter no longer starts -- what deleting the Python it was built from
+    leaves behind (a cleanup tool emptying %APPDATA%\\uv, a python.org uninstall): python.exe is
+    still on disk, but every call fails. The stand-in is a `timeout.exe` copy, which exits non-zero
+    at once on ``-E -c "import sys"`` just as the uv trampoline / venv launcher do then, and can
+    never run anything. ``uv`` adds the ``uv = ...`` line uv writes into the pyvenv.cfg of a venv it
+    created, which is what run.bat reads to decide whether its cached uv.exe can repair it."""
+    scripts = dest / ".venv" / "Scripts"
+    scripts.mkdir(parents=True, exist_ok=True)
+    timeout_exe = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "timeout.exe"
+    shutil.copy(timeout_exe, scripts / "python.exe")
+    shutil.copy(timeout_exe, scripts / "pythonw.exe")
+    cfg = f"home = {home}\n" + ("uv = 0.12.23\n" if uv else "")
+    (dest / ".venv" / "pyvenv.cfg").write_text(cfg, encoding="utf-8")
+
+
 def test_dryrun_with_fake_py_creates_venv_installs_extras_and_writes_stamp(tmp_path: Path) -> None:
     _copy_run_files(tmp_path)
     bin_dir = tmp_path / "fakebin"
@@ -250,6 +266,135 @@ def test_dryrun_vendor_mismatch_forces_reinstall_even_when_stamp_is_fresh(tmp_pa
     assert stamp.read_text(encoding="utf-8").split()[0] == actual_vendor
 
 
+def test_dryrun_broken_uv_venv_reinstalls_python_then_rebuilds(tmp_path: Path) -> None:
+    """The .venv's python.exe is on disk but no longer starts: the uv-managed Python it was built on
+    is gone. run.bat used to check only that python.exe exists, so every launch failed at its first
+    pip call, behind a console that closed at once. It must try to put that Python back with the
+    cached uv.exe first and -- when the interpreter still does not start, as always under a dry
+    run -- rebuild .venv, then carry on with the normal setup."""
+    _copy_run_files(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    _write_fake_py_launcher(bin_dir)
+    uv_dir = tmp_path / ".tools" / "uv"
+    uv_dir.mkdir(parents=True)
+    (uv_dir / "uv.exe").write_bytes(b"not a real uv.exe, just needs to already exist")
+    _seed_broken_venv(tmp_path, home=tmp_path / "deleted-python", uv=True)
+
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + os.pathsep + MINIMAL_PATH
+    env["EXO_SETUP_DRYRUN"] = "1"
+    env["PYTHONPATH"] = str(ROOT)
+
+    result = _run_setup_only(tmp_path, env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    out = result.stdout
+    assert "Python no longer starts" in out
+    assert "[dryrun] .tools\\uv\\uv.exe python install 3.12" in out
+    assert "rebuilding the virtual environment" in out
+    assert "Creating virtual environment" in out
+
+    # The broken venv was replaced by a working one (the fake py launcher's), and setup went on.
+    probe = subprocess.run(
+        [str(tmp_path / ".venv" / "Scripts" / "python.exe"), "-E", "-c", "import sys"],
+        capture_output=True, timeout=15,
+    )
+    assert probe.returncode == 0
+    assert (tmp_path / ".venv" / "exocortex-setup.stamp").is_file()
+
+
+def test_dryrun_broken_venv_whose_base_python_still_exists_is_left_alone(tmp_path: Path) -> None:
+    """python.exe does not start although the Python its pyvenv.cfg names is still installed: the
+    cause is something else (an antivirus block), and a rebuild would only throw away a multi-GB
+    venv to hit the same wall. run.bat must stop with an error and leave .venv as it is."""
+    _copy_run_files(tmp_path)
+    base = tmp_path / "installed-python"
+    base.mkdir()
+    (base / "python.exe").write_bytes(b"")
+    _seed_broken_venv(tmp_path, home=base, uv=False)
+
+    env = dict(os.environ)
+    env["PATH"] = MINIMAL_PATH
+    env["EXO_SETUP_DRYRUN"] = "1"
+    env.pop("PYTHONPATH", None)
+
+    result = _run_setup_only(tmp_path, env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "still installed" in result.stdout
+    assert (tmp_path / ".venv" / "Scripts" / "python.exe").is_file(), "the venv must be left alone"
+    assert (tmp_path / ".venv" / "pyvenv.cfg").is_file()
+
+
+def test_dryrun_quiet_run_keeps_a_broken_venv_instead_of_rebuilding(tmp_path: Path) -> None:
+    """A hidden run (EXO_SETUP_QUIET=1, what run.vbs sets) tries the non-destructive uv repair and
+    nothing more: a rebuild that then failed (offline) would leave no .venv at all, and run.vbs
+    takes a missing .venv for a fresh install -- the one case it shows a console for, to a meeting
+    on a shared screen. The broken venv must still be there afterwards (no app, no window)."""
+    _copy_run_files(tmp_path)
+    bin_dir = tmp_path / "fakebin"
+    _write_fake_py_launcher(bin_dir)
+    uv_dir = tmp_path / ".tools" / "uv"
+    uv_dir.mkdir(parents=True)
+    (uv_dir / "uv.exe").write_bytes(b"not a real uv.exe, just needs to already exist")
+    _seed_broken_venv(tmp_path, home=tmp_path / "deleted-python", uv=True)
+
+    env = dict(os.environ)
+    env["PATH"] = str(bin_dir) + os.pathsep + MINIMAL_PATH
+    env["EXO_SETUP_DRYRUN"] = "1"
+    env["EXO_SETUP_QUIET"] = "1"
+    env["PYTHONPATH"] = str(ROOT)
+
+    result = _run_setup_only(tmp_path, env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[dryrun] .tools\\uv\\uv.exe python install 3.12" in result.stdout
+    assert "rebuilding" not in result.stdout
+    assert "Creating virtual environment" not in result.stdout
+    assert (tmp_path / ".venv" / "pyvenv.cfg").read_text(encoding="utf-8").startswith(
+        f"home = {tmp_path / 'deleted-python'}"), "the broken venv must be kept, not replaced"
+
+
+def test_failed_setup_never_waits_for_a_keypress(tmp_path: Path) -> None:
+    """A failed setup exits at once, like every other run.bat outcome -- it must never `pause` to
+    keep its console up: consoles are not excluded from screen capture, and one left waiting
+    mid-meeting is seen by everyone watching the share. stdin stays OPEN here, so a `pause` would
+    block until the timeout rather than return on EOF. Not a dry run (the failure path must be
+    the real one), but nothing here can reach the network or start the app: setup stops at the
+    broken-venv check first, and the dummy uv.exe stands in the way of a real download should that
+    check ever regress."""
+    _copy_run_files(tmp_path)
+    base = tmp_path / "installed-python"
+    base.mkdir()
+    (base / "python.exe").write_bytes(b"")
+    _seed_broken_venv(tmp_path, home=base, uv=False)
+    uv_dir = tmp_path / ".tools" / "uv"
+    uv_dir.mkdir(parents=True)
+    (uv_dir / "uv.exe").write_bytes(b"not a real uv.exe, just needs to already exist")
+
+    env = dict(os.environ)
+    env["PATH"] = MINIMAL_PATH
+    env.pop("EXO_SETUP_DRYRUN", None)
+    env.pop("EXO_SETUP_QUIET", None)
+    env.pop("PYTHONPATH", None)
+
+    proc = subprocess.Popen(
+        ["cmd", "/c", str(tmp_path / "run.bat")],
+        cwd=str(tmp_path), env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    )
+    timed_out = False
+    try:
+        rc = proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        proc.kill()
+        rc = proc.wait()
+    proc.stdin.close()
+    out = proc.stdout.read()
+    proc.stdout.close()
+    assert not timed_out, "run.bat sat waiting for a keypress after a failed setup:\n" + out
+    assert rc == 1, out
+    assert "still installed" in out
+
+
 # --- run.vbs: does it actually decide correctly whether to call run.bat, and how visibly? ------
 #
 # run.vbs itself never runs real setup or launches the real overlay in these tests: the run.bat it
@@ -272,14 +417,22 @@ _CONSOLE_VISIBLE_PS1 = textwrap.dedent(r"""
     """)
 
 
-def _write_fake_bat_recorder(dest: Path) -> None:
+def _write_fake_bat_recorder(dest: Path, *, starting_python: bool = False) -> None:
     """Overwrites ``run.bat`` in ``dest`` (already containing the real ``run.vbs``, copied
     separately) with a stand-in that: records it was called (``calls.log``), records whether its
     own console window was visible (``visible_state.txt``), and then leaves behind a working
     ``.venv\\Scripts\\pythonw.exe``/``python.exe`` (timeout.exe copies) and a fresh stamp, exactly
     as a real ``run.bat --setup-only`` would on success -- so run.vbs's post-setup launch step has
-    something harmless to invoke."""
+    something harmless to invoke. ``starting_python``: python.exe is instead the interpreter stand-in
+    `_seed_existing_venv` uses, one that passes run.vbs's "does it start" check -- what a repaired
+    venv looks like; without it, a broken venv's python.exe stays as broken as before."""
     (dest / "check_console_visible.ps1").write_text(_CONSOLE_VISIBLE_PS1, encoding="utf-8")
+    if starting_python:
+        real_python = Path(sys.executable)
+        python_step = (f'copy /y "{real_python}" ".venv\\Scripts\\python.exe" >nul\n'
+                       f'> ".venv\\pyvenv.cfg" echo home = {real_python.parent}\n')
+    else:
+        python_step = 'copy /y "%WINDIR%\\System32\\timeout.exe" ".venv\\Scripts\\python.exe" >nul\n'
     (dest / "run.bat").write_text(
         textwrap.dedent(r"""
             @echo off
@@ -290,7 +443,7 @@ def _write_fake_bat_recorder(dest: Path) -> None:
             powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0check_console_visible.ps1" > "%~dp0visible_state.txt"
             if not exist ".venv\Scripts" mkdir ".venv\Scripts" >nul 2>nul
             copy /y "%WINDIR%\System32\timeout.exe" ".venv\Scripts\pythonw.exe" >nul
-            copy /y "%WINDIR%\System32\timeout.exe" ".venv\Scripts\python.exe" >nul
+            """) + python_step + textwrap.dedent(r"""
             > ".venv\exocortex-setup.stamp" echo fake-vendor stamped-by-test
             exit /b 0
             """),
@@ -450,3 +603,50 @@ def test_vbs_vendor_mismatch_runs_setup_hidden(tmp_path: Path) -> None:
     assert (tmp_path / "calls.log").is_file(), "a vendor mismatch alone must still trigger setup"
     visible = (tmp_path / "visible_state.txt").read_text(encoding="utf-8").strip()
     assert visible == "False", "an existing install's vendor-drift setup must stay hidden too"
+
+
+def test_vbs_broken_interpreter_runs_setup_hidden(tmp_path: Path) -> None:
+    """pythonw.exe is on disk but the venv's Python no longer starts (the interpreter it was built
+    from was deleted). run.vbs used to take that for a working install and launch it -- to no
+    effect, on every double-click. It must run the repair, HIDDEN like every other catch-up of an
+    existing install (consoles are not excluded from screen capture), with EXO_SETUP_QUIET=1 --
+    then launch, with no second run.bat call, once the interpreter starts again."""
+    _copy_run_files(tmp_path)
+    _write_fake_bat_recorder(tmp_path, starting_python=True)
+    _seed_broken_venv(tmp_path, home=tmp_path / "deleted-python", uv=True)
+    now = time.time()
+    stamp = tmp_path / ".venv" / "exocortex-setup.stamp"
+    stamp.write_text("nvidia up-to-date\n", encoding="utf-8")
+    os.utime(stamp, (now, now))  # nothing stale: only the broken interpreter can trigger setup
+
+    result = _run_vbs(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    calls = (tmp_path / "calls.log").read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert calls.count("CALLED") == 1, calls
+    visible = (tmp_path / "visible_state.txt").read_text(encoding="utf-8").strip()
+    assert visible == "False", "repairing an existing install must never show a console"
+    assert "QUIET=1" in calls, "a hidden setup must not prompt -- or rebuild (see run.bat)"
+
+
+def test_vbs_broken_interpreter_still_broken_after_setup_stays_silent(tmp_path: Path) -> None:
+    """The hidden repair did not take: python.exe still does not start after run.bat --setup-only.
+    Launching pythonw.exe would do nothing, and an existing install never gets a console -- not
+    even a run.bat window to explain the failure. So: one hidden run.bat call, then nothing. A
+    console fallback would be fire-and-forget, so give one time to show up before checking."""
+    _copy_run_files(tmp_path)
+    _write_fake_bat_recorder(tmp_path)  # leaves python.exe as broken as it found it
+    _seed_broken_venv(tmp_path, home=tmp_path / "deleted-python", uv=True)
+
+    result = _run_vbs(tmp_path)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    log = tmp_path / "calls.log"
+    deadline = time.time() + 3
+    while time.time() < deadline and log.read_text(encoding="utf-8").count("CALLED") < 2:
+        time.sleep(0.2)
+    calls = log.read_text(encoding="utf-8").replace("\r\n", "\n")
+    assert calls.count("CALLED") == 1, calls
+    assert "QUIET=1" in calls
+    visible = (tmp_path / "visible_state.txt").read_text(encoding="utf-8").strip()
+    assert visible == "False", "a failed repair must not show a console either"

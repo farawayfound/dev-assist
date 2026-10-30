@@ -16,6 +16,11 @@ seconds for the cheap checks (a dead stream, a plugged/unplugged device) and reo
 needed; upstream finding 4 (Windows fix): the expensive full device re-enumeration
 (rebuilding a whole WASAPI host) is rate-limited separately -- see
 ``_DEVICE_POLL_INTERVAL_S`` and ``_check_device_changed`` below.
+
+2026-10-29 (Settings > Audio): :func:`candidates_for` (the devices a spec can name, shared by
+:func:`resolve_device` and the device pickers) and :func:`probe_device` (open a spec as a real
+:class:`AudioCapture` for a moment and report what it delivered -- the "Test" button, never raises)
+were added; nothing about the capture itself changed.
 """
 from __future__ import annotations
 
@@ -99,6 +104,9 @@ def pa_guard() -> Iterator[None]:
         _ensure_com()
         yield
 
+#: exo-cortex's name for the same lock (2026-10-29): its probe / device-scan code takes it directly.
+_PA_LOCK = PA_LOCK
+
 
 def _winmm_device_count() -> int | None:
     """Cheap Windows-only probe: total waveIn + waveOut device count via winmm.
@@ -159,10 +167,11 @@ def _resolve_pa_module(pa_module: Any | None) -> Any:
 
 
 def _safe_terminate(pa: Any) -> None:
-    try:
-        pa.terminate()
-    except Exception:
-        log.debug("PyAudio.terminate() raised", exc_info=True)
+    with _PA_LOCK:
+        try:
+            pa.terminate()
+        except Exception:
+            log.debug("PyAudio.terminate() raised", exc_info=True)
 
 
 def _looks_like_index(spec: str) -> bool:
@@ -183,7 +192,10 @@ def _enumerate_wasapi(pa: Any, mod: Any) -> tuple[list[DeviceInfo], int | None, 
     identified by *name* (not index) because ``get_default_input_device_info()`` can
     report a different, non-WASAPI host-API entry for the same physical device -- an MME
     one whose name is cut at 31 characters ("Microphone Array (Realtek(R) Au"). The WASAPI
-    host API's own ``defaultInputDevice`` gives the full WASAPI name, so it is asked first.
+    host API's own ``defaultInputDevice`` gives the full WASAPI name, so it is asked first;
+    and whichever name comes back, ``is_default`` is set on exactly the mic
+    :func:`resolve_device` would pick for ``"default"``: the exact name match, else the first
+    WASAPI mic whose name contains it (2026-10-29).
     """
     wasapi = pa.get_host_api_info_by_type(mod.paWASAPI)
     wasapi_index = wasapi["index"]
@@ -207,32 +219,45 @@ def _enumerate_wasapi(pa: Any, mod: Any) -> tuple[list[DeviceInfo], int | None, 
         except Exception:
             log.debug("no default input device", exc_info=True)
 
-    devices: list[DeviceInfo] = []
+    rows: list[dict[str, Any]] = []
     for i in range(pa.get_device_count()):
         d = pa.get_device_info_by_index(i)
         if d.get("hostApi") != wasapi_index:
             continue
-        is_loopback = bool(d.get("isLoopbackDevice", False))
         max_in = int(d.get("maxInputChannels", 0) or 0)
         max_out = int(d.get("maxOutputChannels", 0) or 0)
-        is_input = max_in > 0
-        index = int(d["index"])
-        if is_loopback:
-            is_default = index == default_loopback_index
-        else:
-            is_default = is_input and default_mic_name is not None and d.get("name") == default_mic_name
-        devices.append(
-            DeviceInfo(
-                index=index,
-                name=str(d.get("name", "")),
-                is_loopback=is_loopback,
-                is_input=is_input,
-                sample_rate=int(round(float(d.get("defaultSampleRate", 0) or 0))),
-                channels=max_in if is_input else max_out,
-                is_default=is_default,
-            )
+        rows.append({
+            "index": int(d["index"]),
+            "name": str(d.get("name", "")),
+            "is_loopback": bool(d.get("isLoopbackDevice", False)),
+            "is_input": max_in > 0,
+            "sample_rate": int(round(float(d.get("defaultSampleRate", 0) or 0))),
+            "channels": max_in if max_in > 0 else max_out,
+        })
+
+    default_mic_index = _default_mic_index(rows, default_mic_name)
+    devices = [
+        DeviceInfo(
+            is_default=(r["index"] == default_loopback_index) if r["is_loopback"] else (r["index"] == default_mic_index),
+            **r,
         )
+        for r in rows
+    ]
     return devices, default_loopback_index, default_mic_name
+
+
+def _default_mic_index(rows: list[dict[str, Any]], default_mic_name: str | None) -> int | None:
+    """The WASAPI mic ``"default"`` resolves to: exact name match, else the first mic whose name
+    contains the reported (possibly truncated) default name; ``None`` when there is none."""
+    if default_mic_name is None:
+        return None
+    mics = [r for r in rows if r["is_input"] and not r["is_loopback"]]
+    exact = next((r for r in mics if r["name"] == default_mic_name), None)
+    if exact is not None:
+        return int(exact["index"])
+    needle = default_mic_name.lower()
+    partial = next((r for r in mics if needle in r["name"].lower()), None)
+    return int(partial["index"]) if partial is not None else None
 
 
 def list_devices(pa_module: Any | None = None) -> list[DeviceInfo]:
@@ -251,6 +276,15 @@ def list_devices(pa_module: Any | None = None) -> list[DeviceInfo]:
             _safe_terminate(pa)
 
 
+def candidates_for(kind: Literal["mic", "system"], devices: list[DeviceInfo]) -> list[DeviceInfo]:
+    """The devices a ``kind`` spec can resolve to, in enumeration order: loopback devices for
+    ``"system"``, non-loopback input devices for ``"mic"`` -- the one filter :func:`resolve_device`
+    applies, shared with the Settings > Audio device pickers so they offer exactly what resolves."""
+    if kind == "system":
+        return [d for d in devices if d.is_loopback]
+    return [d for d in devices if d.is_input and not d.is_loopback]
+
+
 def resolve_device(kind: Literal["mic", "system"], spec: str, pa_module: Any | None = None) -> DeviceInfo:
     """Resolve a device spec to a concrete :class:`DeviceInfo`.
 
@@ -267,14 +301,17 @@ def resolve_device(kind: Literal["mic", "system"], spec: str, pa_module: Any | N
     with pa_guard():
         pa = mod.PyAudio()
         try:
-            devices, default_loopback_index, default_mic_name = _enumerate_wasapi(pa, mod)
+            return _resolve_on(pa, mod, kind, spec)
         finally:
             _safe_terminate(pa)
 
-    if kind == "system":
-        candidates = [d for d in devices if d.is_loopback]
-    else:
-        candidates = [d for d in devices if d.is_input and not d.is_loopback]
+
+def _resolve_on(pa: Any, mod: Any, kind: Literal["mic", "system"], spec: str) -> DeviceInfo:
+    """:func:`resolve_device` on an already-initialised ``pa`` (the caller holds :data:`_PA_LOCK`).
+    ``AudioCapture._open`` resolves on the very instance it then opens the stream on: one host
+    init per open instead of two, and no window for another thread's init in between."""
+    devices, default_loopback_index, default_mic_name = _enumerate_wasapi(pa, mod)
+    candidates = candidates_for(kind, devices)
 
     spec_clean = (spec or "default").strip()
 
@@ -282,9 +319,7 @@ def resolve_device(kind: Literal["mic", "system"], spec: str, pa_module: Any | N
         if kind == "system":
             match = next((d for d in candidates if d.index == default_loopback_index), None)
         else:
-            match = next((d for d in candidates if default_mic_name is not None and d.name == default_mic_name), None)
-            if match is None and default_mic_name is not None:
-                match = next((d for d in candidates if default_mic_name.lower() in d.name.lower()), None)
+            match = next((d for d in candidates if d.is_default), None)   # see _default_mic_index
         if match is None:
             raise ValueError(f"could not resolve default {kind} device; available: {_describe_devices(candidates)}")
         return match
@@ -323,6 +358,125 @@ def default_devices_summary(pa_module: Any | None = None) -> str:
     except Exception as exc:
         mic_line = f"mic: unavailable ({exc})"
     return f"{loop_line}\n{mic_line}"
+
+
+# --------------------------------------------------------------------------- #
+# probe: open a spec for a moment and report what it delivered (Settings > Audio "Test")
+# --------------------------------------------------------------------------- #
+
+_PROBE_SILENT_DBFS = -60.0  # a peak below this is "silent": the -80 dBFS keep-alive tone alone lands here
+
+
+@dataclass(frozen=True)
+class ProbeResult:
+    """What :func:`probe_device` found for one spec: whether it opened, as which device, and what
+    the stream delivered while it ran. ``frames`` counts the 16 kHz ``frame_samples`` frames the
+    production path produced (0 = the stream opened but no callback ever fired -- a WASAPI loopback
+    idling while nothing plays, or a microphone Windows is not handing out); ``rms`` / ``peak`` are
+    linear 0..1 over the whole run."""
+
+    kind: str
+    spec: str
+    ok: bool
+    device: DeviceInfo | None
+    seconds: float
+    frames: int
+    rms: float
+    peak: float
+    error: str = ""
+
+    @property
+    def peak_dbfs(self) -> float:
+        """The peak in dBFS, floored at -120 (silence)."""
+        return 20.0 * float(np.log10(max(self.peak, 1e-6)))
+
+    @property
+    def signal(self) -> str:
+        """``error`` (did not open) | ``none`` (opened, nothing arrived) | ``silent`` (audio arrived,
+        all of it below -60 dBFS) | ``ok``."""
+        if not self.ok:
+            return "error"
+        if self.frames == 0:
+            return "none"
+        if self.peak_dbfs < _PROBE_SILENT_DBFS:
+            return "silent"
+        return "ok"
+
+    def describe(self) -> str:
+        """One plain sentence for a person: the device it opened and what came through."""
+        if not self.ok:
+            return f"Could not open {self.spec!r}: {self.error}"
+        d = self.device
+        where = f"{d.name} ({d.sample_rate} Hz, {d.channels} ch)" if d is not None else self.spec
+        if self.frames == 0:
+            if self.kind == "system":
+                return (f"Opened {where}, but no audio arrived in {self.seconds:.1f} s. Nothing is playing "
+                        "(WASAPI loopback idles while silent; the keep-alive tone keeps it flowing), or "
+                        "another app holds the device in exclusive mode.")
+            return (f"Opened {where}, but no audio arrived in {self.seconds:.1f} s. Check Windows Settings > "
+                    "Privacy > Microphone, and that no app holds the device in exclusive mode.")
+        if self.peak_dbfs < _PROBE_SILENT_DBFS:
+            if self.kind == "system":
+                return (f"Opened {where}: audio flows but it is silent (peak {self.peak_dbfs:.0f} dBFS). "
+                        "Play something through this device and test again.")
+            return (f"Opened {where}: audio flows but it is silent (peak {self.peak_dbfs:.0f} dBFS). "
+                    "Speak into the microphone, or raise its level in Windows Settings > Sound.")
+        return f"OK: {where} delivers audio, peak {self.peak_dbfs:.0f} dBFS over {self.seconds:.1f} s."
+
+
+def probe_device(
+    kind: Literal["mic", "system"],
+    spec: str,
+    *,
+    seconds: float = 1.5,
+    keepalive: bool = True,
+    on_level: Callable[[float, float], None] | None = None,
+    pa_module: Any | None = None,
+) -> ProbeResult:
+    """Open ``spec`` the way the app does -- a real :class:`AudioCapture`: resolve, open at the
+    device's native rate, downmix, resample -- for ``seconds``, stop it, and report.
+
+    Never raises: a spec that does not resolve or a device that will not open comes back as a
+    result with ``ok=False`` and the error text. ``keepalive`` is the ``[audio].loopback_keepalive``
+    value to test with (only a ``"system"`` probe ever starts the tone). ``on_level(rms, peak)``
+    relays the capture's throttled levels for a live meter; it is called from the capture's
+    consumer thread, never the caller's. ``pa_module`` is the usual test injection.
+    """
+    source = Source.SYSTEM if kind == "system" else Source.MIC
+    lock = threading.Lock()
+    stats = {"frames": 0, "sumsq": 0.0, "samples": 0, "peak": 0.0}
+
+    def _on_frames(frame: np.ndarray) -> None:
+        if frame.size == 0:
+            return
+        sumsq = float(np.sum(np.square(frame, dtype=np.float64)))
+        peak = float(np.max(np.abs(frame)))
+        with lock:
+            stats["frames"] += 1
+            stats["sumsq"] += sumsq
+            stats["samples"] += int(frame.size)
+            stats["peak"] = max(stats["peak"], peak)
+
+    capture = AudioCapture(
+        source, spec, on_frames=_on_frames, on_level=on_level, keepalive=keepalive, pa_module=pa_module,
+    )
+    try:
+        device = capture.start()
+    except Exception as exc:  # noqa: BLE001 - the whole point: report, never raise
+        return ProbeResult(kind, spec, False, None, 0.0, 0, 0.0, 0.0, str(exc))
+    t0 = time.monotonic()
+    try:
+        time.sleep(max(0.0, seconds))
+    finally:
+        elapsed = time.monotonic() - t0            # the listening window; stop() below takes its own time
+        try:
+            capture.stop()
+        except Exception:  # noqa: BLE001
+            log.debug("probe: capture.stop() raised", exc_info=True)
+    with lock:
+        frames, sumsq, samples, peak = stats["frames"], stats["sumsq"], stats["samples"], stats["peak"]
+    rms = float(np.sqrt(sumsq / samples)) if samples else 0.0
+    return ProbeResult(kind, spec, True, device, elapsed, frames, rms, peak)
 
 
 # --------------------------------------------------------------------------- #
@@ -531,22 +685,26 @@ class AudioCapture:
 
     def _open_locked(self) -> None:
         mod = self._get_pa_module()
-        pa = mod.PyAudio()
-        try:
-            device = resolve_device(self._kind, self._spec, pa_module=mod)
-            frames_per_buffer = max(1, int(round(device.sample_rate * 0.02)))
-            stream = pa.open(
-                format=mod.paFloat32,
-                channels=max(1, device.channels),
-                rate=device.sample_rate,
-                input=True,
-                input_device_index=device.index,
-                frames_per_buffer=frames_per_buffer,
-                stream_callback=self._make_input_callback(mod),
-            )
-        except Exception:
-            _safe_terminate(pa)
-            raise
+        with _PA_LOCK:   # 2026-10-29: init + resolve + open (+ keep-alive) as one transaction, see _PA_LOCK
+            pa = mod.PyAudio()
+            try:
+                device = _resolve_on(pa, mod, self._kind, self._spec)
+                frames_per_buffer = max(1, int(round(device.sample_rate * 0.02)))
+                stream = pa.open(
+                    format=mod.paFloat32,
+                    channels=max(1, device.channels),
+                    rate=device.sample_rate,
+                    input=True,
+                    input_device_index=device.index,
+                    frames_per_buffer=frames_per_buffer,
+                    stream_callback=self._make_input_callback(mod),
+                )
+            except Exception:
+                _safe_terminate(pa)
+                raise
+            keepalive_stream = None
+            if self._source == Source.SYSTEM and self._keepalive_enabled:
+                keepalive_stream = _start_keepalive(pa, mod)
 
         self._drain_raw_queue()
         self._pa = pa
@@ -563,10 +721,7 @@ class AudioCapture:
         # -- the open above just resolved the device fresh.
         self._last_enum_ts = time.monotonic()
         self._last_device_count = self._safe_device_count()
-
-        self._keepalive_stream = None
-        if self._source == Source.SYSTEM and self._keepalive_enabled:
-            self._keepalive_stream = _start_keepalive(pa, mod)
+        self._keepalive_stream = keepalive_stream
 
         log.info(
             "capture-%s: opened %r (%d Hz, %d ch)",

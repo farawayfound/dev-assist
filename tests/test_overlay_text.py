@@ -78,8 +78,8 @@ def test_control_row_order_ends_with_stretch_text_code(window: OverlayWindow) ->
         widgets.append(w)
 
     labels = [w.text() if w is not None else "<stretch>" for w in widgets]
-    assert labels == ["Read", "Revert", "Reset", "Pause", "Checkpoint", "<stretch>", "Text", "Code"]
-    assert stretch_index == 5
+    assert labels == ["Read", "Revert", "Reset", "Pause", "Checkpoint", "Compact", "<stretch>", "Text", "Code"]
+    assert stretch_index == 6
     # Text sits immediately left of Code, and both come after the stretch.
     assert widgets[-2] is window.text_btn
     assert widgets[-1] is window.code_btn

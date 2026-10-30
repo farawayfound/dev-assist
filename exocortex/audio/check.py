@@ -4,9 +4,10 @@ Speaker attribution is by source: the mic feed is "Me" and is never clustered, t
 (loopback) feed is everyone else and is clustered into Speaker 1, 2, ... (``speech/pipeline.py``).
 That is exact only when two things hold, and this module checks both:
 
-1. **The mic delivers sound.** :class:`LevelTracker` turns the capture's 10 Hz ``(rms, peak)``
-   levels into a verdict. Digital silence means the stream opened but Windows feeds it nothing
-   (endpoint muted, privacy, a hardware mic-mute key) -- see :mod:`exocortex.audio.endpoint`.
+1. **The mic delivers sound.** The Audio page's Test (exo-cortex's
+   :func:`exocortex.audio.capture.probe_device`) says whether audio arrived; a mic delivering
+   digital silence opened fine but Windows feeds it nothing (endpoint muted, privacy, a hardware
+   mic-mute key) -- :mod:`exocortex.audio.endpoint` reads and clears that mute.
 2. **What the speakers play reaches the output feed, not the mic.** :func:`routing_check` plays
    a short chirp on the render device behind the chosen loopback while recording that loopback
    and the mic, then compares the chirp band's energy against the moment before it. A strong
@@ -23,7 +24,6 @@ import logging
 import math
 import threading
 import time
-from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -43,8 +43,6 @@ log = logging.getLogger(__name__)
 
 #: Peak below this (~ -100 dBFS) is digital silence: no real microphone is that quiet.
 SILENCE_PEAK = 1e-5
-#: Peak below this (-50 dBFS) over the whole window: live, but nothing like speech reaches it.
-QUIET_PEAK = 10 ** (-50 / 20)
 
 _LOOPBACK_SUFFIX = " [Loopback]"
 
@@ -70,58 +68,6 @@ BLEED_STRONG_DB = 10.0
 def dbfs(value: float) -> float:
     """A linear 0..1 level in dBFS (floored, so silence is a finite, very negative number)."""
     return 20.0 * math.log10(max(float(value), _FLOOR))
-
-
-# --------------------------------------------------------------------------- #
-# live levels -> verdict
-# --------------------------------------------------------------------------- #
-
-
-class LevelTracker:
-    """Rolling peak over the last ``window_s`` of levels: what the Test meters say beside the bar.
-
-    :meth:`verdict` is ``"waiting"`` (no level yet, or none for ``window_s`` -- a loopback with
-    nothing playing delivers no callbacks), ``"silent"`` (digital silence throughout),
-    ``"quiet"`` (live but below -50 dBFS) or ``"ok"``.
-    """
-
-    def __init__(self, window_s: float = 1.5, clock: Callable[[], float] = time.monotonic) -> None:
-        self._window_s = window_s
-        self._clock = clock
-        self._levels: deque[tuple[float, float]] = deque()   # (ts, peak)
-        self._first_ts: float | None = None
-
-    def push(self, rms: float, peak: float) -> None:
-        now = self._clock()
-        if self._first_ts is None:
-            self._first_ts = now
-        self._levels.append((now, float(peak)))
-        self._trim(now)
-
-    def reset(self) -> None:
-        self._levels.clear()
-        self._first_ts = None
-
-    def _trim(self, now: float) -> None:
-        while self._levels and now - self._levels[0][0] > self._window_s:
-            self._levels.popleft()
-
-    def peak(self) -> float:
-        """Highest peak in the window (0.0 when there is none)."""
-        self._trim(self._clock())
-        return max((p for _, p in self._levels), default=0.0)
-
-    def verdict(self) -> str:
-        now = self._clock()
-        self._trim(now)
-        if not self._levels:
-            return "waiting"
-        peak = max(p for _, p in self._levels)
-        if peak >= QUIET_PEAK:
-            return "ok"
-        if self._first_ts is not None and now - self._first_ts < self._window_s:
-            return "waiting"    # a full window is needed before calling a feed silent or quiet
-        return "silent" if peak < SILENCE_PEAK else "quiet"
 
 
 # --------------------------------------------------------------------------- #

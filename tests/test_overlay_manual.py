@@ -42,7 +42,13 @@ class SpyPressHoldHook:
         self.failed = False
         self.installs = 0
         self.uninstalls = 0
+        self.rebinds = 0
         SpyPressHoldHook.instances.append(self)
+
+    def rebind(self, bindings: dict[str, Callable[[], None]]) -> None:
+        """2026-10-29: the real hook is rebound in place when the table changes."""
+        self.bindings = dict(bindings)
+        self.rebinds += 1
 
     def install(self) -> bool:
         self.installed = True
@@ -69,14 +75,36 @@ def bus() -> EventBus:
     return EventBus()
 
 
+class SpyTapHook:
+    """Stand-in for llhooks.BareKeyHook (the single-key taps: the pause key by default): records
+    its bindings and install/uninstall, hooks nothing."""
+
+    instances: list["SpyTapHook"] = []
+
+    def __init__(self, bindings: Any, on_tap: Any = None, **kw: Any) -> None:
+        self.bindings = dict(bindings) if not isinstance(bindings, str) else {bindings: on_tap}
+        self.installed = False
+        self.failed = False
+        SpyTapHook.instances.append(self)
+
+    def install(self) -> bool:
+        self.installed = True
+        return True
+
+    def uninstall(self) -> None:
+        self.installed = False
+
+
 @pytest.fixture()
 def spy_hook(monkeypatch: pytest.MonkeyPatch):
-    """The overlay believes it is on the real Windows platform, but the press-and-hold hook and
-    the RegisterHotKey table are both spies -- nothing global is ever touched."""
+    """The overlay believes it is on the real Windows platform, but the mouse hook, the tap-key hook
+    and the RegisterHotKey table are all spies -- nothing global is ever touched."""
     monkeypatch.setattr(overlay_mod, "_is_windows_platform", lambda: True)
     monkeypatch.setattr(overlay_mod, "PressHoldMouseHook", SpyPressHoldHook)
+    monkeypatch.setattr(overlay_mod, "BareKeyHook", SpyTapHook)
     monkeypatch.setattr(overlay_mod, "GlobalHotkeys", _SpyHotkeys)
     SpyPressHoldHook.instances = []
+    SpyTapHook.instances = []
     _SpyHotkeys.instances = []
     return SpyPressHoldHook
 
@@ -183,8 +211,8 @@ def test_hook_installed_on_manual_and_removed_on_auto_and_close(
         win._set_manual(True)
         hook = spy_hook.instances[-1]
         assert hook.installed
-        assert set(hook.bindings) == {"left", "middle"}
-        assert callable(hook.kw["hold_s"]) and callable(hook.kw["require_hold"])
+        assert set(hook.bindings) == {"mouse_left", "mouse_middle", "mouse4"}   # the three gestures
+        assert callable(hook.kw["hold_s"]) and callable(hook.kw["require_hold"]) and callable(hook.kw["swallow"])
         win._set_manual(False)
         assert not hook.installed and hook.uninstalls == 1
         win._set_manual(True)
@@ -207,10 +235,19 @@ def test_hold_s_and_require_hold_callables_read_the_live_config(
         cfg.handsfree.manual_hold_s = 1.4          # a settings change: no re-install needed
         assert hook.kw["hold_s"]() == pytest.approx(1.4)
         require_hold = hook.kw["require_hold"]
-        assert require_hold("left") is True and require_hold("middle") is False   # the defaults
+        assert require_hold("mouse_left") is True and require_hold("mouse_middle") is False   # the defaults
+        assert require_hold("mouse4") is False                                               # Code from scratch: a click
         cfg.handsfree.manual_hold_text = False
         cfg.handsfree.manual_hold_code = True
-        assert require_hold("left") is False and require_hold("middle") is True
+        cfg.handsfree.manual_hold_code_fresh = True
+        assert require_hold("mouse_left") is False and require_hold("mouse_middle") is True
+        assert require_hold("mouse4") is True
+        swallow = hook.kw["swallow"]
+        assert swallow("mouse4") is True and swallow("mouse5") is True    # the thumb buttons: no Back / Forward
+        assert swallow("mouse_left") is False and swallow("mouse_middle") is False
+        assert swallow("ctrl+mouse_left") is True                         # a modified click is a hotkey
+        cfg.hotkeys.swallow_thumb_buttons = False
+        assert swallow("mouse4") is False
     finally:
         win.close_silently()
         qapp.processEvents()
@@ -328,3 +365,140 @@ def test_manual_fire_is_ignored_once_manual_is_off(
     actions.calls.clear()
     window._manual_fire("text")                    # a stale deferred fire after toggling off
     assert not any(c[0] == "manual_advance" for c in actions.calls)
+
+
+# =====================================================================================
+# 2026-10-29: the third gesture (Code from scratch), mouse-bound shortcuts outside manual
+# advance, keyboard-bound gestures, problem reporting, and the Shortcuts tab applying live
+# =====================================================================================
+
+
+def test_manual_fire_code_fresh_routes_and_toasts(
+    window: OverlayWindow, actions: FakeActions, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    window._set_manual(True)
+    actions.calls.clear()
+    monkeypatch.setattr(overlay_mod.QCursor, "pos", staticmethod(lambda: QPoint(-5000, -5000)))
+    window._manual_fire("code_fresh")
+    assert ("manual_advance", ("code_fresh",)) in actions.calls
+    assert "Code from scratch" in window.toast.text()
+
+
+def test_manual_toast_names_the_configured_gestures(window: OverlayWindow) -> None:
+    window._set_manual(True)
+    assert window.toast.text() == "Manual advance ON \u2014 hold left = Text, click middle = Code, click mouse 4 = Code from scratch"
+    window._set_manual(False)
+    window._cfg.hotkeys.manual_code_fresh = "f9"
+    window._set_manual(True)
+    assert window.toast.text().endswith("tap F9 = Code from scratch")
+
+
+def test_a_general_shortcut_on_a_mouse_button_is_hooked_even_with_manual_off(
+    qapp: QApplication, bus: EventBus, actions: FakeActions, spy_hook
+) -> None:
+    cfg = Config()
+    cfg.hotkeys.code = "ctrl+mouse4"
+    win = _make_window(qapp, bus, actions, cfg)
+    try:
+        hook = spy_hook.instances[-1]
+        assert hook.installed and set(hook.bindings) == {"ctrl+mouse4"}     # Auto: the gestures are not bound
+        assert "ctrl+mouse4" not in _SpyHotkeys.instances[-1].bindings     # ... and never a RegisterHotKey entry
+        win._set_manual(True)
+        assert hook.rebinds == 1
+        assert set(hook.bindings) == {"ctrl+mouse4", "mouse_left", "mouse_middle", "mouse4"}
+        win._set_manual(False)
+        assert hook.rebinds == 2 and set(hook.bindings) == {"ctrl+mouse4"} and hook.installed
+        actions.calls.clear()
+        hook.bindings["ctrl+mouse4"]()                 # the deferred callback
+        QTest.qWait(_WAIT_MS)
+        assert ("code", ()) in actions.calls           # the Code button's action, not a manual gesture
+    finally:
+        win.close_silently()
+        qapp.processEvents()
+
+
+def test_a_gesture_bound_to_a_key_is_registered_only_while_manual_is_on(
+    qapp: QApplication, bus: EventBus, actions: FakeActions, spy_hook, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cfg = Config()
+    cfg.hotkeys.manual_code_fresh = "ctrl+alt+9"
+    win = _make_window(qapp, bus, actions, cfg)
+    try:
+        assert "ctrl+alt+9" not in _SpyHotkeys.instances[-1].bindings
+        first = _SpyHotkeys.instances[-1]
+        win._set_manual(True)
+        assert first.uninstalled                       # the keyboard table was re-registered
+        table = _SpyHotkeys.instances[-1]
+        assert "ctrl+alt+9" in table.bindings
+        assert set(spy_hook.instances[-1].bindings) == {"mouse_left", "mouse_middle"}
+        monkeypatch.setattr(overlay_mod.QCursor, "pos", staticmethod(lambda: QPoint(-5000, -5000)))
+        actions.calls.clear()
+        table.bindings["ctrl+alt+9"]()
+        assert ("manual_advance", ("code_fresh",)) in actions.calls
+        win._set_manual(False)
+        assert "ctrl+alt+9" not in _SpyHotkeys.instances[-1].bindings
+    finally:
+        win.close_silently()
+        qapp.processEvents()
+
+
+def test_a_gesture_bound_to_a_single_key_uses_the_tap_hook(
+    qapp: QApplication, bus: EventBus, actions: FakeActions, spy_hook
+) -> None:
+    cfg = Config()
+    cfg.handsfree.manual = True
+    cfg.hotkeys.manual_text = "f9"
+    win = _make_window(qapp, bus, actions, cfg)
+    try:
+        taps = SpyTapHook.instances[-1]
+        assert taps.installed and set(taps.bindings) == {"rshift", "f9"}   # one hook for every tap
+        assert win._pause_key_hook is taps
+        assert set(spy_hook.instances[-1].bindings) == {"mouse_middle", "mouse4"}
+    finally:
+        win.close_silently()
+        qapp.processEvents()
+
+
+def test_invalid_and_duplicate_bindings_are_skipped_and_toasted(
+    qapp: QApplication, bus: EventBus, actions: FakeActions, spy_hook
+) -> None:
+    cfg = Config()
+    cfg.hotkeys.quit = "ctrl+alt+g"                    # the same as Code
+    cfg.hotkeys.notes = "ctrl+"                        # not a binding at all
+    win = _make_window(qapp, bus, actions, cfg)
+    try:
+        table = _SpyHotkeys.instances[-1].bindings
+        assert "ctrl+" not in table
+        assert table["ctrl+alt+g"] is not None         # kept once, for the first owner (Code)
+        assert len(win._binding_problems) == 2
+        QTest.qWait(_WAIT_MS)
+        assert "not a valid shortcut" in win.toast.text() and "bound to both code and quit" in win.toast.text()
+        actions.calls.clear()
+        table["ctrl+alt+g"]()
+        assert ("code", ()) in actions.calls and ("quit", ()) not in actions.calls
+    finally:
+        win.close_silently()
+        qapp.processEvents()
+
+
+def test_applying_a_hotkeys_change_reinstalls_the_shortcuts_at_once(
+    qapp: QApplication, bus: EventBus, actions: FakeActions, spy_hook
+) -> None:
+    cfg = Config()
+    win = _make_window(qapp, bus, actions, cfg)
+    try:
+        before = _SpyHotkeys.instances[-1]
+        assert "ctrl+alt+g" in before.bindings
+        win._on_settings_applied({"hotkeys.code": "ctrl+alt+k"})      # the dialog wrote cfg first
+        cfg.hotkeys.code = "ctrl+alt+k"
+        win._on_settings_applied({"hotkeys.code": "ctrl+alt+k"})
+        after = _SpyHotkeys.instances[-1]
+        assert after is not before and before.uninstalled
+        assert "ctrl+alt+k" in after.bindings and "ctrl+alt+g" not in after.bindings
+        assert ("apply_settings", ({"hotkeys.code": "ctrl+alt+k"},)) in actions.calls
+        # a non-hotkeys change leaves the table alone
+        win._on_settings_applied({"ui.opacity": 0.5})
+        assert _SpyHotkeys.instances[-1] is after
+    finally:
+        win.close_silently()
+        qapp.processEvents()

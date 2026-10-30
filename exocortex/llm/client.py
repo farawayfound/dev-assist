@@ -61,6 +61,18 @@ class StreamStats:
     elapsed_s: float
     tok_per_s: float
     cancelled: bool
+    #: 2026-10-06 (context library): what the server says it processed for the PROMPT of this
+    #: request (the whole prompt, cached part included) and how much of it came from the KV prefix
+    #: cache. None when the backend did not report it. They sit at the END so positional
+    #: construction (tests, older callers) keeps working. `ContextManager` calibrates its
+    #: chars-per-token estimate from `prompt_tokens`; the Models window's usage panel shows both.
+    prompt_tokens: int | None = None
+    cached_tokens: int | None = None
+    #: 2026-10-07 (capabilities): why the stream ended -- "stop" (end of text, or one of the
+    #: `stop` strings: llama-server / OpenAI `finish_reason`, Ollama `done_reason`), "length"
+    #: (`max_tokens` reached) or "" (the backend did not say, or the stream was cancelled). The
+    #: tool loop uses it to tell a call that ended on its closing tag from one cut short.
+    finish_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -146,6 +158,68 @@ def _completion_tokens_from_chunk(chunk: dict[str, Any]) -> int | None:
         val = timings.get("predicted_n")
         if isinstance(val, int):
             return val
+    return None
+
+
+def _int_or_none(val: Any) -> int | None:
+    """`val` when it is a real (non-bool) int, else None."""
+    return val if isinstance(val, int) and not isinstance(val, bool) else None
+
+
+def _prompt_tokens_from_chunk(chunk: dict[str, Any]) -> tuple[int | None, int | None]:
+    """`(prompt_tokens, cached_tokens)` from an SSE chunk, either part None when absent.
+
+    2026-10-06 (context library). Shapes seen: OpenAI `usage.prompt_tokens` (+
+    `usage.prompt_tokens_details.cached_tokens` when the server reports a cache hit); LM Studio's
+    `stats` block (any of a few key spellings); llama-server's `timings` on its final streamed
+    chunk, where `prompt_n` is only the part it had to EVALUATE and `cache_n` the part it reused,
+    so the whole prompt is their sum -- reporting `prompt_n` alone would make a warm-cache turn
+    look like a 40-token prompt and wreck the chars-per-token calibration built on it. Sources
+    are consulted in that order and the first to give a number for a part wins.
+    """
+    prompt: int | None = None
+    cached: int | None = None
+    usage = chunk.get("usage")
+    if isinstance(usage, dict):
+        prompt = _int_or_none(usage.get("prompt_tokens"))
+        details = usage.get("prompt_tokens_details")
+        if isinstance(details, dict):
+            cached = _int_or_none(details.get("cached_tokens"))
+    stats = chunk.get("stats")
+    if isinstance(stats, dict):
+        if prompt is None:
+            for key in ("prompt_tokens", "prompt_tokens_count", "input_tokens", "prompt_eval_count"):
+                prompt = _int_or_none(stats.get(key))
+                if prompt is not None:
+                    break
+        if cached is None:
+            for key in ("cached_tokens", "cache_tokens", "prompt_cached_tokens"):
+                cached = _int_or_none(stats.get(key))
+                if cached is not None:
+                    break
+    timings = chunk.get("timings")  # llama-server adds this to its final streamed chunk
+    if isinstance(timings, dict):
+        evaluated = _int_or_none(timings.get("prompt_n"))
+        reused = _int_or_none(timings.get("cache_n"))
+        if cached is None:
+            cached = reused
+        if prompt is None and evaluated is not None:
+            prompt = evaluated + (reused or 0)
+    return prompt, cached
+
+
+def _finish_reason_from_chunk(chunk: dict[str, Any]) -> str | None:
+    """The stream's end reason, when this chunk carries one: OpenAI-style
+    ``choices[0].finish_reason`` ("stop" / "length"; LM Studio and llama-server send it on the
+    last content chunk, None before) or Ollama's ``done_reason``. None when absent."""
+    choices = chunk.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    reason = chunk.get("done_reason")
+    if isinstance(reason, str) and reason:
+        return reason
     return None
 
 
@@ -304,6 +378,45 @@ class LMStudioClient:
             raise LLMError(self._status_error_message(resp))
         return True
 
+    def context_window(self) -> int | None:
+        """The per-request context (tokens) the server will actually give one request, or None.
+
+        2026-10-06 (context library): `Assistant` sizes every prompt to this instead of trusting
+        the configured `ctx_size` (a per-model tuning profile may override it, and an LM Studio
+        model may be loaded with any length; measured the same day: with `--parallel 2` llama-server
+        runs `--kv-unified` and reports the FULL ctx_size per slot -- the two slots share that one
+        pool, which `ContextManager.job_limit` accounts for). llama-server
+        answers `GET /props` with `default_generation_settings.n_ctx`; LM Studio has no `/props`,
+        so its `/api/v0/models` entry for `model_id` is the fallback (`loaded_context_length`,
+        else `max_context_length`). Cheap (the shared client, default timeouts) and NEVER raises:
+        a 404, a non-JSON body, a connect error or an unexpected shape all mean "unknown" -> None,
+        and the caller falls back to its own estimate.
+        """
+        try:
+            resp = self._client.get("/props")
+            if resp.status_code < 400:
+                settings = resp.json().get("default_generation_settings")
+                n_ctx = _int_or_none(settings.get("n_ctx")) if isinstance(settings, dict) else None
+                if n_ctx and n_ctx > 0:
+                    return n_ctx
+        except Exception:  # noqa: BLE001 - any failure just means "unknown"
+            log.debug("client: GET /props failed", exc_info=True)
+        try:
+            resp = self._client.get("/api/v0/models")
+            if resp.status_code >= 400:
+                return None
+            wanted = self.model_id
+            for item in _extract_items(resp.json()):
+                if not isinstance(item, dict) or not wanted or str(item.get("id", "")) != wanted:
+                    continue
+                for key in ("loaded_context_length", "max_context_length"):
+                    n = _int_or_none(item.get(key))
+                    if n and n > 0:
+                        return n
+        except Exception:  # noqa: BLE001 - any failure just means "unknown"
+            log.debug("client: GET /api/v0/models failed", exc_info=True)
+        return None
+
     # ---- streaming generation -------------------------------------------
 
     def stream_completion(
@@ -339,6 +452,9 @@ class LMStudioClient:
         ttft = 0.0
         chunk_count = 0
         usage_tokens: int | None = None
+        prompt_tokens: int | None = None
+        cached_tokens: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         try:
@@ -348,9 +464,17 @@ class LMStudioClient:
                 for chunk in self._iter_sse_chunks(r):
                     choices = chunk.get("choices") or []
                     text = choices[0].get("text", "") if choices else ""
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     tok = _completion_tokens_from_chunk(chunk)
                     if tok is not None:
                         usage_tokens = tok
+                    p_tok, c_tok = _prompt_tokens_from_chunk(chunk)
+                    if p_tok is not None:
+                        prompt_tokens = p_tok
+                    if c_tok is not None:
+                        cached_tokens = c_tok
                     if text:
                         chunk_count += 1
                         if first:
@@ -367,7 +491,10 @@ class LMStudioClient:
         except httpx.TransportError as exc:
             raise LLMError(f"LM Studio request failed: {exc}") from exc
         finally:
-            self.last_stats = self._make_stats(start, ttft, chunk_count, usage_tokens, cancelled)
+            self.last_stats = self._make_stats(
+                start, ttft, chunk_count, usage_tokens, cancelled,
+                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
+            )
 
     def stream_chat(
         self,
@@ -377,13 +504,16 @@ class LMStudioClient:
         temperature: float | None = None,
         top_p: float | None = None,
         cancel: threading.Event | None = None,
+        stop: list[str] | None = None,
     ) -> Iterator[ChatDelta]:
         """POST `/v1/chat/completions` (stream=True) and yield `ChatDelta`s.
 
         Reasoning is taken from `delta.reasoning_content` / `delta.reasoning` when the
         server sends it separately, and additionally split out of inline
         ``<think>...</think>`` spans within `delta.content` so it never leaks into
-        the visible answer text.
+        the visible answer text. `stop` (2026-10-07, capabilities) adds stop strings exactly
+        like `stream_completion`'s: the tool loop stops the chat path on the tool call's
+        closing tag; None sends none, as before.
         """
         body: dict[str, Any] = {
             "model": self.model_id,
@@ -393,12 +523,17 @@ class LMStudioClient:
             "top_p": self.cfg.top_p if top_p is None else top_p,
             "stream": True,
         }
+        if stop:
+            body["stop"] = list(stop)
         body.update(self.cfg.extra_body)
 
         start = time.monotonic()
         ttft = 0.0
         chunk_count = 0
         usage_tokens: int | None = None
+        prompt_tokens: int | None = None
+        cached_tokens: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         splitter = _ThinkSplitter()
@@ -408,6 +543,9 @@ class LMStudioClient:
                     raise LLMError(self._status_error_message(r))
                 for chunk in self._iter_sse_chunks(r):
                     choices = chunk.get("choices") or []
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     delta_obj: dict[str, Any] = {}
                     if choices:
                         delta_obj = choices[0].get("delta") or {}
@@ -421,6 +559,11 @@ class LMStudioClient:
                     tok = _completion_tokens_from_chunk(chunk)
                     if tok is not None:
                         usage_tokens = tok
+                    p_tok, c_tok = _prompt_tokens_from_chunk(chunk)
+                    if p_tok is not None:
+                        prompt_tokens = p_tok
+                    if c_tok is not None:
+                        cached_tokens = c_tok
                     if content or reasoning:
                         chunk_count += 1
                         if first:
@@ -442,7 +585,10 @@ class LMStudioClient:
         except httpx.TransportError as exc:
             raise LLMError(f"LM Studio request failed: {exc}") from exc
         finally:
-            self.last_stats = self._make_stats(start, ttft, chunk_count, usage_tokens, cancelled)
+            self.last_stats = self._make_stats(
+                start, ttft, chunk_count, usage_tokens, cancelled,
+                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
+            )
 
     # ---- internals -------------------------------------------------------
 
@@ -459,7 +605,8 @@ class LMStudioClient:
 
     @staticmethod
     def _make_stats(
-        start: float, ttft: float, chunk_count: int, usage_tokens: int | None, cancelled: bool
+        start: float, ttft: float, chunk_count: int, usage_tokens: int | None, cancelled: bool,
+        *, prompt_tokens: int | None = None, cached_tokens: int | None = None, finish_reason: str = "",
     ) -> StreamStats:
         elapsed = time.monotonic() - start
         tokens = usage_tokens if usage_tokens is not None else chunk_count
@@ -467,7 +614,10 @@ class LMStudioClient:
         # otherwise a long prompt makes a fast model look slow.
         gen_time = elapsed - ttft if tokens > 1 else elapsed
         tok_per_s = tokens / gen_time if gen_time > 0 else 0.0
-        return StreamStats(ttft_s=ttft, tokens=tokens, elapsed_s=elapsed, tok_per_s=tok_per_s, cancelled=cancelled)
+        return StreamStats(
+            ttft_s=ttft, tokens=tokens, elapsed_s=elapsed, tok_per_s=tok_per_s, cancelled=cancelled,
+            prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
+        )
 
     @staticmethod
     def _iter_sse_chunks(r: httpx.Response) -> Iterator[dict[str, Any]]:
@@ -682,6 +832,12 @@ class OllamaClient(LMStudioClient):
             raise LLMError(self._status_error_message(resp))
         return True
 
+    def context_window(self) -> int | None:
+        """2026-10-06 (context library): every Ollama request is sent with `num_ctx` =
+        `cfg.ctx_size` (`_ollama_options`), so that is the window -- no server query needed."""
+        n = _int_or_none(self.cfg.ctx_size)
+        return n if n and n > 0 else None
+
     # ---- streaming generation -------------------------------------------
 
     def _ollama_options(
@@ -729,6 +885,8 @@ class OllamaClient(LMStudioClient):
         ttft = 0.0
         chunk_count = 0
         eval_count: int | None = None
+        prompt_eval_count: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         try:
@@ -740,6 +898,11 @@ class OllamaClient(LMStudioClient):
                         raise LLMError(f"Ollama error: {chunk['error']}")
                     if isinstance(chunk.get("eval_count"), int):
                         eval_count = chunk["eval_count"]
+                    if isinstance(chunk.get("prompt_eval_count"), int):
+                        prompt_eval_count = chunk["prompt_eval_count"]
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     text = chunk.get("response", "")
                     if text:
                         chunk_count += 1
@@ -759,7 +922,10 @@ class OllamaClient(LMStudioClient):
         except httpx.TransportError as exc:
             raise LLMError(f"Ollama request failed: {exc}") from exc
         finally:
-            self.last_stats = self._make_stats(start, ttft, chunk_count, eval_count, cancelled)
+            self.last_stats = self._make_stats(
+                start, ttft, chunk_count, eval_count, cancelled, prompt_tokens=prompt_eval_count,
+                finish_reason=finish_reason,
+            )
 
     def stream_chat(
         self,
@@ -769,22 +935,26 @@ class OllamaClient(LMStudioClient):
         temperature: float | None = None,
         top_p: float | None = None,
         cancel: threading.Event | None = None,
+        stop: list[str] | None = None,
     ) -> Iterator[ChatDelta]:
         """POST `/api/chat` and yield `ChatDelta`s; Ollama's own `message.thinking` field is used
         when present, alongside the same inline ``<think>`` splitting the parent does (a model
-        served through Ollama may still emit inline tags instead of the separate field)."""
+        served through Ollama may still emit inline tags instead of the separate field). `stop`
+        (2026-10-07, capabilities) goes into `options.stop` like `stream_completion`'s."""
         body: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
             "stream": True,
             "keep_alive": "30m",
             "options": self._ollama_options(max_tokens=max_tokens, temperature=temperature, top_p=top_p,
-                                            stop=None, extra_body=None),
+                                            stop=stop, extra_body=None),
         }
         start = time.monotonic()
         ttft = 0.0
         chunk_count = 0
         eval_count: int | None = None
+        prompt_eval_count: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         splitter = _ThinkSplitter()
@@ -797,6 +967,11 @@ class OllamaClient(LMStudioClient):
                         raise LLMError(f"Ollama error: {chunk['error']}")
                     if isinstance(chunk.get("eval_count"), int):
                         eval_count = chunk["eval_count"]
+                    if isinstance(chunk.get("prompt_eval_count"), int):
+                        prompt_eval_count = chunk["prompt_eval_count"]
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     message = chunk.get("message") or {}
                     raw_content = message.get("content") or ""
                     reasoning_field = message.get("thinking") or ""
@@ -824,7 +999,10 @@ class OllamaClient(LMStudioClient):
         except httpx.TransportError as exc:
             raise LLMError(f"Ollama request failed: {exc}") from exc
         finally:
-            self.last_stats = self._make_stats(start, ttft, chunk_count, eval_count, cancelled)
+            self.last_stats = self._make_stats(
+                start, ttft, chunk_count, eval_count, cancelled, prompt_tokens=prompt_eval_count,
+                finish_reason=finish_reason,
+            )
 
     # ---- internals -------------------------------------------------------
 

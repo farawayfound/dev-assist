@@ -71,7 +71,7 @@ def _say(transcript: Transcript, seg_id: int, text: str, *, me: bool = False) ->
                                 speaker_id="me" if me else "spk1", speaker_label="Me" if me else "Sam"))
 
 
-def _start(cfg: Config, answers: list[str], *, screen: str = "", clock: Any = None, context: Any = None,
+def _start(cfg: Config, answers: list[str], *, screen: str = "", clock: Any = None, project: Any = None,
            folder: Path | None = None) -> tuple[EventBus, Transcript, FakeClient, Assistant, DashboardService]:
     bus = EventBus()
     transcript = Transcript()
@@ -79,7 +79,7 @@ def _start(cfg: Config, answers: list[str], *, screen: str = "", clock: Any = No
     clk = clock or ManualClock()
     assistant = Assistant(cfg, bus, client, transcript, clock=clk)
     assistant.set_screen_provider(lambda: screen)
-    service = DashboardService(cfg, bus, transcript, assistant, clk, context=context,
+    service = DashboardService(cfg, bus, transcript, assistant, clk, project=project,
                                screen_provider=lambda: screen, folder=folder)
     assistant.start()
     service.start()
@@ -225,7 +225,7 @@ def test_suggested_prompts_are_cleaned_and_must_name_installed_parts() -> None:
     answer = ("## Action items\n- NEW: Task 1: export\n## Suggested prompts\n- NEW for N1: `/recon the export path`\n"
               "- NEW for N1: /bogus do it\n- NEW for N1: Use the ghost agent on export()\n- NEW: \"/recon again\"\n")
     cfg = Config()
-    bus, transcript, client, assistant, service = _start(cfg, [answer], context=_Toolkit())
+    bus, transcript, client, assistant, service = _start(cfg, [answer], project=_Toolkit())
     sub = bus.subscribe()
     try:
         job = service.refresh_now()
@@ -414,7 +414,7 @@ def test_reset_starts_a_fresh_store(tmp_path: Path) -> None:
         _stop(assistant, service)
 
 
-def test_the_context_provider_feeds_the_refresh_prompt(tmp_path: Path) -> None:
+def test_the_project_context_feeds_the_refresh_prompt(tmp_path: Path) -> None:
     class _Context:
         def __init__(self) -> None:
             self.calls: list[str] = []
@@ -441,7 +441,7 @@ def test_the_context_provider_feeds_the_refresh_prompt(tmp_path: Path) -> None:
 
     cfg = Config()
     ctx = _Context()
-    bus, transcript, client, assistant, service = _start(cfg, [FIRST], context=ctx)
+    bus, transcript, client, assistant, service = _start(cfg, [FIRST], project=ctx)
     sub = bus.subscribe()
     try:
         _say(transcript, 1, "let's run /recon on export() first")
@@ -473,7 +473,7 @@ def test_answers_get_the_toolkit_catalog_and_repo_lookups_through_the_assistant(
     transcript = Transcript()
     client = FakeClient(token_batches=[["ok"], ["ok"], ["ok"]])
     assistant = Assistant(cfg, bus, client, transcript, clock=time.monotonic)
-    assistant.set_context_provider(_Context())
+    assistant.set_project_context(_Context())
     assistant.start()
     sub = bus.subscribe()
     try:
@@ -484,7 +484,7 @@ def test_answers_get_the_toolkit_catalog_and_repo_lookups_through_the_assistant(
         assert "<toolkit>\nSkills: /recon" in system_part and system_part.rstrip().endswith("</toolkit><|im_end|>")
         assert '<repo root="r">' in user_part and "<toolkit_detail>\nDETAIL" in user_part
         assert user_part.index("<repo") < user_part.index("<question>")
-        cfg.context.toolkit_in_answers = False
+        cfg.project.toolkit_in_answers = False
         assistant.ask("and export() again?")
         drain_until(sub, lambda e: isinstance(e, AssistDoneEvent) and e.job_id > 1)
         assert "<toolkit>" not in client.calls[1]["prompt"] and '<repo root="r">' in client.calls[1]["prompt"]

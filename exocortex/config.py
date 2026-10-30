@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -378,6 +379,20 @@ class AssistConfig:
     insight_interval_s: int = 120
     insight_min_new_words: int = 60
     insight_max_items: int = 4         # bullets per section (questions / blind spots)
+    # 2026-10-29: work WITH the code the user has already written. On (default): solve, the Code
+    # button / gesture and Text treat code already in the development window (or in <previous>)
+    # as the thing to complete or fix -- its language, structure, names and approach are kept, what
+    # is missing is added, only what is wrong is changed, and a platform's starter code is filled
+    # in -- instead of jumping to the optimal solution from scratch. Off: the best solution from
+    # scratch, keeping only the entry point the task dictates. The manual-advance "Code from
+    # scratch" gesture ([hotkeys].manual_code_fresh) ignores the given code whatever this says.
+    consider_given_code: bool = True
+    # 2026-10-29: a Code answer is plain code only -- one code block and nothing outside it; a note
+    # or the complexity goes inside as comment lines in the language's own syntax, and markdown the
+    # model slips in (a heading, **bold**, bullets) is turned into comments (exocortex/llm/
+    # codeformat.py). With explanations on the walkthrough stays and the rule applies to the code
+    # block. Off: the answer is shown as the model wrote it.
+    code_only: bool = True
 
 
 @dataclass
@@ -429,13 +444,13 @@ class DashboardConfig:
 
 
 @dataclass
-class ContextConfig:
+class ProjectConfig:
     """What the model may look up beyond the transcript and the screen (2026-10-20): the
     repository being worked on, and the Claude Code toolkit installed in it. Nothing here is
     injected wholesale -- the repo is SEARCHED for the file names and identifiers a prompt
     mentions, and only the matching lines go in; the toolkit is a compact, auto-discovered
     catalog of what is installed (skills, agents, rules, workflows, hooks) plus, on mention,
-    one part's full text. Edited on the settings dialog's "Context" tab.
+    one part's full text. Edited on the settings dialog's "Project" tab.
     """
     # The project directory ("" = none): searched on demand, never read wholesale. Also where the
     # Claude Code toolkit is looked for (<repo_root>/.claude, <repo_root>/CLAUDE.local.md).
@@ -509,6 +524,219 @@ class ScreenConfig:
     # the screen text would include the co-pilot's own answers and suggested questions and feed
     # them back into the next prompt.
     exclude_own_windows: bool = True
+    # 2026-10-29 (multi-file tasks): read the screen the moment Code / Text is pressed and hand
+    # that job the fresh text -- otherwise it gets the last pass, up to interval_s old and often
+    # the wrong file -- waiting at most read_timeout_s for the capture + OCR to finish.
+    read_on_shortcut: bool = True
+    read_timeout_s: float = 4.0
+    # The task's workspace (exocortex/workspace.py): every file / pane seen since the checkpoint,
+    # grouped by similarity, handed to Code / Text as <workspace> next to the <screen> so the
+    # answer is written for the file on screen in the context of the others (the task statement,
+    # a parent class, an interface, a test). workspace_chars caps that block.
+    workspace: bool = True
+    workspace_chars: int = 3000
+
+
+@dataclass
+class ContextConfig:
+    """Context injection + the dynamic context window (added 2026-10-06, the Models window's
+    "Context" tab -- see SPEC.md "Context library + dynamic context window").
+
+    Two things live here. (1) **Reference documents** the user uploads (a README, a design or
+    architecture doc, notes for a presentation) and how each one reaches the model: ``"inject"``
+    puts the document's text into every prompt (a stable block, prefix-cached), ``"reference"``
+    keeps it out of the prompt and instead pre-processes it into a short model-written *digest*
+    (a catalogue line that tells the model the document exists and what it covers) plus a local
+    keyword index, so only the passages that match the question at hand are pulled in -- and
+    only when they match. Either way the material ranks BELOW the live transcript in the prompt's
+    own instructions: the most recent speech matters most, the documents are for reference.
+    (2) **The context window itself**: every prompt is sized to the server's real per-request
+    context (llama-server's ``/props``, else ``[llm].ctx_size`` whole: with ``parallel = 2`` the
+    server runs a unified KV pool that both slots share, so ``lane_share`` splits it between an
+    answer and the notes lane),
+    the transcript window keeps a stable prefix (it advances in steps instead of sliding one line
+    at a time, so llama.cpp's KV prefix cache keeps hitting in a long meeting), what falls out of
+    the window is compacted into a short running summary, and the characters-per-token estimate is
+    calibrated live from the server's own prompt-token counts.
+    """
+    # Where uploaded documents and their manifest live. "" -> <models_dir>/context (persists
+    # across sessions, like the model library; a session never deletes a document).
+    dir: str = ""
+    # Mode a newly added document gets: "reference" (digest + on-demand passages) or "inject"
+    # (its text in every prompt). Each document's mode can be changed afterwards in the tab.
+    default_mode: str = "reference"
+    # Which jobs see the reference material: "all" (every answer, solve, code, text, suggestion
+    # and completion), "questions" (spoken / typed / on-screen questions only: auto, manual, ask,
+    # screen), or "none" (the library is kept but nothing is injected).
+    include_in: str = "all"
+    # Token budgets (approximate; see chars_per_token). The stable <reference> block (injected
+    # documents in full, plus one catalogue line per reference-mode document)...
+    reference_tokens: int = 1200
+    # ...and the volatile <lookup> block (the passages pulled from reference-mode documents for
+    # this one question). Both are the FIRST things trimmed when the server's context is short.
+    lookup_tokens: int = 600
+    lookup_top_k: int = 3              # at most this many passages per answer
+    lookup_min_score: float = 3.0      # BM25 score a passage needs to be pulled in at all (a single
+                                       # matched term needs twice that: one rare word is not relevance)
+    chunk_chars: int = 1200            # a document is indexed in passages of about this size (split on headings / paragraphs)
+    max_doc_chars: int = 200000        # a longer document is cut here when it is added (with a warning)
+    # Pre-process each reference-mode document with the model into a 2-4 line digest (what it is,
+    # what it covers) -- the "catalogue line" the prompt carries so the model knows the document
+    # exists. Runs on the notes lane (never delays an answer). Off: the catalogue shows the file
+    # name and its first heading only.
+    digest: bool = True
+    digest_tokens: int = 120
+    # ---- the window itself ----
+    # "auto": size every prompt to the server's real per-request context (llama-server /props, else
+    # [llm].ctx_size, shared between the lanes per lane_share): transcript + reference + screen + the
+    # answer budget must fit,
+    # trimmed in priority order (lookup, reference, summary, screen, then the OLDEST transcript --
+    # the newest speech and the question are never trimmed). "fixed": the pre-2026-10-06 behaviour
+    # ([llm].context_tokens worth of transcript, no fitting) plus the reference blocks at their
+    # configured sizes.
+    budget_mode: str = "auto"
+    reserve_tokens: int = 256          # safety margin kept free under the server's context
+    # llama-server runs with [llm].parallel = 2 slots over ONE unified KV pool of ctx_size tokens
+    # (measured 2026-10-06: /props reports n_ctx = 4096 per slot for a 4096-token server, and the
+    # two slots share those 4096 cells), so an answer and a notes-lane job (notes, a compaction
+    # summary, a document digest) running at the same time must fit the pool TOGETHER. This share
+    # of the pool is what the notes lane may use; answers get the rest. Ignored with parallel = 1.
+    lane_share: float = 0.3
+    transcript_min_tokens: int = 600   # the newest speech always keeps at least this much, whatever else has to go
+    # When the transcript window overflows its budget, drop at least this share of the window at
+    # once (whole lines, oldest first) instead of sliding one line at a time -- the prompt prefix
+    # then stays byte-identical for the next many turns, which is what lets llama.cpp reuse its KV
+    # cache (a window that slides every turn is re-evaluated in full every turn). 0 = slide.
+    trim_step: float = 0.25
+    # What happens to the transcript that fell out of the window: "summary" = the model folds it
+    # into a short running summary (<earlier> block, at most summary_tokens; one small job on the
+    # notes lane per trim, never on the answer lane) so the earlier part of the meeting is still
+    # known; "off" = it is simply gone (the pre-2026-10-06 behaviour).
+    compaction: str = "summary"
+    summary_tokens: int = 250
+    # Characters per token used for every budget estimate until the server's own prompt-token
+    # counts (llama-server timings.prompt_n / OpenAI usage.prompt_tokens / Ollama prompt_eval_count)
+    # have calibrated it -- 3.6 is conservative for English prose with timestamps and code mixed in
+    # (the old approx_tokens assumed 4.0). auto_calibrate = false pins this value.
+    chars_per_token: float = 3.6
+    auto_calibrate: bool = True
+
+
+#: 2026-10-07 (capabilities): the commands the model may run by default
+#: (``[capabilities].allowed_commands`` and the Capabilities tab's "Restore safe list"). Read-only
+#: by construction, or taking no path at all. An entry matches the whole command or the command's
+#: first words (``entry + " "``); the ARGUMENTS still pass the runner's argument gate
+#: (``exocortex.capabilities``: every path must sit inside a readable folder, no chaining /
+#: redirection, a flag deny-list, no wildcard for anything but a lister, git run with hooks and
+#: external tools off and limited to the folder it runs in). Deliberately absent: the content
+#: readers (``type`` ``cat`` ``head`` ``tail`` ``more`` ``findstr`` ``grep`` ``rg`` ``wc``), which
+#: leaked around the read scope through wildcards, switches and recursion -- the scoped
+#: ``read_file`` / ``search_text`` tools do what they did; a user can still add one by hand and the
+#: gate stays on. Also absent: any interpreter entry (``python -c`` is arbitrary code that passes
+#: every character filter) and every test / build runner (``pytest`` imports the repo's
+#: ``conftest.py``). The listers may list the NAMES of excluded files. The list is a guard against
+#: accidents, not a sandbox; ``allow_all_commands`` is the explicit opt-in that lifts it.
+SAFE_COMMANDS: tuple[str, ...] = (
+    "dir", "ls", "tree", "where", "which", "pwd", "hostname", "whoami", "ver", "date", "tasklist", "systeminfo",
+    "git status", "git log", "git diff", "git show", "git branch", "git blame", "git ls-files",
+    "git remote -v", "git stash list", "git describe", "git rev-parse",
+    "python --version", "pip list", "pip show", "pip --version", "node --version", "npm ls",
+    "npm --version", "dotnet --version", "cargo --version", "go version", "java -version",
+    "rustc --version",
+)
+
+#: Names / patterns (fnmatch, case-insensitive, matched against every component of a path
+#: relative to its readable folder) the model never reads, lists, searches or indexes.
+DEFAULT_READ_EXCLUDE: tuple[str, ...] = (
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+    "dist", "build", "*.pyc", ".env", ".env.*", "*.pem", "*.key", "*.crt", "*.p12", "*.pfx", "*.kdbx",
+    "*.kdb", "id_rsa*", "id_ed25519*", "id_ecdsa*", "*.ppk", ".ssh", ".aws", ".kube", ".docker",
+    ".gnupg", ".npmrc", ".pypirc", ".netrc", ".git-credentials", "*.ovpn", "credentials*", "secrets*",
+    "*.token", "*.sqlite", "*.db",
+)
+
+#: Patterns the model never writes, on top of ``read_exclude`` and the app's own folders
+#: (config.toml, the model library, the context library, the maps, the sessions -- those are
+#: protected by the runner and cannot be removed here).
+DEFAULT_EDIT_EXCLUDE: tuple[str, ...] = (
+    ".git", "*.bat", "*.cmd", "*.ps1", "*.vbs", "*.exe", "*.dll", "*.lnk", "*.sys",
+)
+
+
+@dataclass
+class CapabilitiesConfig:
+    """What the model may do on its own to gather context (2026-10-07, the Models window's
+    "Capabilities" tab -- see SPEC.md "Capabilities: tool use, scoped file / command / web / MCP
+    access, project maps").
+
+    Five switches, each with its scope: **read files** (the folders below, recursively), **edit
+    files** (the edit folders), **execute commands** (the allowed list, or everything), **fetch
+    web content** (search + fetch within the domain lists) and **MCP servers** (the configured
+    servers' tools). When a job's kind is covered (``apply_to``) its system prompt lists the tools
+    it may call and the prompt runs a tool loop: the model writes a one-line call, the app runs it
+    under this policy, appends the result and the model continues (``exocortex.llm.assistant``).
+
+    **Trust tiers.** Only the ask box carries text the user typed; every other kind answers the
+    OTHER speaker (auto, manual) or the screen's OCR (screen, suggest, solve, code, text). So the
+    read tools (``read_file`` / ``list_dir`` / ``find_files`` / ``search_text``) serve every
+    covered kind, while the active tools (``write_file`` / ``edit_file`` / ``run_command`` /
+    ``fetch_url`` / ``web_search`` / the MCP tools) serve the ask box ONLY -- enforced by the
+    runner, not just the prompt. With no readable folder configured no tool is offered at all (a
+    fresh install's prompts are byte-identical to before this section existed).
+
+    Every value is read live. The ``mcp`` entries are an array of inline tables:
+    ``[{ name = "fs", transport = "stdio", command = "npx", args = ["-y", "..."], env = {},
+    enabled = true }]`` (``transport = "http"`` uses ``url`` instead of ``command`` / ``args``).
+    """
+    read_files: bool = True
+    edit_files: bool = False
+    execute_commands: bool = True
+    fetch_web: bool = False
+    mcp_servers: bool = False
+    # Which kinds may use tools at all: "questions" = auto / manual / ask / screen (read tools for
+    # the first three, everything for ask); "ask" = the ask box only; "all" = also suggest / solve
+    # / code / text (read tools). Never inline completions or explanations.
+    apply_to: str = "questions"
+    # Limits for the ask box (the user typed it; a longer wait is acceptable) ...
+    max_tool_calls: int = 4            # per answer
+    tool_result_chars: int = 6000      # one result is cut here before it joins the prompt
+    tool_time_s: float = 30.0          # the WHOLE loop (tools + model hops) per answer; after it, the answer
+    # ... and for the live kinds (auto / manual / screen / suggest / solve / code / text), where
+    # every tool hop delays an answer someone is waiting for.
+    live_max_tool_calls: int = 2
+    live_tool_result_chars: int = 2500
+    live_tool_time_s: float = 10.0
+    # ---- read files ----
+    read_roots: list[str] = field(default_factory=list)       # folders readable recursively; empty = no tools
+    read_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_READ_EXCLUDE))
+    read_max_file_chars: int = 20000   # a longer file is cut (the rest dropped, with a note)
+    # ---- edit files ----
+    edit_roots: list[str] = field(default_factory=list)
+    edit_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EDIT_EXCLUDE))
+    edit_backup: bool = True           # copy the original into <session>/edits/ before every change
+    # ---- execute commands ----
+    allowed_commands: list[str] = field(default_factory=lambda: list(SAFE_COMMANDS))
+    allow_all_commands: bool = False   # explicit opt-in: lifts the allowlist, the chaining filter and the path gate
+    command_timeout_s: float = 15.0
+    command_output_chars: int = 6000
+    command_cwd: str = ""              # "" = the first readable folder (a command needs one; must sit inside one)
+    # ---- fetch web content ----
+    web_allowed_domains: list[str] = field(default_factory=list)   # empty = any public host; "example.com" matches its subdomains
+    web_blocked_domains: list[str] = field(default_factory=list)
+    web_allow_local: bool = False      # loopback / private / link-local / CGNAT addresses are refused unless on
+    web_max_fetches: int = 3           # fetches + searches per answer
+    web_page_chars: int = 8000
+    web_timeout_s: float = 10.0
+    web_search_url: str = "https://html.duckduckgo.com/html/?q={query}"
+    web_search_results: int = 5
+    # ---- MCP servers ----
+    mcp: list[dict[str, Any]] = field(default_factory=list)
+    mcp_timeout_s: float = 20.0
+    # ---- maps ----
+    maps_dir: str = ""                 # "" = <models_dir>/maps
+    active_map: str = ""               # the map loaded last (its name); "" = none
+    map_max_files: int = 4000          # a bigger tree is cut (files beyond this are counted, not listed)
+    map_tokens: int = 800              # budget of the <map> block in the prompt
 
 
 @dataclass
@@ -522,6 +750,44 @@ class UIConfig:
     start_hidden: bool = False
     click_through: bool = False
     always_on_top: bool = True
+    # View: which pieces of the full overlay's chrome are shown (the "View" menu, 2026-10-07).
+    # Each hides only that strip; the title bar (drag, toggles, menu) is always present so the
+    # panel can never be made unreachable. Hidden in completion mode (the slim bar owns the
+    # layout) and overridden by the hands-free view, which shows only its output and switches.
+    show_tabs: bool = True             # the top strip: Live/Assist/Notes/Screen + Manual/Hands-free (keeps the current tab's content when hidden)
+    show_controls: bool = True         # the Read/Revert/Reset/Pause/Checkpoint/Compact/Text/Code row
+    show_status: bool = True           # the bottom status strip (audio levels, ASR/LLM, capture, screen)
+    show_monitor: bool = False         # the performance / context / resource monitor section (off by default)
+
+
+@dataclass
+class MonitorConfig:
+    """What the View → Monitor section displays (2026-10-07). ``[ui].show_monitor`` turns the whole
+    section on or off; these pick which readouts appear inside it (the "Monitor" settings tab).
+    The hardware-utilisation rows (gpu / igpu / npu) also hide themselves automatically when the
+    machine has no such device, so enabling one on a machine that lacks it is harmless."""
+    show_performance: bool = True   # the local model's speed: time-to-first-token, tokens/second
+    show_context: bool = True       # the context window, its breakdown by source, and the running summary
+    show_cpu: bool = True           # whole-machine CPU utilisation
+    show_ram: bool = True           # system memory used / total
+    show_gpu: bool = True           # the dedicated GPU: utilisation + VRAM in use
+    show_igpu: bool = True          # the integrated GPU (iGPU) utilisation
+    show_npu: bool = True           # the NPU / AI accelerator utilisation (e.g. Intel AI Boost)
+
+
+@dataclass
+class OptimizeConfig:
+    """Settings > Optimize (2026-10-07): the goal the planner (:mod:`exocortex.optimize`) tailors
+    this machine's compute split to, plus three limits. Only these four values are remembered
+    here. A plan's RESULTS are never stored in this section: they land where they already live
+    (the per-model tuning profile for the language model, ``[asr]`` for speech, ``[screen]`` /
+    ``[handsfree]`` for the prompt budgets), and benchmark numbers live next to the model library
+    in ``benchmarks.json``. Nothing here changes behaviour by itself -- a plan is only ever applied
+    by pressing "Apply plan" on the Optimize tab."""
+    goal: str = "balanced"        # latency | balanced | context | quality
+    reserve_vram_mb: int = 0      # 0 = automatic per goal (VRAM-guard floor + 256 MiB + the goal's slack); else as given
+    ctx_cap: int = 0              # 0 = the model's trained context; else never plan a longer window than this
+    asr_gpu: str = "auto"         # auto | never: "never" = Whisper is never planned onto the display GPU
 
 
 @dataclass
@@ -645,6 +911,9 @@ class HandsFreeConfig:
     # pointer while the button is down (a drag, an autoscroll) always cancels.
     manual_hold_text: bool = True
     manual_hold_code: bool = False
+    # 2026-10-29: the third gesture, Code from scratch ([hotkeys].manual_code_fresh, mouse button 4
+    # by default): like Code, a click unless this asks for the press-and-hold.
+    manual_hold_code_fresh: bool = False
 
 
 @dataclass
@@ -678,11 +947,28 @@ class HotkeysConfig:
     toggle_pause: str = "rshift"
     code: str = "ctrl+alt+g"            # write the code for the task discussed / shown since the last checkpoint
     toggle_handsfree: str = "ctrl+alt+h"   # hands-free mode (auto read -> checkpoint -> text -> code on screen change)
-    toggle_manual: str = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
+    toggle_manual: str = "ctrl+alt+j"   # manual advance (generate only on the mouse gesture: left = Text, middle = Code)
     insights: str = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
     recap: str = "ctrl+alt+y"           # recap the session so far (goal, done, current state, next)
     toggle_dashboard: str = "ctrl+alt+d"   # dashboard mode on / off (the ▦ title-bar button)
     quit: str = "ctrl+alt+x"
+    # 2026-10-29 (Settings > Shortcuts): every binding in this section follows one grammar
+    # (exocortex.bindings.parse_binding): "ctrl+alt+g" = a hotkey; a single key such as "rshift",
+    # "f9" or "right" = a TAP of that key; "mouse4" or "ctrl+mouse_left" = a mouse button
+    # (mouse_left, mouse_middle, mouse_right, mouse4 and mouse5 -- the two thumb buttons) with
+    # exactly those modifiers held; "" = unbound. Edited live on the Shortcuts tab.
+    # The manual-advance gestures, active only while the Manual switch is on: Text, Code (which
+    # works with the given code when [assist].consider_given_code is on) and Code from scratch
+    # (always ignores the given code). Whether a mouse gesture needs the press-and-hold is
+    # [handsfree].manual_hold_text / manual_hold_code / manual_hold_code_fresh.
+    manual_text: str = "mouse_left"
+    manual_code: str = "mouse_middle"
+    manual_code_fresh: str = "mouse4"
+    # A thumb button (mouse4 / mouse5) bound to anything above is kept from the app underneath --
+    # its press would otherwise make a browser or an editor go Back / Forward. A modified click
+    # (ctrl+mouse_left) is kept too, like a keyboard hotkey; a bare left / middle / right press
+    # never is: it must still reach the app.
+    swallow_thumb_buttons: bool = True
 
 
 @dataclass
@@ -701,11 +987,15 @@ class Config:
     assist: AssistConfig = field(default_factory=AssistConfig)
     notes: NotesConfig = field(default_factory=NotesConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
-    context: ContextConfig = field(default_factory=ContextConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
     screen: ScreenConfig = field(default_factory=ScreenConfig)
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     explain: ExplainConfig = field(default_factory=ExplainConfig)
     handsfree: HandsFreeConfig = field(default_factory=HandsFreeConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
+    capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -721,6 +1011,20 @@ class Config:
         if self.paths.sessions_dir:
             return Path(self.paths.sessions_dir).expanduser()
         return Path.home() / "Documents" / "ExoCortex" / "sessions"
+
+    def context_dir(self) -> Path:
+        """Where uploaded reference documents and their manifest live (``[context].dir``, empty =
+        ``<models_dir>/context``) -- persists across sessions like the model library."""
+        if self.context.dir:
+            return Path(self.context.dir).expanduser()
+        return self.models_dir() / "context"
+
+    def maps_dir(self) -> Path:
+        """Where the project maps the Capabilities tab indexes live (``[capabilities].maps_dir``,
+        empty = ``<models_dir>/maps``) -- persists across sessions like the model library."""
+        if self.capabilities.maps_dir:
+            return Path(self.capabilities.maps_dir).expanduser()
+        return self.models_dir() / "maps"
 
 
 def project_root() -> Path:
@@ -747,11 +1051,27 @@ def _apply(section_obj: Any, data: dict[str, Any], section_name: str) -> None:
             continue
         cur = getattr(section_obj, k)
         if isinstance(cur, bool):
-            v = bool(v)
+            # 2026-10-07 (capabilities): bool("false") is True -- a wrong type here used to fail
+            # OPEN (e.g. allow_all_commands = "false" switching the allowlist off). Only a real
+            # bool (or 0 / 1) is accepted; anything else keeps the default and warns.
+            if isinstance(v, bool):
+                pass
+            elif isinstance(v, int) and v in (0, 1):
+                v = bool(v)
+            else:
+                log.warning("config: [%s].%s expects true/false, got %r; default kept", section_name, k, v)
+                continue
         elif isinstance(cur, int) and isinstance(v, (int, float)):
             v = int(v)
         elif isinstance(cur, float) and isinstance(v, (int, float)):
             v = float(v)
+        elif isinstance(cur, list) and not isinstance(v, list):
+            # a str would be iterated character by character by anything that walks the list
+            log.warning("config: [%s].%s expects a list, got %r; default kept", section_name, k, v)
+            continue
+        elif isinstance(cur, dict) and not isinstance(v, dict):
+            log.warning("config: [%s].%s expects a table, got %r; default kept", section_name, k, v)
+            continue
         setattr(section_obj, k, v)
 
 
@@ -843,6 +1163,32 @@ def _migrate_llm_url_keys(llm_data: dict[str, Any]) -> None:
         )
 
 
+#: The keys ``[project]`` took over from ``[context]`` (2026-10-29): until then the repository /
+#: toolkit settings lived in a ``[context]`` section, which exo-cortex's reference documents and
+#: context window now own. No upstream ``[context]`` key shares one of these names.
+_PROJECT_KEYS = frozenset(f.name for f in fields(ProjectConfig))
+
+
+def _migrate_project_keys(data: dict[str, Any]) -> None:
+    """Move the repository / toolkit keys of an older config.toml from ``[context]`` to
+    ``[project]``, in place, BEFORE ``_apply`` runs. A key already present in ``[project]`` wins;
+    the next save writes everything under ``[project]``. A ``[context]`` section left empty by
+    the move is dropped, so it is not reported as unknown."""
+    old = data.get("context")
+    if not isinstance(old, dict):
+        return
+    moved = {k: old.pop(k) for k in [k for k in old if k in _PROJECT_KEYS]}
+    if not moved:
+        return
+    project = data.setdefault("project", {})
+    if isinstance(project, dict):
+        for k, v in moved.items():
+            project.setdefault(k, v)
+    if not old:
+        del data["context"]
+    log.info("config: moved [context] %s to [project]", ", ".join(sorted(moved)))
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     cfg = Config()
     p = Path(path) if path else find_config_path()
@@ -850,6 +1196,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         return cfg
     with open(p, "rb") as f:
         data = tomllib.load(f)
+    _migrate_project_keys(data)
     for sec_name, sec_data in data.items():
         if not hasattr(cfg, sec_name) or not isinstance(sec_data, dict):
             log.warning("config: unknown section [%s] ignored", sec_name)
@@ -861,17 +1208,52 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     return cfg
 
 
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_string(s: str) -> str:
+    """A TOML basic string: backslash and quote escaped, and (2026-10-07) every control character
+    too -- a raw newline, CR or DEL inside a value (an MCP env value, a command, a map name) used
+    to write a file ``tomllib`` refuses, which bricked the next launch."""
+    out: list[str] = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _toml_key(k: Any) -> str:
+    """A table key: bare when it can be, quoted otherwise (``ProgramFiles(x86)``, ``a.b``, ``A B``
+    are all legal env-variable names that a bare key would mis-write or split)."""
+    key = str(k)
+    return key if _BARE_KEY_RE.match(key) else _toml_string(key)
+
+
 def _toml_value(v: Any) -> str:
+    if v is None:
+        return '""'
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return repr(v)
     if isinstance(v, str):
-        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return _toml_string(v)
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     if isinstance(v, dict):
-        return "{ " + ", ".join(f"{k} = {_toml_value(x)}" for k, x in v.items()) + " }"
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_value(x)}" for k, x in v.items()) + " }"
     raise TypeError(f"unsupported TOML value: {v!r}")
 
 
@@ -900,7 +1282,71 @@ def save_config(cfg: Config, path: str | os.PathLike[str] | None = None) -> Path
     return p
 
 
+_SECRET_WORD = r"(?:token|key|secret|passw(?:or)?d|passwd|pwd|auth|bearer|credential)"
+_SECRET_QUERY_RE = re.compile(rf"(?i)([?&][^=&#]*{_SECRET_WORD}[^=&#]*=)[^&#]*")
+_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@?#]*:)[^/\s@?#]+(@)")      # scheme://user:PASS@host
+_SECRET_FLAG_RE = re.compile(rf"(?i)^-{{1,2}}[^=\s]*{_SECRET_WORD}[^=\s]*$")             # --api-key  (the value is the NEXT argument)
+_SECRET_FLAG_EQ_RE = re.compile(rf"(?i)^(-{{1,2}}[^=\s]*{_SECRET_WORD}[^=\s]*=).*$", re.S)   # --token=VALUE
+
+
+def _redact_text(s: str) -> str:
+    """`s` with the secret parts of a url / connection string blanked: the password of
+    ``scheme://user:PASS@host`` and the value of a ``?token=...`` style query parameter. Best
+    effort (2026-10-07, capabilities); shared by ``session.json`` and the Capabilities tab."""
+    return _SECRET_QUERY_RE.sub(r"\1***", _USERINFO_RE.sub(r"\1***\2", s))
+
+
+def _redact_args(args: Any) -> list[str]:
+    """A command's arguments with the secrets blanked: the value of ``--api-key VALUE`` (the next
+    argument) and of ``--token=VALUE``, and the secret parts of any url / connection string. Only
+    the secret is replaced (by ``***``), never the whole argument, so the rest stays readable."""
+    out: list[str] = []
+    mask_next = False
+    for a in map(str, args):
+        if mask_next:
+            out.append("***")
+            mask_next = False
+        elif _SECRET_FLAG_EQ_RE.match(a):
+            out.append(_SECRET_FLAG_EQ_RE.sub(r"\1***", a))
+        elif _SECRET_FLAG_RE.match(a):
+            out.append(a)
+            mask_next = True
+        else:
+            out.append(_redact_text(a))
+    return out
+
+
+def _redact_mcp_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """An MCP server entry with its secrets blanked: every ``env`` (and ``headers``) value becomes
+    ``"***"``, the url's userinfo password and token-like query values likewise, and so do the
+    values of secret-named command-line flags and the secret parts of url-like arguments (2026-10-07,
+    capabilities). Best effort -- put a secret in ``env``, not in ``args``."""
+    out = dict(spec)
+    for table in ("env", "headers"):
+        val = out.get(table)
+        if isinstance(val, dict):
+            out[table] = {str(k): "***" for k in val}
+    url = out.get("url")
+    if isinstance(url, str) and url:
+        out["url"] = _redact_text(url)
+    args = out.get("args")
+    if isinstance(args, (list, tuple)):
+        out["args"] = _redact_args(args)
+    return out
+
+
 def config_as_dict(cfg: Config) -> dict[str, Any]:
+    """The whole config as plain data -- what ``session.json`` records. 2026-10-07: the MCP
+    server entries are redacted (their ``env`` values, url passwords and tokens, secret-named
+    flag values and url-like arguments) and so is the web search url's query, so an exported
+    session does not carry an API key (best effort); ``to_toml`` (the config file itself) is
+    unaffected."""
     d = dataclasses.asdict(cfg)
     d.pop("path", None)
+    caps = d.get("capabilities")
+    if isinstance(caps, dict):
+        if isinstance(caps.get("mcp"), list):
+            caps["mcp"] = [_redact_mcp_spec(s) if isinstance(s, dict) else s for s in caps["mcp"]]
+        if isinstance(caps.get("web_search_url"), str):
+            caps["web_search_url"] = _redact_text(caps["web_search_url"])
     return d

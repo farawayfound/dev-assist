@@ -19,6 +19,8 @@ from typing import Any, Callable
 
 from PySide6.QtCore import QAbstractNativeEventFilter, QCoreApplication, QObject, Signal
 
+from exocortex.bindings import NAMED_VKS
+
 log = logging.getLogger(__name__)
 
 # ---- RegisterHotKey modifiers ----------------------------------------------------------
@@ -43,37 +45,9 @@ _MODIFIER_ALIASES: dict[str, int] = {
     "super": MOD_WIN,
 }
 
-_NAMED_VKS: dict[str, int] = {
-    "space": 0x20,
-    "left": 0x25,
-    "up": 0x26,
-    "right": 0x27,
-    "down": 0x28,
-    "enter": 0x0D,
-    "esc": 0x1B,
-    "tab": 0x09,
-    "backspace": 0x08,
-    "insert": 0x2D,
-    "delete": 0x2E,
-    "home": 0x24,
-    "end": 0x23,
-    "pageup": 0x21,
-    "pagedown": 0x22,
-    "grave": 0xC0,
-    "-": 0xBD,
-    "=": 0xBB,
-    "[": 0xDB,
-    "]": 0xDD,
-    ";": 0xBA,
-    "'": 0xDE,
-    ",": 0xBC,
-    ".": 0xBE,
-    "/": 0xBF,
-    "backslash": 0xDC,
-}
-for _n in range(1, 13):
-    _NAMED_VKS[f"f{_n}"] = 0x70 + (_n - 1)
-del _n
+# 2026-10-29 (Shortcuts tab): the key table moved to exocortex.bindings -- the one grammar for
+# hotkeys, single-key taps and mouse buttons -- and stays importable here under its old name.
+_NAMED_VKS: dict[str, int] = NAMED_VKS
 
 
 def parse_hotkey(text: str) -> tuple[int, int]:

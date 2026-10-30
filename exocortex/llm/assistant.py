@@ -45,7 +45,29 @@ Owns five daemon threads:
   completer (:meth:`plan_typed`) or seen on screen (:meth:`_maybe_explain_from_screen`) -- an
   "explain" job explains the finished solution.
 - ``notes-worker`` -- runs notes jobs the same way (at most one queued; the running one is not
-  cancellable).
+  cancellable). 2026-10-06 (context library): it is also the **notes lane** for the two small
+  background jobs the context library adds -- a *compaction* (fold the transcript that fell out of
+  the anchored window into the running ``<earlier>`` summary) and a *digest* (a 2-4 line catalogue
+  entry for an uploaded reference document). Each has its own latest-wins slot; notes always go
+  first, then compactions, then digests (:meth:`Assistant._next_notes_job`). Keeping them off the
+  assist lane means a compaction or a digest can never delay a live answer.
+- Every assist job's prompt is assembled by :class:`exocortex.context.ContextManager` (the
+  anchored transcript window, the reference/lookup blocks, the earlier summary, all sized to the
+  server's real context -- see ``exocortex/context.py``); the Assistant publishes how that went as
+  two :class:`~exocortex.bus.ContextUsageEvent` per job and feeds the server's own prompt-token
+  count back so the estimate calibrates itself.
+- 2026-10-07 (capabilities): with a :class:`exocortex.capabilities.ToolRunner` (``tools=``) a job
+  whose kind it covers runs a **tool loop** on the assist worker (:meth:`Assistant._stream_answer`):
+  the system prompt ends with the ``<tools>`` list, the user turn carries the project ``<map>``,
+  and when the model writes ``<tool>{...}</tool>`` (on a line of its own, or after a line of
+  prose) the server stops the pass at the closing tag, the runner executes the call under the
+  ``[capabilities]`` policy, and the conversation is continued: the call closes the assistant
+  turn, its ``<result>`` block comes back as a USER turn and a fresh assistant turn is opened
+  (2026-10-08: every request a byte-for-byte extension of the previous one plus what the model
+  generated, so the KV prefix cache stays intact; the chat path appends two messages). Only the
+  visible text reaches the deltas, the history, the plan and ``AssistDoneEvent``; every call is
+  published as a :class:`~exocortex.bus.ToolCallEvent`. Never for "complete" / "explain", nor for
+  the notes lane's jobs.
 - ``bus-listener`` -- drains this instance's own bus subscription, watching for
   :class:`~exocortex.bus.FinalTranscriptEvent` to drive auto-answer mode and for
   :class:`~exocortex.bus.ScreenTextEvent` to drive screen-triggered questions and auto-suggest.
@@ -74,6 +96,7 @@ can be called from any thread (the Qt UI thread, hotkey callbacks, the bus-liste
 """
 from __future__ import annotations
 
+import dataclasses
 import itertools
 import logging
 import queue
@@ -82,7 +105,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, NamedTuple, TypeVar
 
 from exocortex.bus import (
     AssistDeltaEvent,
@@ -93,6 +116,8 @@ from exocortex.bus import (
     AutoAssistChangedEvent,
     CheckpointEvent,
     ComponentStatusEvent,
+    ContextLibraryEvent,
+    ContextUsageEvent,
     EventBus,
     FinalTranscriptEvent,
     InsightsUpdatedEvent,
@@ -100,14 +125,17 @@ from exocortex.bus import (
     NotesUpdatedEvent,
     ScreenTextEvent,
     Source,
+    ToolCallEvent,
     TranscriptSegment,
 )
 from exocortex.config import Config
-from exocortex.llm import prompts, questions
+from exocortex.context import ContextBundle, ContextManager, ContextStore
+from exocortex.llm import codeformat, prompts, questions
 from exocortex.llm.choices import ChoiceSet, annotate_choices, choices_block, finalize_answer, find_choices
-from exocortex.llm.client import LLMError, LMStudioClient
+from exocortex.llm.client import LLMError, LMStudioClient, StreamStats
 from exocortex.plan import PlanView, containment, split_plan, typed_fraction
 from exocortex.transcript import Transcript
+from exocortex.workspace import Workspace
 
 log = logging.getLogger(__name__)
 
@@ -187,7 +215,7 @@ _CANCELS: dict[str, tuple[str, ...]] = {
 }
 
 #: Kinds whose SYSTEM prompt carries the installed Claude Code toolkit's catalog (<toolkit>,
-#: exocortex.context) when `[context].toolkit_in_answers` is on; "dashboard" builds its own.
+#: exocortex.project) when `[project].toolkit_in_answers` is on; "dashboard" builds its own.
 _TOOLKIT_KINDS: frozenset[str] = frozenset({"ask", "auto", "manual", "screen", "recap", "text", "code", "solve", "suggest", "insights"})
 #: Kinds whose USER turn gets the on-demand <repo> / <toolkit_detail> lookups (the question, the
 #: tail of the transcript and the screen name the identifiers searched for).
@@ -195,6 +223,43 @@ _LOOKUP_KINDS: frozenset[str] = frozenset({"ask", "auto", "manual", "screen", "r
 #: File-scan budget of one repo lookup made for an answer (a spoken question must stay snappy);
 #: the dashboard refresh uses its own, longer budget.
 _LOOKUP_BUDGET_S = 0.8
+#: How much of the newest transcript the repo / toolkit lookups read for the names to search
+#: (`_project_extra`); taken before the context manager sizes the window, so the lookups' own
+#: length can be budgeted.
+_LOOKUP_TAIL_CHARS = 600
+
+#: An `LLMError` message that means "the prompt did not fit the server's context" (llama-server:
+#: ``request (N tokens) exceeds the available context size (4096 tokens)``; LM Studio / OpenAI
+#: style servers word it "too many / too long" or name ``n_ctx``). The one case in which an assist
+#: job is rebuilt smaller and streamed once more (see `Assistant._run_assist_job`).
+_OVERFLOW_RE = re.compile(r"exceed|context size|too (?:many|long)|n_ctx", re.IGNORECASE)
+
+#: A document digest is made from at most this many leading characters of the document (and fewer
+#: when the notes lane has less room: `ContextManager.available_chars`).
+_DIGEST_EXCERPT_CHARS = 6000
+
+#: The notes job's transcript chunk never shrinks below this, whatever the notes lane's room says
+#: (`head_text` returns nothing for a zero budget, which would stall the notes forever).
+_MIN_NOTES_CHUNK_CHARS = 200
+#: 2026-10-06: a notes pass keeps the configured answer budget as long as the lane leaves at least
+#: this many tokens of new transcript beside it; below that the document scales down (see
+#: `Assistant._notes_budget`), but never under `_NOTES_MIN_DOC_TOKENS`.
+_NOTES_MIN_CHUNK_TOKENS = 400
+_NOTES_MIN_DOC_TOKENS = 200
+#: 2026-10-06: a compaction / digest steps aside for a live answer this many times before it runs
+#: to completion regardless, and waits at most this long for the answer lane to go idle first.
+_LANE_YIELD_ATTEMPTS = 2
+_LANE_IDLE_WAIT_S = 20.0
+
+
+def _head_lines(text: str, max_chars: int) -> str:
+    """The first `max_chars` characters of `text`, ending on a line boundary when there is one
+    (the oldest headings of a notes document survive a cut; the tail is what the rewrite adds back)."""
+    if len(text) <= max_chars:
+        return text
+    head = text[:max(0, max_chars)]
+    cut = head.rfind("\n")
+    return head[:cut] if cut > 0 else head
 
 _T = TypeVar("_T")
 
@@ -224,6 +289,355 @@ def _normalize_line(text: str) -> str:
 def _normalized_line_set(lines: Sequence[str]) -> set[str]:
     """`lines`, normalised via `_normalize_line` and with blanks dropped, as a set."""
     return {norm for line in lines if (norm := _normalize_line(line))}
+
+
+# ---- the tool loop's pieces (2026-10-07, capabilities) -------------------------------------
+
+#: Kinds that never get tools, whatever the runner says (inline completions are ghost text typed
+#: into another app; an explanation answers a finished plan). dev-assist's own background kinds
+#: join them: their system prompts carry no <tools> block, and the dashboard builds its own.
+_NO_TOOL_KINDS = frozenset({"complete", "explain", "insights", "recap", "dashboard"})
+
+#: Appended to the result of the call that used the last one (or after the time budget ran out):
+#: the model's cue, repeated by `prompts._TOOL_RULE`, to write the answer now.
+_NO_CALLS_LEFT = "(no calls left: write the answer now)"
+
+#: What a result becomes when the server says the continuation did not fit its context.
+_RESULT_DROPPED = "(result dropped to fit the context)"
+
+#: A short narration that announces a lookup but makes none ("Let me check the config file."):
+#: the first stream of an answer that matches gets ONE retry with the call opened for it. The
+#: announcement must OPEN the text (after optional filler such as "Okay,") with a first-person
+#: lookup verb ("let me check", "I'll start by reading", "I need to look"), or be a bare
+#: "Checking / Reading / Looking at ..." clause that is the whole text -- so a complete answer
+#: that merely says "Looking at the transcript, Atlas ships Friday." or "Let me know if ..." is not
+#: one.
+_INTENT_RE = re.compile(
+    r"^\W*(?:(?:okay|ok|sure|alright|right|so|now|first|well)\b\W*)*"
+    r"(?:(?:let me|let['\u2019]s|i(?:'ll|\u2019ll| will)|i need to|i['\u2019]m going to)\s+"
+    r"(?:(?:first|just|now|quickly)\s+)*"
+    r"(?:check|look|read|open|search|find|verify|run|list|fetch|grep|pull|take a look|examine|inspect|review|browse"
+    r"|scan|load|start by|see (?:if|what|whether|how|which|where|the))\b"
+    r"|(?:checking|reading|searching|looking (?:up|at|in|through|for))\b"
+    r"(?:(?![,;:]|[.!?]\s+\S)[^\n]){0,80}$)",
+    re.IGNORECASE,
+)
+_INTENT_MAX_CHARS = 240
+#: ... and it only counts when it is unfinished (no full stop at its end) or names what it will
+#: look at -- a file, a folder, a command, a url -- because a finished sentence that names nothing
+#: ("Let me check that.") is as likely an answer as an announcement.
+_SENTENCE_END_RE = re.compile(r"[.!?\u2026][\"')\]\u201d]*\s*$")
+_INTENT_TARGET_RE = re.compile(
+    r"[`\"/\\]|\bhttps?:|\bwww\.|\b[\w-]+\.[A-Za-z]{1,6}\b"
+    r"|\b(?:files?|folders?|directory|directories|dir|repo|repository|project|codebase|command|commands|url|link|page|site"
+    r"|website|docs?|documentation|readme|config|configuration|settings|script|logs?|source|code|module|package|tests?)\b"
+    r"|\b(?:git|pip|npm|ls|tree|grep|rg|findstr|pytest|python|where|which|cat|type)\s+\S",
+    re.IGNORECASE,
+)
+
+
+def _announces_lookup(text: str) -> bool:
+    """Is `text` (the first stream of an answer) only an announcement of a lookup it never made?"""
+    if not text.strip() or len(text) >= _INTENT_MAX_CHARS or not _INTENT_RE.search(text):
+        return False
+    return _SENTENCE_END_RE.search(text) is None or _INTENT_TARGET_RE.search(text) is not None
+
+
+#: The chat path cannot prefill an assistant turn, so the two retries below ask in words instead.
+_CHAT_FORCE_CALL = '(make the tool call now: <tool>{"name": "...", "args": {...}}</tool>)'
+_CHAT_WRITE_ANSWER = "(write the answer now)"
+
+#: A call whose JSON object is complete but whose closing tag has not come after this many more
+#: characters was written by a model that forgot the tag: `_send_hop` stops reading there (the one
+#: client-side cut left, 2026-10-08) instead of paying for a made-up continuation.
+_CLOSE_GRACE_CHARS = 80
+
+
+def _forgot_closing_tag(held: str) -> bool:
+    """True when `held` (the text from a call's opening marker on) holds a complete JSON object
+    followed by `_CLOSE_GRACE_CHARS` characters or more without a closing tag."""
+    payload = prompts.find_tool_call(held)
+    if payload is None:
+        return False
+    at = held.find(prompts.TOOL_OPEN)
+    tail = held[at + len(prompts.TOOL_OPEN) + len(payload):]
+    return prompts.TOOL_CLOSE not in tail and len(tail) >= _CLOSE_GRACE_CHARS
+
+#: A call that may carry a file's content (ask with `write_file` / `edit_file`) needs more room
+#: than a one-line lookup: `max_tokens` of such hops is raised to at least this.
+_WRITE_HOP_MIN_TOKENS = 1200
+_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+
+#: Argument names that best say what a call is about, in order (the event's one-line summary).
+_SUMMARY_KEYS = ("query", "pattern", "command", "url", "path", "file", "name")
+
+
+class _NoAnswerError(Exception):
+    """The tool loop ended without an answer: the model called tools and then wrote nothing, even
+    when asked once more. Reported as an `AssistErrorEvent` (not as an LLM failure)."""
+
+
+class _Outcome(NamedTuple):
+    """What the loop needs of a runner's result (`exocortex.capabilities.ToolResult`, or any
+    object with the same four attributes)."""
+
+    text: str
+    state: str
+    detail: str
+    summary: str
+
+
+def _outcome(result: Any) -> _Outcome:
+    """`result` as an `_Outcome`: missing attributes read as empty, an unknown state as "done"."""
+    state = str(getattr(result, "state", "") or "done")
+    if state not in ("done", "error", "denied"):
+        state = "done"
+    return _Outcome(
+        str(getattr(result, "text", "") or ""), state,
+        str(getattr(result, "detail", "") or ""), str(getattr(result, "summary", "") or ""),
+    )
+
+
+def _call_summary(args: dict[str, Any]) -> str:
+    """One line (<= 120 chars) naming what a call is about, from its arguments: the query, the
+    pattern, the command, the url or the path, else the first scalar value."""
+    text = ""
+    for key in _SUMMARY_KEYS:
+        value = args.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+            text = str(value)
+            break
+    else:
+        for value in args.values():
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+                text = str(value)
+                break
+    return " ".join(text.split())[:120]
+
+
+def _one_line(text: str, limit: int = 160) -> str:
+    """The first non-empty line of `text`, cut to `limit` characters."""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:limit]
+    return ""
+
+
+@dataclass
+class _JobTools:
+    """Everything the tool loop needs of ONE job, resolved once (`Assistant._job_tools`): the
+    runner's per-answer budget (its `calls_left` is what the system prompt announced), the specs it
+    listed, the rendered ``<tools>`` block and the project map cut to `[capabilities].map_tokens`."""
+
+    budget: Any
+    specs: list[Any]
+    block: str
+    map_text: str
+
+
+@dataclass
+class _ToolStep:
+    """One call of the loop as the continuation carries it: the visible text the model wrote
+    before it (`text`), the call's payload, the tool's name and its result. `note` is the loop's
+    own trailing line inside the result block; `sanitize` is False for the loop's own notices
+    (a malformed call's, which names ``<tool>`` on purpose); `dropped` replaces the result's body
+    by a placeholder when the server ran out of context."""
+
+    text: str
+    payload: str
+    name: str
+    result: str
+    note: str = ""
+    sanitize: bool = True
+    dropped: bool = False
+
+    def block(self, *, nudge: str = "") -> str:
+        """The ``<result>`` block of this step; `nudge` is the answer retry's trailing line."""
+        body = _RESULT_DROPPED if self.dropped else self.result
+        if self.note:
+            body = f"{body.rstrip()}\n{self.note}"
+        if nudge:
+            body = f"{body.rstrip()}\n{nudge}"
+        return prompts.tool_result_block(self.name, body, sanitize=self.sanitize)
+
+    def call_text(self) -> str:
+        """What the assistant wrote: the visible lead and the call. A ChatML special token the
+        model managed to write (``<|...``) is defused, as in a result: this text goes back into the
+        prompt verbatim."""
+        text = f"{self.text}{prompts.TOOL_OPEN}{self.payload}{prompts.TOOL_CLOSE}"
+        return text.replace("<|", "<¦")
+
+
+class _ToolSplitter:
+    """Splits the stream of one tool-loop request into the visible answer and the held-back call
+    (the shape of ``client._ThinkSplitter``: feed arbitrary chunks, tags may straddle them).
+
+    Text goes to `emit` (the job's ``on_delta``) unless it starts a call: a ``<tool>`` that opens a
+    LINE -- after indentation and an optional bullet / quote marker (``prompts.CALL_LEAD_RE``) --
+    switches to holding everything from there on, in `held`. A ``<tool>`` in the middle of a line
+    of prose is a call too when what follows it is a complete JSON object that spells out its
+    arguments (`prompts.is_explicit_call`): the prose before it stays visible, the call is held
+    and the raw JSON is never published; any other mid-line ``<tool>`` (a name-only object, ``{}``,
+    plain words) is ordinary text, and one whose object is still being written waits for its
+    end. A line that might still turn into a call (``<too``, ``- ``, ``1.``) waits
+    for its next characters, and a code-fence line is withheld until the line after it shows
+    whether a call follows (then the fence is swallowed). Decided text is not published at once
+    either: it waits for a newline or `PUBLISH_CHARS` characters, so a call at the very start of the
+    answer never leaks a partial ``<too`` and a tiny stream does not become a flurry of deltas.
+
+    `visible` is every character decided visible; `held` is None while no call has started. A
+    splitter made with `held=TOOL_OPEN` is already inside a call (the loop forced one open).
+    """
+
+    PUBLISH_CHARS = 120
+    #: How much of an unfinished mid-line ``<tool>{...`` is waited for before it is called text.
+    MID_CALL_WAIT_CHARS = 20_000
+
+    #: A line that is (or may become) a code-fence line: ```` ``` ```` / ``~~~`` plus an info string.
+    _FENCE_LINE = re.compile(r"[ \t]*(?:`{3,}|~{3,})[^`\n]*")
+    _FENCE_START = re.compile(r"[ \t]*(?:`{1,2}|~{1,2})?$|[ \t]*(?:`{3,}|~{3,})[^\n]*$")
+
+    def __init__(self, emit: Callable[[str], None], *, held: str | None = None) -> None:
+        self._emit = emit
+        self.visible = ""
+        self.held: str | None = held
+        #: True once a delta went out (a request that failed before that may be retried).
+        self.published = False
+        self._pending = ""        # decided visible, not yet published
+        self._buf = ""            # the line being read, not decided yet
+        self._fence = ""          # a fence line withheld in case a call follows it
+        self._mid_line = False    # the current line is prose: pass it on, watching for a mid-line <tool>
+
+    def feed(self, text: str) -> None:
+        """Take the next chunk of the stream."""
+        if not text:
+            return
+        if self.held is not None:
+            self.held += text
+            return
+        self._buf += text
+        self._drain(final=False)
+
+    def finish(self) -> None:
+        """The stream ended: decide whatever is still ambiguous and publish the rest."""
+        if self.held is None:
+            self._drain(final=True)
+        self._release_fence()
+        self._flush()
+
+    # ---- internals
+    def _visible(self, text: str) -> None:
+        if not text:
+            return
+        self.visible += text
+        self._pending += text
+        if "\n" in self._pending or len(self._pending) >= self.PUBLISH_CHARS:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._pending:
+            out, self._pending = self._pending, ""
+            self.published = True
+            self._emit(out)
+
+    def _release_fence(self) -> None:
+        if self._fence:
+            fence, self._fence = self._fence, ""
+            self._visible(fence)
+
+    def _begin_call(self, at: int) -> None:
+        """A call starts at index `at` of the buffer: hold it and everything after; swallow a
+        fence line that was withheld right before it."""
+        self._fence = ""
+        self.held = self._buf[at:]
+        self._buf = ""
+
+    @staticmethod
+    def _open_prefix_len(text: str) -> int:
+        """Length of the longest suffix of `text` that is a proper prefix of ``<tool>`` (0 = none)."""
+        for k in range(min(len(prompts.TOOL_OPEN) - 1, len(text)), 0, -1):
+            if prompts.TOOL_OPEN.startswith(text[-k:]):
+                return k
+        return 0
+
+    def _judge_mid_call(self, tail: str) -> str:
+        """What the text after a mid-line ``<tool>`` makes of it: "call" (a complete JSON object
+        that spells out its arguments), "text" (it cannot become one, or it is complete but is not a
+        call: ``{}``, a name with no arguments) or "wait" (nothing yet, an object still open, or a
+        code-fence opener), the last for at most `MID_CALL_WAIT_CHARS` characters."""
+        stripped = tail.lstrip()
+        if not stripped:
+            return "wait"
+        end = prompts._json_object_end(tail)
+        if end is None:
+            if stripped.startswith("{") or prompts._FENCE_PREFIX_RE.fullmatch(stripped):
+                return "wait" if len(tail) < self.MID_CALL_WAIT_CHARS else "text"
+            return "text"
+        return "call" if prompts.is_explicit_call(tail[:end]) else "text"
+
+    def _scan_prose(self, nl: int, final: bool) -> bool:
+        """Pass the prose line being read on to `_visible`, looking for a ``<tool>`` that opens a
+        call in the middle of it (`nl` = index of the line's newline in the buffer, -1 for none yet).
+        True = stop draining: a call began, or the next characters decide what is held back (a
+        partial ``<tool>`` at the end of the buffer, or a ``<tool>`` whose object is not complete)."""
+        buf = self._buf
+        at = buf.find(prompts.TOOL_OPEN)
+        if at >= 0 and (nl < 0 or at < nl):
+            if at:
+                self._visible(buf[:at])
+                self._buf = buf = buf[at:]
+            verdict = self._judge_mid_call(buf[len(prompts.TOOL_OPEN):])
+            if verdict == "call":
+                self._begin_call(0)
+                return True
+            if verdict == "wait" and not final:
+                return True
+            self._visible(prompts.TOOL_OPEN)                    # ordinary text: go on after the marker
+            self._buf = buf[len(prompts.TOOL_OPEN):]
+            return False
+        end = len(buf) if nl < 0 else nl + 1
+        keep = self._open_prefix_len(buf[:end]) if nl < 0 and not final else 0
+        if end > keep:
+            self._visible(buf[:end - keep])
+            self._buf = buf[end - keep:]
+        if nl >= 0:
+            self._mid_line = False
+            return False
+        return keep > 0
+
+    def _drain(self, *, final: bool) -> None:
+        while self._buf and self.held is None:
+            nl = self._buf.find("\n")
+            if self._mid_line:
+                if self._scan_prose(nl, final):
+                    return
+                continue
+            complete = nl >= 0
+            line = self._buf[:nl] if complete else self._buf
+            lead = prompts.CALL_LEAD_RE.match(line).end()      # always matches (possibly empty)
+            rest = line[lead:]
+            if rest.startswith(prompts.TOOL_OPEN):
+                self._begin_call(lead)
+                return
+            partial_tag = bool(rest) and prompts.TOOL_OPEN.startswith(rest)
+            ambiguous = (
+                partial_tag or prompts.CALL_LEAD_PARTIAL_RE.fullmatch(line) is not None
+                or self._FENCE_START.fullmatch(line) is not None
+            )
+            if ambiguous and not complete and not final:
+                return                                          # wait for the next characters
+            if complete and self._FENCE_LINE.fullmatch(line):
+                fence, self._buf = self._buf[:nl + 1], self._buf[nl + 1:]
+                self._release_fence()
+                self._fence = fence                             # withheld: a call may follow
+                continue
+            if final and not complete and partial_tag:
+                self._begin_call(lead)                          # the stream stopped inside "<too"
+                return
+            # An ordinary line (or the start of one): prose. `_scan_prose` passes it on, a long one
+            # flowing through, and watches it for a ``<tool>`` in the middle.
+            self._release_fence()
+            self._mid_line = True
 
 
 class _JobSlot(Generic[_T]):
@@ -385,6 +799,23 @@ class _AssistJob:
     sections: tuple[str, ...] = ()
     auto: bool = False
     started: float = 0.0
+    #: 2026-10-29, kind "code" only: the manual-advance "Code from scratch" gesture -- the prompt
+    #: tells the model to ignore the code already on screen, whatever `[assist].consider_given_code`
+    #: says (`Assistant._consider_given_code`).
+    fresh: bool = False
+    #: 2026-10-29, kinds "code" / "text": read the screen afresh when the job starts (the Code /
+    #: Text shortcuts: the user is on the file they mean NOW) -- `Assistant._refresh_screen_for`;
+    #: and the <workspace> block built for it (the OTHER files of the task), "" for none.
+    read_now: bool = False
+    workspace: str = ""
+    #: 2026-10-07 (capabilities): the tool loop's state for this job, resolved ONCE by
+    #: `Assistant._job_tools` (None = no tools for it) so the system prompt, the user turn, the
+    #: prompt rebuilt by the overflow retry and the loop itself all agree on one budget.
+    tool_ctx: "_JobTools | None" = None
+    tool_ctx_resolved: bool = False
+    #: Calls handed to the runner so far: once any ran, the outer overflow retry stays off (a tool
+    #: must never execute twice for one answer).
+    tools_used: int = 0
 
 
 @dataclass
@@ -393,6 +824,45 @@ class _NotesJob:
 
     id: int
     force: bool
+
+
+@dataclass
+class _CompactJob:
+    """One queued compaction (2026-10-06): fold the text that fell out of `scope`'s transcript
+    window into that scope's running summary. `scope` is the checkpoint boundary the window was
+    cut for (None = the whole meeting, a perfectly valid scope). `attempts` counts the times this
+    scope's compaction yielded to a live answer and was re-queued (see `_lane_cancel`)."""
+
+    id: int
+    scope: int | None
+    attempts: int = 0
+    #: A user-driven ``compact()`` (not an overflow): its summary is installed ACTIVELY the moment
+    #: it finishes (one prefix re-evaluation), because the forced drop already moved the anchor, so
+    #: there is no imminent natural anchor move to fold a merely *staged* summary into.
+    force: bool = False
+
+
+@dataclass
+class _DigestJob:
+    """One queued document digest (2026-10-06): the catalogue entry for a reference document.
+    `attempts` as for `_CompactJob`."""
+
+    id: int
+    doc_id: str
+    attempts: int = 0
+
+
+@dataclass
+class _Prepared:
+    """Everything one assist attempt needs: the prompt, its budget, and (for every kind but
+    "explain", whose prompt carries no transcript) the context bundle it was assembled from."""
+
+    system: str
+    user: str
+    max_tokens: int
+    assistant_prefix: str | None
+    temperature: float | None
+    bundle: ContextBundle | None
 
 
 @dataclass
@@ -421,12 +891,31 @@ class Assistant:
         client: LMStudioClient,
         transcript: Transcript,
         clock: Callable[[], float],
+        context: ContextManager | None = None,
+        tools: Any = None,
     ) -> None:
         self._cfg = cfg
         self._bus = bus
         self._client = client
         self._transcript = transcript
         self._clock = clock
+        #: 2026-10-07 (capabilities): the `exocortex.capabilities.ToolRunner` (duck-typed: `wants`,
+        #: `specs`, `budget`, `run`, `map_text`). `None` -> no job ever gets tools, and every prompt
+        #: and request is exactly what it was before the capabilities existed.
+        self._tools = tools
+        #: 2026-10-06: the context library + dynamic window. `None` -> a private, in-memory
+        #: manager (no documents, the anchored window only), so every pre-existing caller and test
+        #: that builds an `Assistant` with the old five arguments keeps working.
+        self._context: ContextManager = (
+            context if context is not None else ContextManager(cfg, ContextStore(None), transcript)
+        )
+        #: Bumped by `reset()`: a compaction that was already running when the session was reset
+        #: must not write its summary into the NEW session (see `_run_compact_job`).
+        self._session_epoch = 0
+        self._epoch_lock = threading.Lock()
+        #: The document id a digest job is running for (`_kick_digests` skips it).
+        self._digest_running: str | None = None
+        self._digest_lock = threading.Lock()
 
         self._job_ids = itertools.count(1)
         self._assist_slot: _JobSlot[_AssistJob] = _JobSlot()      # main lane: auto/manual/ask/screen
@@ -438,6 +927,12 @@ class Assistant:
         self._dashboard_slot: _JobSlot[_AssistJob] = _JobSlot()   # dashboard lane: a refresh of the tracked board (exocortex.dashboard)
         self._complete_slot: _JobSlot[_AssistJob] = _JobSlot()    # completion lane: inline completions (lowest priority)
         self._notes_slot: _JobSlot[_NotesJob] = _JobSlot()
+        #: Notes lane, below notes: the compaction of what fell out of the transcript window and
+        #: the digest of an uploaded document. One queued job each, latest wins -- what a replaced
+        #: job would have done is never lost (the window keeps the dropped text pending; an
+        #: undigested document stays "pending" in the store and `_kick_digests` finds it again).
+        self._compact_slot: _JobSlot[_CompactJob] = _JobSlot()
+        self._digest_slot: _JobSlot[_DigestJob] = _JobSlot()
 
         self._current_job: _AssistJob | None = None
         self._current_lock = threading.Lock()
@@ -467,6 +962,15 @@ class Assistant:
         self._screen_provider: Callable[[], str] | None = None
         self._last_screen_text = ""
         self._screen_text_lock = threading.Lock()
+        #: 2026-10-29 (multi-file tasks): the task's workspace -- the files / panes seen since the
+        #: checkpoint (`exocortex.workspace`), fed from every changed screen event; a Code / Text job
+        #: gets the OTHER views as its <workspace> block. `_screen_refresh` reads the screen afresh
+        #: for a job that asks for it (`read_now`); the title / process of the latest capture name a
+        #: view (the file in an editor's title).
+        self._workspace = Workspace()
+        self._screen_refresh: Callable[[], bool] | None = None
+        self._last_screen_title = ""
+        self._last_screen_process = ""
 
         #: Auto-suggest throttle state, updated when a suggest job STARTS (see
         #: `_record_suggest_start`), not merely when one is submitted/queued.
@@ -497,11 +1001,11 @@ class Assistant:
         #: Dashboard mode (exocortex.dashboard, 2026-10-20): the DashboardService's hooks that
         #: BUILD a "dashboard" job's prompt from its store and SETTLE the result (None = no
         #: dashboard wired: `dashboard_now` refuses, and the Notes-tab insights passes run as
-        #: before). And the on-demand context provider (exocortex.context.provider) that adds the
+        #: before). And the project context (exocortex.project.provider) that adds the
         #: installed toolkit's catalog and repository lookups to the other kinds' prompts.
         self._dashboard_build: Callable[..., tuple[str, str, int]] | None = None
         self._dashboard_settle: Callable[..., None] | None = None
-        self._context_provider: Any = None
+        self._project: Any = None
 
         self._auto_enabled = cfg.assist.auto_answer_questions
         #: Global pause for all *automatic* assist activity (auto-answer, screen questions,
@@ -532,6 +1036,13 @@ class Assistant:
 
         self._sub_queue: "queue.Queue[Any] | None" = None
         self._stop_event = threading.Event()
+        #: 2026-10-06: set while an assist job runs (and by stop()); a compaction / digest streams
+        #: with it as its cancel token so a live answer never shares the GPU with background work
+        #: -- measured: a compaction running beside an answer took its first token from 0.3 s to
+        #: 4.9 s. The yielded job hands its text back and re-queues itself; after
+        #: `_LANE_YIELD_ATTEMPTS` yields it runs to completion regardless (completion mode fires a
+        #: job every second or two, so an unbounded yield would starve the lane).
+        self._lane_yield = threading.Event()
         self._threads: list[threading.Thread] = []
 
     # ---- lifecycle ---------------------------------------------------------
@@ -542,9 +1053,12 @@ class Assistant:
             log.warning("assistant: start() called while already running; stopping first")
             self.stop()
         self._stop_event.clear()
+        self._lane_yield.clear()
         for slot in self._assist_slots():
             slot.reopen()
         self._notes_slot.reopen()
+        self._compact_slot.reopen()
+        self._digest_slot.reopen()
         with self._insights_lock:
             # The first background insights pass waits one full interval: a few opening sentences
             # are not worth a model call, and on-demand insights work from the first second.
@@ -566,6 +1080,7 @@ class Assistant:
         """Cancel any running job, stop every thread and timer, and unsubscribe from the bus."""
         self.cancel()
         self._stop_event.set()
+        self._lane_yield.set()          # aborts a streaming compaction / digest too
         with self._coalesce_lock:
             # Bump the generation first so a coalesce callback that is already past its own
             # generation check (the threading.Timer.cancel() race -- see _fire_auto) still
@@ -580,6 +1095,8 @@ class Assistant:
         for slot in self._assist_slots():
             slot.close()
         self._notes_slot.close()
+        self._compact_slot.close()
+        self._digest_slot.close()
         for t in self._threads:
             t.join(timeout=5.0)
             if t.is_alive():
@@ -608,6 +1125,24 @@ class Assistant:
         """Enqueue a notes regeneration job. With `force=False` the worker may skip it (too
         little new speech since the last pass); `force=True` always regenerates."""
         self._notes_slot.put(_NotesJob(id=next(self._job_ids), force=force))
+
+    @property
+    def context(self) -> ContextManager:
+        """The context manager this assistant builds its prompts with (2026-10-06): the document
+        store, the anchored transcript window and the token estimator."""
+        return self._context
+
+    def digest_document(self, doc_id: str) -> None:
+        """Queue the model-written digest of a reference document (2026-10-06).
+
+        Runs on the notes lane (:meth:`_next_notes_job`), never on the answer lane, one document at
+        a time: the slot holds one queued job and a newer call replaces it, but a replaced
+        document is still "pending" in the store, so when the running digest finishes the worker
+        queues the next pending one itself (`_kick_digests`) -- adding five files at once digests
+        all five, in turn. The job stores the digest with `ContextStore.set_digest` and publishes
+        `ContextLibraryEvent(reason="digest", doc_id=...)`. A no-op for an unknown document.
+        """
+        self._digest_slot.put(_DigestJob(id=next(self._job_ids), doc_id=doc_id))
 
     def cancel(self) -> None:
         """Cancel the running assist job (if any) and drop any queued assist job."""
@@ -678,6 +1213,18 @@ class Assistant:
         """
         self._screen_provider = fn
 
+    def set_screen_refresh(self, fn: Callable[[], bool] | None) -> None:
+        """2026-10-29: register (or clear) the function a Code / Text job calls to read the screen
+        afresh before building its prompt (`Engine._refresh_screen`: `ScreenReader.capture_and_wait`),
+        returning whether the read completed in time. Called on the assist-worker thread, once per
+        job that asks (`read_now`), gated by `[screen].read_on_shortcut`."""
+        self._screen_refresh = fn
+
+    @property
+    def workspace(self) -> Workspace:
+        """The task's workspace (the views seen since the checkpoint) -- status and tests."""
+        return self._workspace
+
     def suggest_now(self, focus: str = "") -> None:
         """Generate proactive suggestions from the current screen text + recent transcript now.
 
@@ -701,11 +1248,13 @@ class Assistant:
             return
         self._enqueue_side_job("solve", focus=focus, screen_lines=None)
 
-    def code(self, focus: str = "", label: str = "") -> int:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now (kind "code", the Code button). Returns the job id.
         `label`, when given, is what the Assist tab / history show as the question instead of
-        `focus` (hands-free mode passes a long instruction as `focus`).
+        `focus` (hands-free mode passes a long instruction as `focus`). `fresh` (2026-10-29, the
+        "Code from scratch" gesture) makes the prompt ignore the code already written on screen,
+        whatever `[assist].consider_given_code` says.
 
         Runs on the same side lane as `suggest`/`solve` -- it never cancels a running main-lane
         (auto/manual/ask/screen) job -- but a new "suggest"/"solve"/"code" job cancels a running
@@ -713,9 +1262,12 @@ class Assistant:
         while paused (see `exocortex.actions.EngineActions.code`). `focus` is an optional extra
         instruction; blank falls back to `prompts.user_code`'s default ask.
         """
-        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label)
+        # 2026-10-29: `read_now` (default) reads the screen the moment the job starts -- the file the
+        # user is on when the shortcut fires -- see `_screen_text_for_job`.
+        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label, fresh=fresh,
+                                      read_now=read_now)
 
-    def text(self, focus: str = "", label: str = "") -> int:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int:
         """Walk through, in plain English, the task discussed (transcript since the last checkpoint)
         and/or shown on screen, right now (kind "text", the Text button): what is asked, the key
         insight, the approach step by step, the edge cases and the complexity -- or, for a
@@ -731,7 +1283,7 @@ class Assistant:
         the auto-solve throttle. `focus` is an optional extra instruction; blank falls back to
         `prompts.user_text`'s default ask; `label` as for `code()`.
         """
-        return self._enqueue_side_job("text", focus=focus, screen_lines=None, label=label)
+        return self._enqueue_side_job("text", focus=focus, screen_lines=None, label=label, read_now=read_now)
 
     def recap(self, focus: str = "") -> int:
         """Recap the session right now (kind "recap", the Recap action): the goal, what is done,
@@ -863,20 +1415,20 @@ class Assistant:
         except Exception:  # noqa: BLE001 - the service's own bug must never kill the worker
             log.exception("assistant: dashboard settle hook failed for job %d", job.id)
 
-    # ---- on-demand context (exocortex.context, 2026-10-20) ------------------------------------
+    # ---- on-demand context (exocortex.project, 2026-10-20) ------------------------------------
 
-    def set_context_provider(self, provider: Any) -> None:
-        """Register (or with None, clear) the `exocortex.context.provider.ContextProvider` whose
+    def set_project_context(self, provider: Any) -> None:
+        """Register (or with None, clear) the `exocortex.project.provider.ProjectContext` whose
         `toolkit_block()` joins the system prompt of answers and `repo_block()` /
         `toolkit_lookup()` the user turn (`_TOOLKIT_KINDS` / `_LOOKUP_KINDS`). Called on the
         assist-worker thread once per job, never from here."""
-        self._context_provider = provider
+        self._project = provider
 
     def _toolkit_system_suffix(self, kind: str) -> str:
         """The <toolkit> catalog (with its standing rule) to append to a system prompt, or ""."""
-        provider = self._context_provider
-        context_cfg = getattr(self._cfg, "context", None)
-        if provider is None or kind not in _TOOLKIT_KINDS or not getattr(context_cfg, "toolkit_in_answers", False):
+        provider = self._project
+        project_cfg = getattr(self._cfg, "project", None)
+        if provider is None or kind not in _TOOLKIT_KINDS or not getattr(project_cfg, "toolkit_in_answers", False):
             return ""
         try:
             block = provider.toolkit_block() or ""
@@ -885,22 +1437,22 @@ class Assistant:
             return ""
         return f"\n{prompts.TOOLKIT_RULE}\n{block}" if block.strip() else ""
 
-    def _context_extra(self, job: _AssistJob, window: str, screen_text: str) -> str:
+    def _project_extra(self, job: _AssistJob, window: str, screen_text: str) -> str:
         """The on-demand blocks for a user turn: lines from the repository matching the names
         the question / recent transcript / screen mention, and the full text of a toolkit part
         that was mentioned. "" when there is no provider, nothing to look up or nothing found."""
-        provider = self._context_provider
+        provider = self._project
         if provider is None or job.kind not in _LOOKUP_KINDS:
             return ""
-        tail = window[-600:] if window else ""
-        context_cfg = getattr(self._cfg, "context", None)
+        tail = window[-_LOOKUP_TAIL_CHARS:] if window else ""
+        project_cfg = getattr(self._cfg, "project", None)
         try:
             repo = provider.repo_block(job.question, job.focus, tail, screen_text, time_budget_s=_LOOKUP_BUDGET_S) or ""
             detail = ""
-            if getattr(context_cfg, "toolkit_in_answers", False):
+            if getattr(project_cfg, "toolkit_in_answers", False):
                 detail = provider.toolkit_lookup(job.question, job.focus, tail) or ""
         except Exception:  # noqa: BLE001
-            log.exception("assistant: context lookup failed for job %d", job.id)
+            log.exception("assistant: project lookup failed for job %d", job.id)
             return ""
         return "\n\n".join(part for part in (repo.strip(), detail.strip()) if part)
 
@@ -955,15 +1507,59 @@ class Assistant:
         with self._answers_lock:
             answers = len(self._answers)
         with self._checkpoint_lock:
+            old_seg_id = self._checkpoint_seg_id
             self._checkpoint_seg_id = seg_id
             self._checkpoint_answers = answers
             self._checkpoint_time = t
             self._code_answers = []
+        self._workspace.reset()      # 2026-10-29: the next capture starts the next task's workspace
+        if old_seg_id is not None and old_seg_id != seg_id:
+            # The window's anchor / pending compaction of the OLD checkpoint scope will never be
+            # used again (the whole-meeting scope, None, is the ask box's and stays).
+            try:
+                self._context.window.forget_scope(old_seg_id)
+            except Exception:  # noqa: BLE001 - context bookkeeping must never break a checkpoint
+                log.exception("assistant: forgetting the old checkpoint's context scope failed")
         with self._plan_lock:
             self._plan = None
             self._plan_parsed = None
         self._bus.publish(CheckpointEvent(t=t, segment_id=seg_id))
         log.info("assistant: checkpoint set (segment %s, %d answer(s) so far)", seg_id, answers)
+
+    def compact(self) -> int:
+        """Compact the context window *now* (the overlay's "Compact" control, like the
+        ``/compact`` command): fold everything but the newest couple of lines of the whole-meeting
+        transcript window into its running summary straight away, instead of waiting for the
+        window to overflow.
+
+        The whole-meeting scope (``None``) is used on purpose: it is what the spoken/typed/on-screen
+        answers (auto, manual, ask, screen) build on, and what the Monitor's summary readout shows,
+        and it is the scope that grows across a long meeting. The checkpoint-scoped coding context
+        (``code`` / ``solve`` / ``text``) is already bounded to the post-checkpoint transcript, and
+        Checkpoint is its reset; compacting it here would leave the broad transcript untouched,
+        which is the opposite of what Compact is for.
+
+        The drop is immediate (the next prompt is already shorter); the summary of the dropped text
+        is produced by a compaction job on the notes lane (so it never competes with a live answer)
+        and, because the drop already moved the anchor, that job installs its summary ACTIVELY the
+        moment it finishes rather than staging it for a future anchor move -- otherwise the dropped
+        speech would be missing from every prompt AND its summary withheld until the next natural
+        overflow. Returns the transcript characters folded (0 = nothing to compact, or
+        ``[context].compaction`` is off -- with compaction off the window is left untouched rather
+        than silently discarding the transcript)."""
+        if self._cfg.context.compaction != "summary":
+            log.info("assistant: compact requested but [context].compaction is off; nothing folded")
+            return 0
+        scope = None   # the whole meeting (see the docstring)
+        try:
+            dropped = self._context.window.compact_now(scope)
+        except Exception:  # noqa: BLE001 - context bookkeeping must never break a user action
+            log.exception("assistant: forced compaction of scope %s failed", scope)
+            return 0
+        if dropped > 0:
+            self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=scope, force=True))
+            log.info("assistant: forced compaction queued (scope %s, %d chars folded)", scope, dropped)
+        return dropped
 
     def _checkpoint_boundary(self) -> int | None:
         """Transcript segment id the current checkpoint starts after (`None` = no checkpoint yet:
@@ -1221,6 +1817,18 @@ class Assistant:
         self.cancel()
         for slot in self._assist_slots():
             slot.clear()
+        self._compact_slot.clear()
+        with self._epoch_lock:
+            # The bump and the window reset happen under ONE lock, and a compaction job reads the
+            # epoch and claims its text under the same lock: a job either saw the old epoch with
+            # the old window (and is dropped as stale when it finishes) or the new epoch with the
+            # cleared window (nothing to claim) -- never the new epoch with the old session's text
+            # (review, 2026-10-06).
+            self._session_epoch += 1
+            try:
+                self._context.reset_session()   # anchors, summaries, pending compactions; documents stay
+            except Exception:  # noqa: BLE001 - context bookkeeping must never break a reset
+                log.exception("assistant: resetting the context window failed")
         with self._coalesce_lock:
             self._coalesce_generation += 1
             timer, self._coalesce_timer = self._coalesce_timer, None
@@ -1254,6 +1862,7 @@ class Assistant:
             self._checkpoint_answers = 0
             self._checkpoint_time = None
             self._code_answers = []
+        self._workspace.reset()
         log.info("assistant: reset")
 
     # ---- assist-worker ---------------------------------------------------------
@@ -1275,7 +1884,7 @@ class Assistant:
 
     def _enqueue_side_job(
         self, kind: AssistKind, *, focus: str, screen_lines: tuple[str, ...] | None,
-        plan_id: int | None = None, label: str = "",
+        plan_id: int | None = None, label: str = "", fresh: bool = False, read_now: bool = False,
     ) -> int:
         """Queue a side-lane ("suggest"/"solve"/"code"), text-lane ("text") or explain-lane
         ("explain") job. Cancels only a running job that the new kind supersedes (`_CANCELS`); a
@@ -1286,10 +1895,13 @@ class Assistant:
             "text": "the task being discussed", "explain": "Explanation",
             "recap": "Recap of the session so far",
         }.get(kind, "Suggestions")
+        if fresh and kind == "code":
+            default_label += " \u00b7 from scratch"
         display_question = label.strip() or focus.strip() or default_label
         job = _AssistJob(
             id=next(self._job_ids), kind=kind, question=display_question,
             cancel=threading.Event(), focus=focus, screen_lines=screen_lines, plan_id=plan_id,
+            fresh=bool(fresh and kind == "code"), read_now=bool(read_now and kind in ("code", "text")),
         )
         self._cancel_running_of(_CANCELS.get(kind, ()))
         self._preempt_auto_insights()
@@ -1322,6 +1934,7 @@ class Assistant:
                 return
             with self._current_lock:
                 self._current_job = job
+            self._lane_yield.set()          # background lane jobs step aside for an answer
             try:
                 self._run_assist_job(job)
             except Exception:  # pragma: no cover - safety net; _run_assist_job handles its own errors
@@ -1330,6 +1943,8 @@ class Assistant:
                 with self._current_lock:
                     if self._current_job is job:
                         self._current_job = None
+                if not self._stop_event.is_set():
+                    self._lane_yield.clear()
 
     def _next_assist_job(self) -> _AssistJob | None:
         """Block until a job is ready, taking the highest-priority lane that has one (main, then
@@ -1394,26 +2009,10 @@ class Assistant:
         # "solve"/"code"/"text"/"complete" see only the transcript since the last checkpoint (or
         # the whole session with none set yet); every other kind (notably "ask") keeps the full window.
         since_id = self._checkpoint_boundary() if job.kind in ("solve", "code", "text", "complete") else None
-        window = self._transcript.window_text(self._cfg.llm.context_tokens * 4, until_id=until_id, since_id=since_id)
-        assistant_prefix: str | None = None
-        temperature: float | None = None
         choices, choices_on_screen = self._detect_choices(job, screen_text)
         try:
-            if job.kind == "complete":
-                system, user, max_tokens, assistant_prefix, temperature = self._complete_prompt_parts(job, window, screen_text)
-            else:
-                # The annotated copies exist only for the prompt: every screen-line fingerprint (plan
-                # matching, suggest throttling, screen-question de-dup) keeps comparing raw OCR text.
-                prompt_screen, prompt_question = screen_text, job.question
-                if choices is not None:
-                    if choices_on_screen:
-                        prompt_screen = annotate_choices(screen_text, choices)
-                    else:
-                        prompt_question = annotate_choices(job.question, choices)
-                system, user, max_tokens = self._build_prompt_parts(
-                    job, window, prompt_screen, choices, prompt_question, until_id=until_id,
-                )
-        except Exception as exc:  # noqa: BLE001 - a prompt that cannot be built (a dashboard / context
+            prepared = self._prepare(job, screen_text, choices, choices_on_screen, since_id, until_id)
+        except Exception as exc:  # noqa: BLE001 - a prompt that cannot be built (a dashboard / project
             # hook raising) is this job's error, never a dead worker or a job without its Done
             log.error("assist job %d (%s): building the prompt failed: %s", job.id, job.kind, exc, exc_info=True)
             self._settle_plan_state(job, is_plan, "", keep=False)
@@ -1421,6 +2020,7 @@ class Assistant:
             self._settle_dashboard(job, ok=False)
             self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
             return
+        self._publish_usage(job, prepared.bundle)
 
         start_wall = time.monotonic()
         delta_count = 0
@@ -1435,29 +2035,62 @@ class Assistant:
                 self._plan_delta(job.id, text)   # the completer follows the plan while it streams
             self._bus.publish(AssistDeltaEvent(job_id=job.id, delta=text))
 
-        try:
-            extra = None
-            if job.kind == "complete" and self._cfg.completion.repeat_penalty and self._cfg.completion.repeat_penalty != 1.0:
-                extra = {"repeat_penalty": float(self._cfg.completion.repeat_penalty)}
-            text = self._stream_text(
-                system, user, max_tokens=max_tokens, cancel=job.cancel, on_delta=on_delta,
-                assistant_prefix=assistant_prefix, temperature=temperature, extra_body=extra,
-            )
-        except LLMError as exc:
-            log.error("assist job %d (%s) failed: %s", job.id, job.kind, exc, exc_info=True)
-            self._settle_plan_state(job, is_plan, "", keep=False)
-            self._settle_insights(job, ok=False)
-            self._settle_dashboard(job, ok=False)
-            self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
-            self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
-            return
-        except Exception as exc:  # noqa: BLE001 - surface any bug as a job error, never kill the worker
-            log.error("assist job %d (%s) failed unexpectedly: %s", job.id, job.kind, exc, exc_info=True)
-            self._settle_plan_state(job, is_plan, "", keep=False)
-            self._settle_insights(job, ok=False)
-            self._settle_dashboard(job, ok=False)
-            self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
-            return
+        retried = False
+        while True:
+            try:
+                text, sent_chars, stats = self._stream_answer(job, prepared, on_delta)
+                break
+            except LLMError as exc:
+                if (
+                    not retried and prepared.bundle is not None and delta_count == 0
+                    and job.tools_used == 0      # a tool that already ran must never run twice
+                    and not job.cancel.is_set() and _OVERFLOW_RE.search(str(exc))
+                ):
+                    # 2026-10-06: the server says the prompt did not fit its context -- the
+                    # estimate was too optimistic. Shrink the estimator (note_overflow), rebuild
+                    # the prompt with the smaller budgets and stream ONCE more; Started was
+                    # already published and is not repeated, a second failure is reported below
+                    # exactly as before. Only before the first delta: a stream that already
+                    # produced text must not restart under the reader.
+                    retried = True
+                    log.warning("assist job %d (%s): prompt overflowed the server's context (%s); "
+                                "rebuilding smaller and retrying once", job.id, job.kind, exc)
+                    self._note_overflow()
+                    try:
+                        prepared = self._prepare(job, screen_text, choices, choices_on_screen, since_id, until_id)
+                    except Exception as prep_exc:  # noqa: BLE001 - the retry must end in Done/Error like any job
+                        log.error("assist job %d (%s): rebuilding the prompt failed: %s", job.id, job.kind,
+                                  prep_exc, exc_info=True)
+                        self._settle_plan_state(job, is_plan, "", keep=False)
+                        self._settle_insights(job, ok=False)
+                        self._settle_dashboard(job, ok=False)
+                        self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(prep_exc)))
+                        return
+                    self._publish_usage(job, prepared.bundle)
+                    continue
+                log.error("assist job %d (%s) failed: %s", job.id, job.kind, exc, exc_info=True)
+                self._settle_plan_state(job, is_plan, "", keep=False)
+                self._settle_insights(job, ok=False)
+                self._settle_dashboard(job, ok=False)
+                self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
+                self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
+                return
+            except _NoAnswerError as exc:
+                # The tool loop's own verdict (not a server failure): the calls ran, nothing was written.
+                log.warning("assist job %d (%s): %s", job.id, job.kind, exc)
+                self._settle_plan_state(job, is_plan, "", keep=False)
+                self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
+                return
+            except Exception as exc:  # noqa: BLE001 - surface any bug as a job error, never kill the worker
+                log.error("assist job %d (%s) failed unexpectedly: %s", job.id, job.kind, exc, exc_info=True)
+                self._settle_plan_state(job, is_plan, "", keep=False)
+                self._settle_insights(job, ok=False)
+                self._settle_dashboard(job, ok=False)
+                self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
+                return
+
+        self._finish_usage(job, prepared, stats, sent_chars)
+        self._queue_compaction(prepared.bundle)
 
         if not job.cancel.is_set() and prompts.is_skip(text):
             # The model found nothing technical to do (a poll, chrome, small talk): drop it quietly.
@@ -1470,7 +2103,6 @@ class Assistant:
                                               cancelled=True, skipped=True))
             return
 
-        stats = self._client.last_stats
         cancelled = job.cancel.is_set()
         if stats is not None:
             ttft_s, tokens, tok_per_s, cancelled = stats.ttft_s, stats.tokens, stats.tok_per_s, cancelled or stats.cancelled
@@ -1479,6 +2111,19 @@ class Assistant:
             ttft_s = (first_delta_wall - start_wall) if first_delta_wall is not None else elapsed
             tokens = delta_count
             tok_per_s = tokens / elapsed
+
+        # 2026-10-29: a Code answer is plain code only (`[assist].code_only`): prose and the complexity
+        # line become comments inside the one block, markdown inside it becomes comments too; with
+        # explanations on, only the inside of the block changes (the plan shape is kept).
+        if not cancelled and job.kind == "code" and self._cfg.assist.code_only and text.strip():
+            try:
+                cleaned = codeformat.code_only(text, explain=is_plan, language=self._cfg.assist.primary_language)
+            except Exception:  # noqa: BLE001 - a formatting bug must never lose an answer
+                log.exception("assist job %d: code-only formatting failed", job.id)
+                cleaned = text
+            if cleaned != text:
+                log.info("assist job %d: code answer normalised to code only", job.id)
+                text = cleaned
 
         # The multiple-choice verdict line goes to the bus and the history only; the plan (what
         # the completer offers as ghost text) keeps the raw answer.
@@ -1511,6 +2156,83 @@ class Assistant:
                     self._answers.append(entry)
                 if job.kind in ("solve", "code"):
                     self._append_code_answer(job, entry)
+
+    # ---- context bookkeeping around a job (2026-10-06) -----------------------------------
+
+    def _publish_usage(self, job: _AssistJob, bundle: ContextBundle | None) -> None:
+        """Publish the estimate half of a job's `ContextUsageEvent` (the bundle's own, stamped with
+        the job id) right after its prompt was built. Nothing for "explain" (no bundle)."""
+        if bundle is None:
+            return
+        self._bus.publish(dataclasses.replace(bundle.usage, job_id=job.id))
+
+    def _sent_chars(self, system: str, user: str, assistant_prefix: str | None) -> int:
+        """The characters actually sent for a prompt, mirroring `_stream_text`'s choice of path:
+        the rendered ChatML for a raw completion, system + user for a chat request. This is the
+        text the server counted `prompt_tokens` for, so it is what the estimator calibrates on."""
+        if assistant_prefix is not None:
+            return len(prompts.render_chatml(system, user, assistant_prefix))
+        if self._cfg.llm.thinking == "on":
+            return len(system) + len(user)
+        return len(prompts.render_chatml(system, user, prompts.NO_THINK_PREFIX))
+
+    def _observe_prompt(self, sent_chars: int, stats: Any) -> None:
+        """Calibrate the context manager's chars-per-token estimate from the server's own count
+        for the request that just finished (a no-op when the client reported none)."""
+        tokens = getattr(stats, "prompt_tokens", None)
+        if tokens is None:
+            return
+        try:
+            self._context.observe_prompt(sent_chars, tokens)
+        except Exception:  # noqa: BLE001 - calibration must never break a job
+            log.exception("assistant: calibrating the token estimate failed")
+
+    def _finish_usage(
+        self, job: _AssistJob, prepared: _Prepared, stats: Any, sent_chars: int | None = None,
+    ) -> None:
+        """After the stream: calibrate from the server's count and publish the second
+        `ContextUsageEvent` of the job -- the same estimates plus `prompt_tokens` / `cached_tokens`
+        as the server reported them (None when it did not) and the post-calibration
+        chars-per-token -- and hand it to the manager (`record_usage`, what the Models window's
+        usage panel reads back). `sent_chars` (the tool loop's) is the size of the LAST request
+        sent -- the one `stats.prompt_tokens` counts; None = the prepared prompt, as before."""
+        if sent_chars is None:
+            sent_chars = self._sent_chars(prepared.system, prepared.user, prepared.assistant_prefix)
+        self._observe_prompt(sent_chars, stats)
+        bundle = prepared.bundle
+        if bundle is None:
+            return
+        try:
+            cpt = float(self._context.estimator.chars_per_token)
+        except Exception:  # noqa: BLE001
+            cpt = bundle.usage.chars_per_token
+        final = dataclasses.replace(
+            bundle.usage, job_id=job.id,
+            prompt_tokens=getattr(stats, "prompt_tokens", None),
+            cached_tokens=getattr(stats, "cached_tokens", None),
+            chars_per_token=cpt,
+        )
+        self._bus.publish(final)
+        try:
+            self._context.record_usage(final)
+        except Exception:  # noqa: BLE001
+            log.exception("assistant: recording the context usage failed")
+
+    def _note_overflow(self) -> None:
+        """Tell the estimator the server found a prompt too long (guarded)."""
+        try:
+            self._context.note_overflow()
+        except Exception:  # noqa: BLE001
+            log.exception("assistant: noting a context overflow failed")
+
+    def _queue_compaction(self, bundle: ContextBundle | None) -> None:
+        """Queue the compaction of what fell out of the transcript window, when the bundle says so
+        (`compact_wanted`, which already accounts for `[context].compaction`). Queued AFTER the
+        answer is done so the summary job never competes with the answer for the model; latest
+        wins in its slot, and the dropped text stays pending in the window until a job claims it."""
+        if bundle is None or not bundle.compact_wanted or self._cfg.context.compaction != "summary":
+            return
+        self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=bundle.compact_scope))
 
     def _settle_plan_state(self, job: _AssistJob, is_plan: bool, text: str, *, keep: bool) -> None:
         """Record how a plan-related job ended: a solve that is the plan is finished (or, when
@@ -1575,101 +2297,311 @@ class Assistant:
         log.info("assist job %d (%s): multiple-choice verdict %r", job.id, job.kind, last)
         return final
 
-    def _build_prompt_parts(
-        self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
-        question: str | None = None, until_id: int | None = None,
-    ) -> tuple[str, str, int]:
-        """System/user prompt text and the token budget for one job.
+    # ---- prompt assembly (2026-10-06: the context manager sizes every block) ------------
+
+    def _prepare(
+        self, job: _AssistJob, screen_text: str, choices: ChoiceSet | None, choices_on_screen: bool,
+        since_id: int | None, until_id: int | None,
+    ) -> _Prepared:
+        """Assemble one job's prompt: the system prompt first (its size is part of the budget),
+        then the context bundle (`ContextManager.build`: anchored transcript window, reference /
+        lookup blocks, earlier summary, screen text, all fitted to the server's context for this
+        job's answer budget), then the user turn. Called a second time, with a smaller estimate,
+        by the overflow retry. "explain" prompts carry no transcript and skip the manager.
 
         A "dashboard" job's prompt comes from the dashboard service's hook (`_dashboard_prompt`:
-        the board's open items, the transcript up to `until_id`, the context lookups). Every
-        other kind is built by `_build_prompt_parts_base` and then, through the context
-        provider (2026-10-20): the installed toolkit's catalog is appended to the system prompt
-        (`_toolkit_system_suffix`, config-stable, so it stays a cached prefix) and the on-demand
-        repository / toolkit-detail lookups go into the user turn (`_context_extra`).
-        """
+        the board's open items, the transcript up to `until_id`, the project lookups) and skips
+        the manager as well. For the other kinds the project context (2026-10-20) appends the
+        installed toolkit's catalog to the system prompt (`_toolkit_system_suffix`, config-stable,
+        so it stays a cached prefix) and puts the on-demand repository / toolkit-detail lookups
+        in the user turn (`_project_extra`), which the manager budgets as fixed text."""
+        if job.kind == "complete":
+            return self._prepare_complete(job, screen_text, since_id, until_id)
         if job.kind == "dashboard":
-            return self._dashboard_prompt(job, screen_text, until_id)
-        extra = self._context_extra(job, window, screen_text)
-        system, user, max_tokens = self._build_prompt_parts_base(job, window, screen_text, choices, question, extra=extra)
-        suffix = self._toolkit_system_suffix(job.kind)
-        return (system + suffix if suffix else system), user, max_tokens
-
-    def _build_prompt_parts_base(
-        self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
-        question: str | None = None, extra: str = "",
-    ) -> tuple[str, str, int]:
-        """System/user prompt text and the token budget for one job (every kind but "dashboard").
-
-        `choices` (a detected multiple-choice option set) adds the <choices> block to the
-        question-answering prompts and `CHOICES_TOKEN_HEADROOM` to their budget, so the verdict
-        line never has to compete with the answer's own shape for tokens; `question` replaces
-        `job.question` in the prompt (its annotated copy) and defaults to it; `extra` is the
-        on-demand context the user turn carries after the screen block (`prompts._extra_block`).
-        """
+            system, user, max_tokens = self._dashboard_prompt(job, screen_text, until_id)
+            return _Prepared(system, user, max_tokens, None, None, None)
+        # The annotated copies exist only for the prompt: every screen-line fingerprint (plan
+        # matching, suggest throttling, screen-question de-dup) keeps comparing raw OCR text.
+        prompt_screen, prompt_question = screen_text, job.question
+        if choices is not None:
+            if choices_on_screen:
+                prompt_screen = annotate_choices(screen_text, choices)
+            else:
+                prompt_question = annotate_choices(job.question, choices)
+        system = self._system_for(job, choices) + self._toolkit_system_suffix(job.kind)
+        max_tokens = self._max_tokens_for(job, choices)
+        if job.kind == "explain":
+            user = self._user_for(job, "", prompt_screen, choices, prompt_question)
+            return _Prepared(system, user, max_tokens, None, None, None)
+        previous = self._previous_for(job)
         block = choices_block(choices) if choices is not None else ""
-        headroom = CHOICES_TOKEN_HEADROOM if choices is not None else 0
-        q = job.question if question is None else question
+        spoken = job.kind in ("auto", "manual", "ask", "screen")
+        tail = self._transcript.window_text(_LOOKUP_TAIL_CHARS, until_id=until_id, since_id=since_id)
+        extra = self._project_extra(job, tail, prompt_screen)
+        # The characters of the user turn that are not a context block (the manager budgets the
+        # rest): the ask / question / focus, the <choices> block, the <previous> code (or the
+        # insights' lists, the recap's notes), the <workspace> block, the project lookups, the tags.
+        fixed = (200 + len(block) + len(previous) + len(job.workspace)
+                 + len(prompt_question if spoken else job.focus) + len(extra))
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is not None:
+            # The room one tool result may take, and the <map> block: the transcript window is cut
+            # to leave them, so a result appended mid-answer still fits the server's context.
+            fixed += int(tool_ctx.budget.chars) + len(tool_ctx.map_text)
+        bundle = self._build_context(
+            job, question=self._lookup_question(job), screen_text=prompt_screen, since_id=since_id,
+            until_id=until_id, max_tokens=max_tokens, system=system, fixed_chars=fixed,
+        )
+        user = self._user_for(
+            job, bundle.transcript, bundle.screen, choices, prompt_question, previous=previous,
+            reference=bundle.reference, earlier=bundle.earlier, lookup=bundle.lookup, extra=extra,
+        )
+        return _Prepared(system, user, max_tokens, None, None, bundle)
+
+    def _prepare_complete(
+        self, job: _AssistJob, screen_text: str, since_id: int | None, until_id: int | None
+    ) -> _Prepared:
+        """`_prepare` for an inline completion: its extra blocks (answers, notes, the plan's
+        solution) and the typed prefix / suffix / field count against the budget as fixed text."""
+        cc = self._cfg.completion
+        inputs = self._complete_inputs(job)
+        system = self._complete_system()
+        fixed = 300 + len(job.prefix) + len(job.suffix) + len(job.field) + sum(len(v) for v in inputs.values())
+        bundle = self._build_context(
+            job, question=f"{job.field}\n{job.prefix[-300:]}", screen_text=screen_text, since_id=since_id,
+            until_id=until_id, max_tokens=cc.max_tokens, system=system, fixed_chars=fixed,
+        )
+        user = self._complete_user(job, bundle, inputs)
+        return _Prepared(system, user, cc.max_tokens, prompts.NO_THINK_PREFIX + job.prefix, cc.temperature, bundle)
+
+    def _build_context(
+        self, job: _AssistJob, *, question: str, screen_text: str, since_id: int | None,
+        until_id: int | None, max_tokens: int, system: str, fixed_chars: int,
+    ) -> ContextBundle:
+        """`ContextManager.build`, guarded: a bug there degrades to the pre-context behaviour (the
+        plain transcript window, no reference material, no compaction) instead of killing the
+        worker, and is logged."""
+        try:
+            return self._context.build(
+                kind=job.kind, question=question, screen_text=screen_text, since_id=since_id,
+                until_id=until_id, max_tokens=max_tokens, system_text=system, fixed_chars=fixed_chars,
+            )
+        except Exception:  # noqa: BLE001 - the worker must always get a prompt
+            log.exception("assist job %d (%s): context build failed; using the plain transcript window",
+                          job.id, job.kind)
+        window = self._transcript.window_text(self._cfg.llm.context_tokens * 4, until_id=until_id, since_id=since_id)
+        usage = ContextUsageEvent(job_id=job.id, kind=job.kind)
+        return ContextBundle(window, "", "", "", screen_text, usage, since_id, False, 0)
+
+    @staticmethod
+    def _lookup_question(job: _AssistJob) -> str:
+        """What the reference index searches for: the spoken / typed / on-screen question itself;
+        for the screen-driven kinds (whose `question` is only a display label) the user's own
+        focus text, which may be blank -- the manager adds the recent transcript and screen terms."""
+        if job.kind in ("suggest", "solve", "code", "text", "explain", "insights", "recap"):
+            return job.focus
+        return job.question
+
+    def _consider_given_code(self, job: _AssistJob) -> bool:
+        """2026-10-29: whether this job's prompt tells the model to work with the code already on
+        screen (`[assist].consider_given_code`, read live) -- never for a "fresh" code job, the
+        manual-advance "Code from scratch" gesture (the flag means nothing on any other kind)."""
+        fresh = bool(job.fresh) and job.kind == "code"
+        return bool(self._cfg.assist.consider_given_code) and not fresh
+
+    def _code_only(self, job: _AssistJob) -> bool:
+        """2026-10-29: whether this job's answer must be plain code (`[assist].code_only`, read live;
+        only a "code" job)."""
+        return job.kind == "code" and bool(self._cfg.assist.code_only)
+
+    def _system_for(self, job: _AssistJob, choices: ChoiceSet | None = None) -> str:
+        """The system prompt for `job`. `choices` is accepted for symmetry with the budget but does
+        not change it: the multiple-choice rule is worded conditionally ("If a <choices> block is
+        present ..."), so a system prompt never differs between turns (a stable KV-cache prefix).
+        `[assist].session_context` joins every one of them (config-only text, just as stable)."""
+        persona = self._cfg.assist.persona
         context = self._cfg.assist.session_context
+        # 2026-10-07 (capabilities): with tools for this job the rule + the <tools> block end the
+        # prompt; without, no keyword is passed and the builders render exactly what they always did.
+        tool_ctx = self._job_tools(job)
+        extra: dict[str, str] = {"tools": tool_ctx.block} if tool_ctx is not None else {}
         if job.kind == "ask":
-            system = prompts.system_ask(self._cfg.assist.persona, context)
-            user = prompts.user_ask(window, q, screen_text, block, extra=extra)
-            return system, user, self._cfg.llm.ask_max_tokens + headroom
-        if job.kind == "solve":
+            return prompts.system_ask(persona, context, **extra)
+        if job.kind in ("solve", "code"):
             ex = self._cfg.explain
             level = prompts.normalize_comment_level(self._cfg.assist.comments)
-            system = prompts.system_solve(
-                self._cfg.assist.persona, explain=ex.enabled, comments=level,
-                language=self._cfg.assist.primary_language,
+            kwargs: dict[str, Any] = dict(
+                explain=ex.enabled, comments=level, language=self._cfg.assist.primary_language,
                 libraries=self._cfg.assist.libraries, context=context,
+                consider_given_code=self._consider_given_code(job), **extra,
             )
-            user = prompts.user_solve(window, screen_text, job.focus, block, extra=extra)
-            return system, user, self._code_budget(ex.enabled, level) + headroom
-        if job.kind == "code":
-            ex = self._cfg.explain
-            level = prompts.normalize_comment_level(self._cfg.assist.comments)
-            system = prompts.system_code(
-                self._cfg.assist.persona, explain=ex.enabled, comments=level,
-                language=self._cfg.assist.primary_language,
-                libraries=self._cfg.assist.libraries, context=context,
-            )
-            user = prompts.user_code(window, screen_text, self._previous_code_text(), job.focus, extra=extra)
-            return system, user, self._code_budget(ex.enabled, level) + headroom
+            if job.kind == "solve":
+                return prompts.system_solve(persona, **kwargs)
+            # 2026-10-29: the <workspace> rule (static for a fixed config) and the code-only shape
+            return prompts.system_code(persona, workspace=bool(self._cfg.screen.workspace),
+                                       code_only=self._code_only(job), **kwargs)
         if job.kind == "text":
-            system = prompts.system_text(self._cfg.assist.persona, context)
-            user = prompts.user_text(window, screen_text, self._previous_code_text(), job.focus, extra=extra)
-            return system, user, self._cfg.llm.text_max_tokens
+            return prompts.system_text(persona, context, consider_given_code=self._consider_given_code(job),
+                                       workspace=bool(self._cfg.screen.workspace), **extra)
+        if job.kind == "explain":
+            return prompts.system_explain(persona, context)
+        if job.kind == "suggest":
+            return prompts.system_suggest(persona, context, **extra)
+        if job.kind == "insights":
+            a = self._cfg.assist
+            secs = job.sections or prompts.INSIGHT_SECTIONS
+            return prompts.system_insights(persona, a.role, secs, a.insight_max_items, context)
+        if job.kind == "recap":
+            return prompts.system_recap(persona, context)
+        # "auto", "manual", "screen"
+        return prompts.system_assist(persona, self._cfg.assist.style, context, **extra)
+
+    def _job_tools(self, job: _AssistJob) -> _JobTools | None:
+        """The tool loop's state for `job`, resolved on first use and kept on the job (None = this
+        job gets no tools): the runner must `wants` the kind, list at least one tool and allow at
+        least one call. The budget is taken ONCE, so the "At most N calls" line of the system
+        prompt, the prompt rebuilt by the overflow retry and the loop all see the same one. Never
+        for "complete" / "explain". A runner that raises means no tools, not a failed job."""
+        if job.tool_ctx_resolved:
+            return job.tool_ctx
+        job.tool_ctx_resolved = True
+        runner = self._tools
+        if runner is None or job.kind in _NO_TOOL_KINDS:
+            return None
+        try:
+            if not runner.wants(job.kind):
+                return None
+            specs = list(runner.specs(job.kind))
+            budget = runner.budget(job.kind)
+            block = prompts.tools_block(specs, max_calls=budget.calls_left)
+            if not block or budget.calls_left <= 0:
+                return None
+            map_text = self._map_for_prompt(runner.map_text())
+        except Exception:  # noqa: BLE001 - tools are an extra: a broken runner must not break an answer
+            log.exception("assist job %d (%s): the tool runner failed; answering without tools", job.id, job.kind)
+            return None
+        job.tool_ctx = _JobTools(budget=budget, specs=specs, block=block, map_text=map_text)
+        return job.tool_ctx
+
+    def _map_for_prompt(self, text: str) -> str:
+        """The runner's map text for the ``<map>`` block, "" for no map (or `map_tokens` = 0).
+
+        The Engine already cut the text ONCE when it rendered the map, to
+        `[capabilities].map_tokens` x `[context].chars_per_token` characters -- the CONFIGURED
+        ratio, never the calibrated estimator -- so it is used verbatim here and the block is
+        byte-identical across jobs (the cached prefix of the user turn reaches into the transcript).
+        The cut below is only a safety net, at four times that figure, for a map file indexed under
+        a much larger `map_tokens`; it too uses the configured ratio, so it is just as stable."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        tokens = max(0, int(self._cfg.capabilities.map_tokens))
+        if tokens <= 0:
+            return ""
+        try:
+            ratio = float(self._cfg.context.chars_per_token)
+        except (TypeError, ValueError):
+            ratio = 4.0
+        limit = 4 * max(1, int(tokens * ratio))
+        return _head_lines(text, limit).strip() if len(text) > limit else text
+
+    def _max_tokens_for(self, job: _AssistJob, choices: ChoiceSet | None = None) -> int:
+        """The answer budget (`max_tokens`) of `job`; `choices` adds `CHOICES_TOKEN_HEADROOM` to the
+        question-answering kinds so the verdict line never competes with the answer's own shape."""
+        headroom = CHOICES_TOKEN_HEADROOM if choices is not None else 0
+        llm = self._cfg.llm
+        if job.kind == "ask":
+            return llm.ask_max_tokens + headroom
+        if job.kind in ("solve", "code"):
+            level = prompts.normalize_comment_level(self._cfg.assist.comments)
+            return self._code_budget(self._cfg.explain.enabled, level) + headroom
+        if job.kind == "text":
+            return llm.text_max_tokens
+        if job.kind == "explain":
+            return self._cfg.explain.explain_max_tokens
+        if job.kind == "suggest":
+            return llm.assist_max_tokens
+        if job.kind == "insights":
+            return llm.insights_max_tokens
+        if job.kind == "recap":
+            return llm.recap_max_tokens
+        return llm.assist_max_tokens + headroom     # "auto", "manual", "screen"
+
+    def _previous_for(self, job: _AssistJob) -> str:
+        """The block a user turn carries besides the transcript, the screen and the context
+        blocks, which the context manager budgets as fixed text: the <previous> code of a "code" /
+        "text" job, the current lists of an "insights" pass, the running notes of a "recap"; ""
+        for every other kind."""
+        if job.kind in ("code", "text"):
+            return self._previous_code_text()
+        if job.kind == "insights":
+            secs = job.sections or prompts.INSIGHT_SECTIONS
+            with self._insights_lock:
+                return prompts.render_insights({s: self._insights.get(s, "") for s in secs})
+        if job.kind == "recap":
+            with self._notes_lock:
+                return self._notes_markdown
+        return ""
+
+    def _user_for(
+        self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
+        question: str | None = None, *, previous: str | None = None,
+        reference: str = "", earlier: str = "", lookup: str = "", extra: str = "",
+    ) -> str:
+        """The user turn for `job`. `choices` (a detected multiple-choice option set) adds the
+        <choices> block to the question-answering prompts; `question` replaces `job.question` in
+        the prompt (its annotated copy) and defaults to it; `previous` is the kind's fixed block
+        (`_previous_for`: the <previous> code of a "code" / "text" job, the lists of an "insights"
+        pass, the notes of a "recap"; None = look it up). `reference` / `earlier` / `lookup` are the
+        context manager's blocks (2026-10-06), "" when absent -- which renders as before they
+        existed; `extra` is the project context's on-demand lookups (`_project_extra`)."""
+        block = choices_block(choices) if choices is not None else ""
+        q = job.question if question is None else question
+        ctx = {"reference": reference, "earlier": earlier, "lookup": lookup}
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is not None and tool_ctx.map_text:
+            ctx["map_text"] = tool_ctx.map_text         # 2026-10-07: the project map, after <earlier>
+        if job.kind == "ask":
+            return prompts.user_ask(window, q, screen_text, block, extra=extra, **ctx)
+        if job.kind == "solve":
+            return prompts.user_solve(window, screen_text, job.focus, block, extra=extra,
+                                      consider_given_code=self._consider_given_code(job), **ctx)
+        if job.kind in ("code", "text"):
+            prev = self._previous_code_text() if previous is None else previous
+            builder = prompts.user_code if job.kind == "code" else prompts.user_text
+            return builder(window, screen_text, prev, job.focus, extra=extra,
+                           consider_given_code=self._consider_given_code(job), workspace=job.workspace, **ctx)
         if job.kind == "explain":
             with self._plan_lock:
                 plan = self._plan
                 parts = self._parsed_plan_locked(plan) if plan is not None else None
             walkthrough = parts.walkthrough if parts is not None else ""
             solution = parts.solution if parts is not None else ""
-            system = prompts.system_explain(self._cfg.assist.persona, context)
-            user = prompts.user_explain(walkthrough, solution, screen_text)
-            return system, user, self._cfg.explain.explain_max_tokens
+            return prompts.user_explain(walkthrough, solution, screen_text)
         if job.kind == "suggest":
-            system = prompts.system_suggest(self._cfg.assist.persona, context)
-            user = prompts.user_suggest(window, screen_text, job.focus)
-            return system, user, self._cfg.llm.assist_max_tokens
+            return prompts.user_suggest(window, screen_text, job.focus, **ctx)
         if job.kind == "insights":
-            a = self._cfg.assist
-            secs = job.sections or prompts.INSIGHT_SECTIONS
-            with self._insights_lock:
-                previous = prompts.render_insights({s: self._insights.get(s, "") for s in secs})
-            system = prompts.system_insights(a.persona, a.role, secs, a.insight_max_items, context)
-            user = prompts.user_insights(window, screen_text, previous, secs)
-            return system, user, self._cfg.llm.insights_max_tokens
+            prev = self._previous_for(job) if previous is None else previous
+            return prompts.user_insights(window, screen_text, prev, job.sections or prompts.INSIGHT_SECTIONS, **ctx)
         if job.kind == "recap":
-            with self._notes_lock:
-                notes = self._notes_markdown
-            system = prompts.system_recap(self._cfg.assist.persona, context)
-            user = prompts.user_recap(window, notes, screen_text, job.focus, extra=extra)
-            return system, user, self._cfg.llm.recap_max_tokens
+            notes = self._previous_for(job) if previous is None else previous
+            return prompts.user_recap(window, notes, screen_text, job.focus, extra=extra, **ctx)
         # "auto", "manual", "screen"
-        system = prompts.system_assist(self._cfg.assist.persona, self._cfg.assist.style, context)
-        user = prompts.user_assist(window, q, screen_text, block, extra=extra)
-        return system, user, self._cfg.llm.assist_max_tokens + headroom
+        return prompts.user_assist(window, q, screen_text, block, extra=extra, **ctx)
+
+    def _build_prompt_parts(
+        self, job: _AssistJob, window: str, screen_text: str, choices: ChoiceSet | None = None,
+        question: str | None = None, *, reference: str = "", earlier: str = "", lookup: str = "",
+        extra: str = "",
+    ) -> tuple[str, str, int]:
+        """System/user prompt text and the token budget for one job, around an explicit `window`
+        (the pre-context-library entry point; `_prepare` is what the job runner uses now)."""
+        return (
+            self._system_for(job, choices) + self._toolkit_system_suffix(job.kind),
+            self._user_for(job, window, screen_text, choices, question,
+                           reference=reference, earlier=earlier, lookup=lookup, extra=extra),
+            self._max_tokens_for(job, choices),
+        )
 
     def _code_budget(self, explain: bool, level: str) -> int:
         """Token budget for a "solve" / "code" answer: `solve_max_tokens`, plus the walkthrough's
@@ -1678,43 +2610,63 @@ class Assistant:
         extra = self._cfg.explain.walkthrough_max_tokens if explain else 0
         return self._cfg.llm.solve_max_tokens + extra + COMMENT_TOKEN_HEADROOM.get(level, 0)
 
-    def _complete_prompt_parts(
-        self, job: _AssistJob, window: str, screen_text: str
-    ) -> tuple[str, str, int, str, float]:
-        """(system, user, max_tokens, assistant_prefix, temperature) for a kind "complete" job.
-
-        The session context goes into the user turn stable-first (transcript, answers, notes,
-        screen); the typed prefix becomes the start of the assistant turn so the model continues
-        it verbatim (see `prompts.system_complete`). `window` (like the answers below) is already
-        scoped to the current checkpoint -- see `_run_assist_job`.
-        """
+    def _complete_inputs(self, job: _AssistJob) -> dict[str, str]:
+        """The inline completion's own context blocks that are not the transcript / screen: the
+        recent answers, the notes and the plan's solution, keyed by their prompt tag and present
+        only when their `[completion].use_*` switch (or explanations) asks for them. They are
+        scoped to the current checkpoint like the transcript window."""
         cc = self._cfg.completion
-        blocks: list[tuple[str, str]] = []
-        if cc.use_transcript:
-            blocks.append(("transcript", window))
+        inputs: dict[str, str] = {}
         if cc.use_answers:
             checkpoint_answers = self._checkpoint_answers_index()
             with self._answers_lock:
                 recent = self._answers[checkpoint_answers:][-3:]
-            joined = "\n\n".join(f"Q: {q[:200]}\nA: {a[:600]}" for _t, q, a in recent)
-            blocks.append(("answers", joined))
+            inputs["answers"] = "\n\n".join(f"Q: {q[:200]}\nA: {a[:600]}" for _t, q, a in recent)
         if cc.use_notes:
             with self._notes_lock:
-                notes = self._notes_markdown[:1200]
-            blocks.append(("notes", notes))
-        if cc.use_screen:
-            blocks.append(("screen", screen_text))
-        explain = self._cfg.explain.enabled
-        if explain:
+                inputs["notes"] = self._notes_markdown[:1200]
+        if self._cfg.explain.enabled:
             view = self.plan()
             if view is not None and view.solution.strip():
-                blocks.append(("solution", view.solution))   # the plan: the continuation must follow it
-        system = prompts.system_complete(
-            self._cfg.assist.persona, cc.hint, explain=explain, language=self._cfg.assist.primary_language,
+                inputs["solution"] = view.solution    # the plan: the continuation must follow it
+        return inputs
+
+    def _complete_system(self) -> str:
+        cc = self._cfg.completion
+        return prompts.system_complete(
+            self._cfg.assist.persona, cc.hint, explain=self._cfg.explain.enabled,
+            language=self._cfg.assist.primary_language,
             comments=prompts.normalize_comment_level(self._cfg.assist.comments),
         )
-        user = prompts.user_complete(blocks, job.field, job.suffix)
-        return system, user, cc.max_tokens, prompts.NO_THINK_PREFIX + job.prefix, cc.temperature
+
+    def _complete_user(self, job: _AssistJob, bundle: ContextBundle, inputs: dict[str, str]) -> str:
+        """The user turn of a kind "complete" job.
+
+        The session context goes in stable-first (reference, earlier summary, transcript, answers,
+        notes, screen, the plan's solution, then the volatile lookup passages); the typed prefix
+        becomes the start of the assistant turn so the model continues it verbatim (see
+        `prompts.system_complete`). The transcript (like the answers) is already scoped to the
+        current checkpoint -- see `_run_assist_job`.
+        """
+        cc = self._cfg.completion
+        blocks: list[tuple[str, str]] = []
+        if bundle.reference:
+            blocks.append(("reference", bundle.reference))
+        if bundle.earlier:
+            blocks.append(("earlier", bundle.earlier))
+        if cc.use_transcript:
+            blocks.append(("transcript", bundle.transcript))
+        if cc.use_answers:
+            blocks.append(("answers", inputs.get("answers", "")))
+        if cc.use_notes:
+            blocks.append(("notes", inputs.get("notes", "")))
+        if cc.use_screen:
+            blocks.append(("screen", bundle.screen))
+        if "solution" in inputs:
+            blocks.append(("solution", inputs["solution"]))
+        if bundle.lookup:
+            blocks.append(("lookup", bundle.lookup))
+        return prompts.user_complete(blocks, job.field, job.suffix)
 
     def _screen_text_for_job(self, job: _AssistJob) -> str:
         """Fetch (and cache as `last_screen_text`) the screen text to hand this job's prompt.
@@ -1731,6 +2683,12 @@ class Assistant:
         question line (e.g. "how would you implement this?" with no antecedent for "this"), so
         gating it the same way as a normal spoken-question answer would defeat the feature's own
         purpose. Any exception from the provider is swallowed and treated as no screen text.
+
+        2026-10-29 (multi-file tasks): a job with `read_now` (the Code / Text shortcuts) first has the
+        screen read afresh (`_refresh_screen_for`), so the text is the file the user is on at that
+        moment; the hands-free context is rendered around that fresh screen (its provider takes it as
+        the "on screen now" part); and the current screen is sorted into the task's workspace, whose
+        OTHER views become the job's <workspace> block (`job.workspace`).
         """
         provider = self._screen_provider
         text = ""
@@ -1742,28 +2700,73 @@ class Assistant:
                 or self._cfg.screen.use_in_answers
             )
         max_chars = self._cfg.screen.max_text_chars
+        if wants_screen and job.read_now:
+            self._refresh_screen_for(job)
+        current = ""
+        if provider is not None and wants_screen:
+            try:
+                current = provider() or ""
+            except Exception:  # noqa: BLE001 - a broken screen provider must never break answers
+                log.exception("assistant: screen_provider() raised for job %d; using no screen text", job.id)
+                current = ""
         context = self._hands_free_context if self._hands_free and job.kind in ("text", "code") else None
         if context is not None and wants_screen:
             # Hands-free: the cumulative screen of the task (what scrolled out of view + the
             # current screen), with its own, larger budget; "" means nothing read yet.
             try:
-                text = context() or ""
+                text = self._hands_free_text(context, current)
             except Exception:  # noqa: BLE001 - never break answers over the context provider
                 log.exception("assistant: hands-free context provider raised for job %d", job.id)
                 text = ""
             if text:
                 max_chars = max(max_chars, int(self._cfg.handsfree.context_chars))
-        if not text and provider is not None and wants_screen:
-            try:
-                text = provider() or ""
-            except Exception:  # noqa: BLE001 - a broken screen provider must never break answers
-                log.exception("assistant: screen_provider() raised for job %d; using no screen text", job.id)
-                text = ""
+        if not text:
+            text = current
         if max_chars >= 0:
             text = text[:max_chars]
+        job.workspace = self._workspace_for_job(job, current) if wants_screen else ""
         with self._screen_text_lock:
             self._last_screen_text = text
         return text
+
+    @staticmethod
+    def _hands_free_text(context: Callable[..., str], current: str) -> str:
+        """The hands-free cumulative context rendered around the `current` screen (the provider's
+        2026-10-29 form, `HandsFreeController.context_text(current)`); an older zero-argument provider
+        is called as before."""
+        try:
+            return context(current) or ""
+        except TypeError:
+            return context() or ""
+
+    def _refresh_screen_for(self, job: _AssistJob) -> None:
+        """Read the screen afresh for `job` (`[screen].read_on_shortcut`): blocks on the assist-worker
+        thread until the reader has run the pass (at most `[screen].read_timeout_s`, inside the
+        engine's callback); a read that does not complete leaves the latest text in use, logged."""
+        refresh = self._screen_refresh
+        if refresh is None or not self._cfg.screen.read_on_shortcut:
+            return
+        try:
+            if not refresh():
+                log.info("assistant: job %d (%s): the fresh screen read did not complete; using the latest text",
+                         job.id, job.kind)
+        except Exception:  # noqa: BLE001 - a reader problem must never break an answer
+            log.exception("assistant: job %d (%s): the fresh screen read failed", job.id, job.kind)
+
+    def _workspace_for_job(self, job: _AssistJob, current: str) -> str:
+        """The <workspace> block of a Code / Text job: the current screen is sorted into the task's
+        workspace (synchronously, so the view it lands in is the current one whatever the bus
+        listener has seen so far) and the OTHER views are rendered within `[screen].workspace_chars`."""
+        if job.kind not in ("code", "text") or not self._cfg.screen.workspace or not current.strip():
+            return ""
+        try:
+            now = self._clock()
+            view = self._workspace.observe(current, title=self._last_screen_title,
+                                           process=self._last_screen_process, now=now)
+            return self._workspace.others_text(current=view, max_chars=int(self._cfg.screen.workspace_chars), now=now)
+        except Exception:  # noqa: BLE001 - the workspace is an extra: never break an answer over it
+            log.exception("assistant: job %d (%s): the workspace block failed", job.id, job.kind)
+            return ""
 
     def _record_suggest_start(self, job: _AssistJob, screen_text: str) -> None:
         """Record the auto-suggest throttle state when a suggest job starts (see the module
@@ -1785,14 +2788,38 @@ class Assistant:
     def _notes_worker_loop(self) -> None:
         log.info("notes-worker: started")
         while True:
-            job = self._notes_slot.get()
+            job = self._next_notes_job()
             if job is None:
                 log.info("notes-worker: stopping")
                 return
             try:
-                self._run_notes_job(job)
-            except Exception:  # pragma: no cover - safety net; _run_notes_job handles its own errors
+                if isinstance(job, _CompactJob):
+                    self._run_compact_job(job)
+                elif isinstance(job, _DigestJob):
+                    self._run_digest_job(job)
+                else:
+                    self._run_notes_job(job)
+            except Exception:  # pragma: no cover - safety net; the _run_* methods handle their own errors
                 log.exception("notes-worker: unhandled error running job %d", job.id)
+
+    def _next_notes_job(self) -> "_NotesJob | _CompactJob | _DigestJob | None":
+        """Block until a notes-lane job is ready: notes first, then a compaction, then a digest
+        (2026-10-06); `None` once the notes slot is closed (the worker's stop signal).
+
+        Same shape as `_next_assist_job`: the lanes' slots are polled with `try_get`, and the
+        notes slot's condition is waited on with a short timeout, so a notes job (or `close()`)
+        wakes the worker at once while a compaction / digest queued on its own slot is picked up
+        within `_DISPATCH_POLL_S`. A job that would run while a notes job waits never delays it by
+        more than the one job already running (the lane is not cancellable).
+        """
+        while True:
+            for slot in (self._notes_slot, self._compact_slot, self._digest_slot):
+                job = slot.try_get()
+                if job is not None:
+                    return job
+            if self._notes_slot.closed:
+                return None
+            self._notes_slot.wait(timeout=_DISPATCH_POLL_S)
 
     def _run_notes_job(self, job: _NotesJob) -> None:
         with self._notes_lock:
@@ -1820,16 +2847,20 @@ class Assistant:
         # `since_id` is. `tip` is the newest segment at this point; a chunk that stops short of it
         # was cut by the budget, and the next chunk is queued right after this one succeeds.
         tip = self._transcript.last_id()
-        new_text, last_included = self._transcript.head_text(self._cfg.llm.context_tokens * 4, since_id=since_id)
-        until_id = last_included if last_included is not None else since_id   # nothing new: stay put
         # Dashboard mode keeps the tasks, goals, constraints and questions in its own database:
         # the notes are then narrative only (the notes prompt's `tracked` form).
         dash = self._cfg.dashboard
         system = prompts.system_notes(self._cfg.notes.template, tracked=bool(dash.enabled and dash.track))
-        user = prompts.user_notes(previous, new_text)
+        chunk_chars, max_tokens, previous = self._notes_budget(previous, system)
+        new_text, last_included = self._transcript.head_text(chunk_chars, since_id=since_id)
+        until_id = last_included if last_included is not None else since_id   # nothing new: stay put
+        max_words = prompts.words_for_tokens(max_tokens) if max_tokens < int(self._cfg.llm.notes_max_tokens) else None
+        user = prompts.user_notes(previous, new_text, max_words)
         try:
-            text = self._stream_text(system, user, max_tokens=self._cfg.llm.notes_max_tokens)
+            text = self._stream_text(system, user, max_tokens=max_tokens)
         except LLMError as exc:
+            if _OVERFLOW_RE.search(str(exc)):
+                self._note_overflow()   # 2026-10-06: the next (re-sent) chunk is cut smaller
             log.error("notes job %d failed: %s", job.id, exc, exc_info=True)
             self._bus.publish(NotesErrorEvent(message=str(exc)))
             self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
@@ -1850,6 +2881,7 @@ class Assistant:
             # prompt size, so it should not permanently discard this window from the notes either.
             return
 
+        self._observe_prompt(self._sent_chars(system, user, None), self._client.last_stats)
         markdown = text.strip()
         with self._notes_lock:
             self._notes_markdown = markdown
@@ -1864,6 +2896,240 @@ class Assistant:
             log.info("notes job %d: backlog remains past segment %d (tip %d); queuing the next chunk",
                      job.id, last_included, tip)
             self.generate_notes(force=True)
+
+    def _notes_budget(self, previous: str, system: str) -> tuple[int, int, str]:
+        """``(chunk_chars, max_tokens, previous)`` for one notes job (2026-10-06, context window).
+
+        A notes pass rewrites the WHOLE document: previous notes + the new chunk in, a document of
+        up to `[llm].notes_max_tokens` out, and all of it inside the notes lane's share of the
+        server's pool (`ContextManager.job_limit("notes")`, beside a live answer). Measured on the
+        owner's 4096-token profile the lane is ~1228 tokens: the configured 900-token document
+        cannot even fit once, let alone twice (previous + new), and the old `context_tokens * 4`
+        chunk alone was 2500 tokens -- so the whole thing scales to the lane instead:
+          - the chunk is `context_tokens * 4` chars (the old cap) when the lane has room for it
+            beside the previous notes and the full answer, else what is left -- never under
+            `_MIN_NOTES_CHUNK_CHARS`, so the notes always advance;
+          - when the full answer would leave the chunk under `_NOTES_MIN_CHUNK_TOKENS`, the answer
+            budget AND the previous notes shrink together to an equal share of what is left after
+            that chunk (`user_notes(..., max_words)` tells the model the new length), so the
+            document stays complete, just compact; a previous document longer than that share is
+            cut on a line boundary (once -- the rewritten one fits from then on).
+        Any sizing failure falls back to the old cap and the configured answer budget."""
+        cap = max(_MIN_NOTES_CHUNK_CHARS, int(self._cfg.llm.context_tokens) * 4)
+        notes_max = max(16, int(self._cfg.llm.notes_max_tokens))
+        try:
+            est = self._context.estimator
+            template = est.tokens(prompts.user_notes("", "", notes_max)) + 48   # its tags + the ChatML frame
+            room = self._context.job_limit("notes") - est.tokens(system) - template
+            prev_t = est.tokens(previous) if previous else 0
+            if room - prev_t - notes_max >= _NOTES_MIN_CHUNK_TOKENS:
+                max_tokens = notes_max
+            else:
+                doc_t = max(_NOTES_MIN_DOC_TOKENS, (room - _NOTES_MIN_CHUNK_TOKENS) // 2)
+                max_tokens = min(notes_max, doc_t)
+                if prev_t > doc_t:
+                    previous = _head_lines(previous, est.chars(doc_t))
+                    prev_t = est.tokens(previous)
+                    log.info("notes: previous notes cut to ~%d tokens to fit the notes lane (%d tokens)",
+                             doc_t, self._context.job_limit("notes"))
+            chunk_t = room - prev_t - max_tokens
+            chunk_chars = min(cap, max(_MIN_NOTES_CHUNK_CHARS, est.chars(max(0, chunk_t))))
+            return chunk_chars, max_tokens, previous
+        except Exception:  # noqa: BLE001 - never stall the notes over a sizing bug
+            log.exception("notes: sizing the prompt failed; using the configured cap and budget")
+            return cap, notes_max, previous
+
+    def _run_compact_job(self, job: _CompactJob) -> None:
+        """Fold the transcript that fell out of `job.scope`'s window into that scope's running
+        summary (the next prompts' <earlier> block). Claims the oldest part of the pending dropped
+        text that fits the notes lane (the manager keeps the rest pending and this job re-queues
+        itself while any is left), asks the model for a summary of at most
+        `[context].summary_tokens`, and stores it; on ANY failure the claimed text is handed back
+        so nothing is lost and the next answer's build asks for the compaction again."""
+        c = self._cfg.context
+        if c.compaction != "summary":
+            return
+        summary_tokens = max(16, int(c.summary_tokens))
+        max_tokens = summary_tokens + 32
+        system = prompts.system_compact()
+        try:
+            with self._epoch_lock:          # atomic with reset(): see the note there
+                epoch = self._session_epoch
+                previous = self._context.window.staged_summary(job.scope) or self._context.window.earlier_summary(job.scope)
+                room = self._context.available_chars(
+                    "notes", max_tokens=max_tokens, system_text=system, other_text=previous,
+                )
+                claimed = self._context.claim_compaction(job.scope, max_chars=max(room, _MIN_NOTES_CHUNK_CHARS))
+        except Exception:  # noqa: BLE001 - context bookkeeping must never kill the notes worker
+            log.exception("compact job %d: claiming the dropped transcript failed", job.id)
+            return
+        if claimed is None:
+            return
+        previous, dropped = claimed
+        user = prompts.user_compact(previous, dropped, prompts.words_for_tokens(summary_tokens))
+        summary = ""
+        cancel = self._lane_cancel(job.attempts)
+        try:
+            summary = prompts.strip_think(
+                self._stream_text(system, user, max_tokens=max_tokens, cancel=cancel)
+            )
+        except LLMError as exc:
+            if _OVERFLOW_RE.search(str(exc)):
+                self._note_overflow()
+            log.warning("compact job %d failed: %s", job.id, exc)
+        except Exception:  # noqa: BLE001 - surface any bug in the log, never kill the worker
+            log.exception("compact job %d failed unexpectedly", job.id)
+        with self._epoch_lock:
+            stale = epoch != self._session_epoch
+        if stale:
+            return                         # the session was reset while this ran: drop everything
+        yielded = self._yielded(cancel)
+        try:
+            if not summary or self._stop_event.is_set() or yielded:
+                self._context.restore_compaction(job.scope, dropped)
+                if yielded and not self._stop_event.is_set():
+                    log.info("compact job %d: stepped aside for an answer; re-queued", job.id)
+                    self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=job.scope,
+                                                       attempts=job.attempts + 1, force=job.force))
+                return
+            self._observe_prompt(self._sent_chars(system, user, None), self._client.last_stats)
+            if job.force:
+                # A user-driven Compact already moved the anchor; there is no imminent natural
+                # anchor move to fold a staged summary into, so install it active now (one prefix
+                # re-evaluation) -- otherwise the dropped speech is absent AND unsummarised until
+                # the window next overflows on its own.
+                self._context.set_summary(job.scope, summary)
+            else:
+                self._context.stage_summary(job.scope, summary)    # enters the prompt at the next anchor move
+            more = self._context.window.has_pending(job.scope)
+        except Exception:  # noqa: BLE001
+            log.exception("compact job %d: storing the summary failed", job.id)
+            return
+        log.info("compact job %d: scope %s summary %s (%d chars)", job.id, job.scope,
+                 "installed" if job.force else "staged", len(summary))
+        if more:
+            # A forced compaction with a long backlog keeps folding actively (each chunk installed)
+            # until the pending buffer is drained, so the whole dropped span is summarised at once.
+            self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=job.scope, force=job.force))
+
+    # ---- yielding to a live answer (2026-10-06) ---------------------------------------------
+
+    def _lane_cancel(self, attempts: int) -> threading.Event:
+        """The cancel token for a notes-lane background job: `_lane_yield` (set while an answer
+        runs, and by stop()) for the first `_LANE_YIELD_ATTEMPTS` tries -- after first waiting
+        for the answer lane to go idle -- then the plain stop event, so the job cannot be starved
+        forever by a stream of inline completions."""
+        if attempts >= _LANE_YIELD_ATTEMPTS:
+            return self._stop_event
+        self._wait_answer_idle()
+        return self._lane_yield
+
+    def _wait_answer_idle(self, timeout: float = _LANE_IDLE_WAIT_S) -> None:
+        deadline = time.monotonic() + timeout
+        while not self._stop_event.is_set() and time.monotonic() < deadline:
+            with self._current_lock:
+                busy = self._current_job is not None
+            if not busy and not self._lane_yield.is_set():
+                return
+            time.sleep(_DISPATCH_POLL_S)
+
+    def _yielded(self, cancel: threading.Event) -> bool:
+        """Whether a lane job streamed with `cancel` was cut short to make room for an answer:
+        the token is still set (the answer is running), or the client reports the stream as
+        cancelled and this was not a shutdown."""
+        if cancel is self._stop_event:
+            return False
+        if self._stop_event.is_set():
+            return False
+        if cancel.is_set():
+            return True
+        stats = self._client.last_stats
+        return bool(stats is not None and getattr(stats, "cancelled", False))
+
+    def _kick_digests(self, exclude: str | None = None) -> None:
+        """Queue the next document still waiting for its digest (`store.pending_digests()`),
+        skipping the one running and `exclude`. Called when the assistant starts / the model
+        changes (a library added while no model was loaded gets digested now) and by the digest
+        job itself when it finishes, which is how a burst of added files is digested one by one
+        although the slot holds a single job."""
+        try:
+            pending = self._context.store.pending_digests()
+        except Exception:  # noqa: BLE001
+            log.exception("assistant: listing pending digests failed")
+            return
+        with self._digest_lock:
+            running = self._digest_running
+        for doc_id in pending:
+            if doc_id != running and doc_id != exclude:
+                self._digest_slot.put(_DigestJob(id=next(self._job_ids), doc_id=doc_id))
+                return
+
+    def _run_digest_job(self, job: _DigestJob) -> None:
+        """Write a document's catalogue entry: the first ~6000 characters (fewer when the notes
+        lane has less room) go to the model, which answers in 2-4 lines (`[context].digest_tokens`).
+        Stores it ("ready", or "failed" when the model errors / says nothing), publishes a
+        `ContextLibraryEvent`, and queues the next pending document."""
+        doc_id = job.doc_id
+        with self._digest_lock:
+            self._digest_running = doc_id
+        try:
+            self._digest_document_now(job)
+        finally:
+            with self._digest_lock:
+                self._digest_running = None
+            self._kick_digests(exclude=doc_id)
+
+    def _digest_document_now(self, job: _DigestJob) -> None:
+        doc_id = job.doc_id
+        store = self._context.store
+        try:
+            doc = store.get(doc_id)
+            if doc is None:
+                return
+            max_tokens = max(16, int(self._cfg.context.digest_tokens)) + 32
+            system = prompts.system_digest()
+            room = self._context.available_chars(
+                "notes", max_tokens=max_tokens, system_text=system, other_text=doc.name,
+            )
+            excerpt = store.text(doc_id)[: max(_MIN_NOTES_CHUNK_CHARS, min(_DIGEST_EXCERPT_CHARS, room))]
+        except Exception:  # noqa: BLE001 - never kill the notes worker over a library problem
+            log.exception("digest job %d: preparing document %s failed", job.id, doc_id)
+            # Marked failed rather than left "pending": two documents that both keep failing here
+            # would otherwise re-queue each other forever (review, 2026-10-06). Re-digest retries.
+            try:
+                store.set_digest(doc_id, "", "failed")
+            except Exception:  # noqa: BLE001
+                log.debug("digest job %d: could not mark %s failed", job.id, doc_id, exc_info=True)
+            self._bus.publish(ContextLibraryEvent(reason="digest failed", doc_id=doc_id))
+            return
+        digest = ""
+        cancel = self._lane_cancel(job.attempts)
+        if excerpt.strip():
+            user = prompts.user_digest(doc.name, excerpt)
+            try:
+                digest = prompts.strip_think(
+                    self._stream_text(system, user, max_tokens=max_tokens, cancel=cancel)
+                )
+            except LLMError as exc:
+                if _OVERFLOW_RE.search(str(exc)):
+                    self._note_overflow()
+                log.warning("digest job %d (%s) failed: %s", job.id, doc.name, exc)
+            except Exception:  # noqa: BLE001
+                log.exception("digest job %d (%s) failed unexpectedly", job.id, doc.name)
+            else:
+                self._observe_prompt(self._sent_chars(system, user, None), self._client.last_stats)
+        if self._stop_event.is_set():
+            return                         # shutting down: leave it pending for the next launch
+        if self._yielded(cancel):
+            log.info("digest job %d (%s): stepped aside for an answer; re-queued", job.id, doc.name)
+            self._digest_slot.put(_DigestJob(id=next(self._job_ids), doc_id=doc_id, attempts=job.attempts + 1))
+            return
+        try:
+            store.set_digest(doc_id, digest, "ready" if digest else "failed")
+        except Exception:  # noqa: BLE001
+            log.exception("digest job %d: storing the digest of %s failed", job.id, doc_id)
+            return
+        self._bus.publish(ContextLibraryEvent(reason="digest" if digest else "digest failed", doc_id=doc_id))
 
     # ---- shared streaming --------------------------------------------------------
 
@@ -1917,6 +3183,327 @@ class Assistant:
                         on_delta(piece)
         return "".join(parts)
 
+    # ---- the tool loop (2026-10-07, capabilities) --------------------------------------
+
+    def _stream_answer(
+        self, job: _AssistJob, prepared: _Prepared, on_delta: Callable[[str], None],
+    ) -> tuple[str, int, StreamStats | None]:
+        """Stream one assist job's answer: `(visible text, characters of the LAST request sent,
+        stats of the stream)` -- the last request is what `stats.prompt_tokens` counts, so it is
+        what `_finish_usage` / `_observe_prompt` pair it with.
+
+        A job without tools (no runner, a kind the runner does not cover, "complete" / "explain")
+        gets the plain `_stream_text` call, the very request it always sent. A job with tools runs
+        the loop (`_run_tool_loop`): the visible text is all that reaches `on_delta`, the history,
+        the plan and `AssistDoneEvent`; the calls and their results live in the continuation only."""
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is None or prepared.assistant_prefix is not None:
+            extra = None
+            if job.kind == "complete" and self._cfg.completion.repeat_penalty and self._cfg.completion.repeat_penalty != 1.0:
+                extra = {"repeat_penalty": float(self._cfg.completion.repeat_penalty)}
+            text = self._stream_text(
+                prepared.system, prepared.user, max_tokens=prepared.max_tokens, cancel=job.cancel,
+                on_delta=on_delta, assistant_prefix=prepared.assistant_prefix,
+                temperature=prepared.temperature, extra_body=extra,
+            )
+            sent = self._sent_chars(prepared.system, prepared.user, prepared.assistant_prefix)
+            return text, sent, self._client.last_stats
+        return self._run_tool_loop(job, prepared, tool_ctx, on_delta)
+
+    def _run_tool_loop(
+        self, job: _AssistJob, prepared: _Prepared, tool_ctx: _JobTools, on_delta: Callable[[str], None],
+    ) -> tuple[str, int, StreamStats | None]:
+        """The tool loop. Each pass streams one request: a `_ToolSplitter` publishes the visible
+        text and holds back a call; when the stream ends with a call (`<tool>` opening a line, or
+        following prose on its line with a complete JSON object; the server stops the pass at
+        the closing tag, `</tool>` being a stop string of every call pass) it is parsed, run by the
+        runner under the policy and appended to the conversation as a USER turn carrying its
+        `<result>` block, after which a fresh assistant turn is opened and the model continues
+        (raw path: `_raw_prompt`, every request a byte-for-byte extension of the previous one plus
+        the text the model generated, so the server's KV cache holds all but the new turn; chat
+        path: two messages appended). It ends when a pass writes no call:
+
+        - a malformed call is told so (the first is free, later ones cost a call);
+        - the call that spends the last one (or the time budget) gets "(no calls left ...)" and the
+          next pass runs without the call stop, so a call it still writes is cut there;
+        - a first pass that only SAYS it will look something up ("Let me check ...", `_announces_lookup`)
+          is re-streamed once with the call opened for it, the narration dropped from the answer;
+        - a pass that writes nothing after tools ran (whatever lead-in came before its call) gets one
+          more pass, then an error."""
+        from exocortex.capabilities import ToolCall      # lazy: the loop is the only user
+
+        runner = self._tools
+        budget = tool_ctx.budget
+        raw = self._cfg.llm.thinking != "on"
+        initial_calls = max(1, int(budget.calls_left))
+        hard_cap = 2 * initial_calls + 2        # a net under a runner that never charges a repeated call
+        write_hops = job.kind == "ask" and bool(_WRITE_TOOLS & set(budget.allowed))
+        steps: list[_ToolStep] = []
+        answer = ""
+        all_stats: list[StreamStats] = []
+        sent_chars = 0
+        calls = 0                               # ToolCallEvents published (their 1-based index)
+        malformed = 0
+        forced_used = blank_used = False
+        forced_lead: str | None = None          # next pass: the narration the call is forced after
+        blank = False                           # next pass: the "write the answer" retry
+        final = False                           # no more calls: the next pass has no call stop
+        hop = 0
+        while not job.cancel.is_set():
+            hop += 1
+            if not final and (budget.calls_left <= 0 or time.monotonic() >= budget.deadline):
+                final = True
+            # The SERVER stops a call pass at the closing tag: the tag's tokens stay in the slot's
+            # cache, the request completes normally, and the continuation (an extension of this
+            # very text) lands on the same slot. The answer pass, which may make no call, stops at
+            # an opening tag instead. 2026-10-08, from the owner's first live session: the client-
+            # side cut this replaces turned every hop into a cancelled request -- the server
+            # noticed the dropped connection only after the NEXT request had been handed the other
+            # slot, which re-evaluated the whole prompt (2998 tokens, 3 s on the 27B) every hop.
+            # A `</tool>` the model writes in its own prose now cuts the answer there: accepted,
+            # the rule tells it never to mention the tools.
+            stop = list(prompts.STOP) + [prompts.TOOL_OPEN if final else prompts.TOOL_CLOSE]
+            max_tokens = prepared.max_tokens
+            if write_hops and not final:
+                max_tokens = max(max_tokens, _WRITE_HOP_MIN_TOKENS)      # a write_file call carries a body
+            forced, forced_lead = forced_lead, None
+            was_blank, blank = blank, False
+            splitter, stats, sent = self._stream_hop(
+                job, prepared, steps, on_delta, raw=raw, stop=stop, max_tokens=max_tokens,
+                cut_on_call=final, forced_lead=forced, blank=was_blank,
+            )
+            sent_chars = sent
+            if stats is not None:
+                all_stats.append(stats)
+            visible, held = splitter.visible, splitter.held
+            reason = str(getattr(stats, "finish_reason", "") or "")
+            if job.cancel.is_set():
+                answer += visible if forced is None else ""
+                break
+
+            if held is None or final:
+                # No call (or one when none may be made: the stream was cut at it, its visible part kept).
+                if (
+                    held is None and hop == 1 and not forced_used and not steps and not final
+                    and _announces_lookup(visible)
+                ):
+                    forced_used = True
+                    forced_lead = visible if visible.endswith("\n") else visible + "\n"
+                    log.info("assist job %d (%s): narration without a tool call; forcing one", job.id, job.kind)
+                    continue
+                if steps and not visible.strip():      # judge THIS pass: `answer` already holds the lead-ins
+                    if blank_used:
+                        raise _NoAnswerError(f"the model made {calls} tool call(s) but wrote no answer")
+                    blank_used = blank = final = True      # (a blank pass's text is dropped: the retry lacks it)
+                    log.info("assist job %d (%s): blank answer after %d call(s); asking once more", job.id, job.kind, calls)
+                    continue
+                answer += visible
+                if forced is not None and not answer.strip():
+                    answer = forced.rstrip("\n")       # the loop forced a call it could not get: keep the narration
+                break
+
+            # ---- the pass ended with a call
+            if forced is not None and not held[len(prompts.TOOL_OPEN):].strip():
+                answer += forced.rstrip("\n")          # asked for a call, the model declined: the narration is its answer
+                break
+            lead = forced if forced is not None else visible
+            if forced is None:
+                answer += visible
+            payload: str | None
+            parsed: tuple[str, dict[str, Any]] | str
+            if reason == "length":
+                payload, parsed = None, "the call was cut off by the length limit"
+            else:
+                # The stream was abandoned at the closing tag or at the end of the JSON object; a
+                # call with no complete object is read as written: whatever follows the marker.
+                payload = prompts.find_tool_call(held)
+                if payload is None:
+                    payload = held[len(prompts.TOOL_OPEN):]
+                parsed = prompts.parse_tool_call(payload)
+            if isinstance(parsed, str):
+                malformed += 1
+                shown = (payload if payload is not None else held[len(prompts.TOOL_OPEN):]).strip()[:300]
+                step = _ToolStep(
+                    lead, shown, "tool",
+                    f'(the call could not be parsed: {parsed}. Write exactly: '
+                    f'<tool>{{"name": ..., "args": {{...}}}}</tool>)',
+                    sanitize=False,
+                )
+                if malformed > 1:
+                    budget.calls_left -= 1             # the first malformed call is free, the others count
+                if budget.calls_left <= 0:
+                    step.note = _NO_CALLS_LEFT
+                    final = True
+                steps.append(step)
+                log.info("assist job %d (%s): malformed tool call #%d: %s", job.id, job.kind, malformed, parsed)
+                continue
+
+            name, args = parsed
+            calls += 1
+            summary = _call_summary(args)
+            self._bus.publish(ToolCallEvent(job_id=job.id, index=calls, name=name, summary=summary, state="running"))
+            if job.cancel.is_set():                    # last look before anything runs
+                self._bus.publish(ToolCallEvent(
+                    job_id=job.id, index=calls, name=name, summary=summary, state="error", detail="cancelled"))
+                break
+            started = time.monotonic()
+            if started >= budget.deadline:
+                out = _Outcome("denied: the time for tool calls in this answer is used up", "denied",
+                               "time budget used up", summary)
+            else:
+                job.tools_used += 1
+                try:
+                    out = _outcome(runner.run(
+                        ToolCall(name=name, args=args, raw=payload or ""), budget=budget, cancel=job.cancel))
+                except Exception as exc:  # noqa: BLE001 - `run` never raises; a fake or a bug must not kill the answer
+                    log.exception("assist job %d (%s): tool %s raised", job.id, job.kind, name)
+                    out = _Outcome(f"error: {exc}", "error", str(exc)[:120], summary)
+            elapsed = time.monotonic() - started
+            detail = out.detail or (_one_line(out.text) if out.state != "done" else "")
+            self._bus.publish(ToolCallEvent(
+                job_id=job.id, index=calls, name=name, summary=_one_line(out.summary, 120) or summary,
+                state=out.state, detail=detail[:200], elapsed_s=elapsed))
+            log.info("assist job %d (%s): tool %s %s (%s) in %.2fs", job.id, job.kind, name, out.state, summary, elapsed)
+            step = _ToolStep(lead, (payload or "").strip(), name, out.text)
+            if budget.calls_left <= 0 or time.monotonic() >= budget.deadline or calls >= hard_cap:
+                step.note = _NO_CALLS_LEFT
+                final = True
+            steps.append(step)
+        return answer, sent_chars, self._merge_stats(all_stats)
+
+    def _stream_hop(
+        self, job: _AssistJob, prepared: _Prepared, steps: list[_ToolStep], on_delta: Callable[[str], None], *,
+        raw: bool, stop: list[str], max_tokens: int, cut_on_call: bool, forced_lead: str | None, blank: bool,
+    ) -> tuple[_ToolSplitter, StreamStats | None, int]:
+        """One request of the loop, streamed through a fresh `_ToolSplitter`: returns the splitter
+        (`visible` / `held`), the stream's stats and the characters sent. A pass after a tool ran
+        whose request the server rejects as too long is retried ONCE with the oldest result's body
+        dropped (`_RESULT_DROPPED`); the first pass has no result to drop -- its overflow goes to
+        `_run_assist_job`'s own retry, which only ever runs when no tool has."""
+        retried = False
+        while True:
+            splitter = _ToolSplitter(on_delta, held=prompts.TOOL_OPEN if forced_lead is not None else None)
+            try:
+                stats, sent = self._send_hop(
+                    job, prepared, steps, splitter, raw=raw, stop=stop, max_tokens=max_tokens,
+                    cut_on_call=cut_on_call, forced_lead=forced_lead, blank=blank,
+                )
+                return splitter, stats, sent
+            except LLMError as exc:
+                droppable = next((s for s in steps if not s.dropped), None)
+                if (
+                    steps and droppable is not None and not retried and not splitter.published
+                    and not job.cancel.is_set() and _OVERFLOW_RE.search(str(exc))
+                ):
+                    droppable.dropped = True
+                    retried = True
+                    log.warning("assist job %d (%s): the continuation overflowed the server's context (%s); "
+                                "dropping the oldest tool result and retrying the pass once", job.id, job.kind, exc)
+                    self._note_overflow()
+                    continue
+                raise
+
+    def _send_hop(
+        self, job: _AssistJob, prepared: _Prepared, steps: list[_ToolStep], splitter: _ToolSplitter, *,
+        raw: bool, stop: list[str], max_tokens: int, cut_on_call: bool, forced_lead: str | None, blank: bool,
+    ) -> tuple[StreamStats | None, int]:
+        """Send the continuation as it stands and feed the splitter; `(stats, characters sent)`.
+        The server's stop strings end a pass (`_run_tool_loop`); the stream is abandoned client-side
+        only as a fallback: a server that ignored the stop string (`</tool>` seen in the held text),
+        a model that forgot the closing tag and wrote on past its JSON object
+        (`_forgot_closing_tag`), or, with `cut_on_call` (no calls left), a call that starts anyway."""
+        if raw:
+            prompt = self._raw_prompt(prepared, steps, forced_lead, blank)
+            sent = len(prompt)
+            stream = self._client.stream_completion(prompt, max_tokens=max_tokens, stop=stop, cancel=job.cancel)
+        else:
+            messages = self._chat_messages(prepared, steps, forced_lead, blank)
+            sent = sum(len(m["content"]) for m in messages)
+            stream = self._client.stream_chat(messages, max_tokens=max_tokens, cancel=job.cancel, stop=stop)
+        try:
+            for item in stream:
+                piece = item if raw else item.content
+                if not piece:
+                    continue
+                splitter.feed(piece)
+                if splitter.held is not None and (
+                    cut_on_call or prompts.TOOL_CLOSE in splitter.held or _forgot_closing_tag(splitter.held)
+                ):
+                    break
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()                    # lets the client's stream finish (and record its stats) now
+        splitter.finish()
+        return self._client.last_stats, sent
+
+    @staticmethod
+    def _raw_prompt(prepared: _Prepared, steps: list[_ToolStep], forced_lead: str | None, blank: bool) -> str:
+        """The raw-path prompt of a pass. The first assistant turn carries `NO_THINK_PREFIX` and
+        the text + call the model wrote; each result then comes back as a USER turn (its <result>
+        block) and a fresh assistant turn, again with `NO_THINK_PREFIX`, is opened for the model to
+        continue in -- the shape chat models are trained on: a tool's reply is a message TO the
+        model, never text inside its own turn. 2026-10-08, the owner's first live session: results
+        appended inside the assistant turn made the Qwen model end its turn right after them (one
+        token, end of text, on the continuation AND on the retry) -- the "made 1 tool call(s) but
+        wrote no answer" failure. Every prompt is a byte-for-byte extension of the previous request
+        plus what the model generated, so the server's KV cache holds all but the new turn.
+        `forced_lead` opens a call after the narration it follows (a first pass without a call);
+        `blank` is the answer retry: a nudge inside the last result block."""
+        prompt = prompts.render_chatml(prepared.system, prepared.user, prompts.NO_THINK_PREFIX)
+        last = len(steps) - 1
+        for i, s in enumerate(steps):
+            block = s.block(nudge=_CHAT_WRITE_ANSWER if blank and i == last else "")
+            prompt += (
+                f"{s.call_text()}{prompts.IM_END}\n"
+                f"{prompts.IM_START}user\n{block.strip(chr(10))}{prompts.IM_END}\n"
+                f"{prompts.IM_START}assistant\n{prompts.NO_THINK_PREFIX}"
+            )
+        if forced_lead is not None:
+            prompt += forced_lead + prompts.TOOL_OPEN
+        return prompt
+
+    @staticmethod
+    def _chat_messages(
+        prepared: _Prepared, steps: list[_ToolStep], forced_lead: str | None, blank: bool,
+    ) -> list[dict[str, str]]:
+        """The chat-path messages of a pass: system, user, then per call an assistant message (the
+        visible lead and the call) and a user message (the result block) -- the same turns the raw
+        path renders. A chat API cannot prefill an assistant turn, so the two retries ask in words:
+        the forced call as a user message of its own, the answer nudge inside the last result block
+        (roles must keep alternating for strict templates)."""
+        messages = [
+            {"role": "system", "content": prepared.system},
+            {"role": "user", "content": prepared.user},
+        ]
+        last = len(steps) - 1
+        for i, s in enumerate(steps):
+            messages.append({"role": "assistant", "content": s.call_text()})
+            block = s.block(nudge=_CHAT_WRITE_ANSWER if blank and i == last else "")
+            messages.append({"role": "user", "content": block.strip("\n")})
+        if forced_lead is not None:
+            messages.append({"role": "assistant", "content": forced_lead.rstrip()})
+            messages.append({"role": "user", "content": _CHAT_FORCE_CALL})
+        return messages
+
+    @staticmethod
+    def _merge_stats(stats: list[StreamStats]) -> StreamStats | None:
+        """One `StreamStats` for a whole loop: the FIRST stream's time to first token (what the
+        reader waited for), the tokens and times of every stream summed, and the LAST stream's
+        prompt / cached tokens, finish reason and cancelled flag. One stream is returned as is."""
+        if not stats:
+            return None
+        if len(stats) == 1:
+            return stats[0]
+        first, last = stats[0], stats[-1]
+        tokens = sum(s.tokens for s in stats)
+        elapsed = sum(s.elapsed_s for s in stats)
+        gen_time = sum(max(s.elapsed_s - s.ttft_s, 0.0) if s.tokens > 1 else s.elapsed_s for s in stats)
+        return dataclasses.replace(
+            last, ttft_s=first.ttft_s, tokens=tokens, elapsed_s=elapsed,
+            tok_per_s=tokens / gen_time if gen_time > 0 else 0.0,
+        )
+
     # ---- auto mode (bus-listener + coalesce timer) --------------------------------
 
     def _bus_listener_loop(self) -> None:
@@ -1956,9 +3543,20 @@ class Assistant:
 
         `prev_lines` is updated on every changed event regardless of either feature's config
         flag or outcome, so a later toggle sees only genuinely new lines from that point on.
+
+        2026-10-29: every changed capture is also sorted into the task's workspace (the window
+        title / process remembered for the job-time sort as well).
         """
+        self._last_screen_title = str(getattr(event, "window_title", "") or "")
+        self._last_screen_process = str(getattr(event, "window_process", "") or "")
         if not event.changed:
             return
+        if self._cfg.screen.workspace:
+            try:
+                self._workspace.observe(event.text, title=self._last_screen_title,
+                                        process=self._last_screen_process, now=self._clock())
+            except Exception:  # noqa: BLE001 - never let the workspace break screen handling
+                log.exception("assistant: sorting the screen into the workspace failed")
         prev = self._screen_prev_lines
         current = tuple(event.lines)
         new = self._compute_new_lines(prev, current)
@@ -2297,8 +3895,33 @@ class Assistant:
                 self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
                 return
 
+        self._read_context_window()
         self._bus.publish(ComponentStatusEvent(component="llm", state="ready", detail=self._cfg.llm.model))
         self._refresh_models_async()
+        self._kick_digests()
+
+    def _read_context_window(self) -> None:
+        """Size every later prompt to what the server really gives one request (2026-10-06):
+        `client.context_window()` (llama-server's /props, LM Studio's model entry; None when it
+        cannot say -- then the manager falls back to `[llm].ctx_size`). Guarded: a client without
+        the method, or one that raises, just means "unknown"."""
+        n: int | None = None
+        try:
+            reader = getattr(self._client, "context_window", None)
+            value = reader() if callable(reader) else None
+            n = int(value) if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+        except Exception:  # noqa: BLE001 - any failure means "unknown"
+            log.debug("assistant: reading the server's context window failed", exc_info=True)
+        try:
+            self._context.set_slot_tokens(n)
+        except Exception:  # noqa: BLE001
+            log.exception("assistant: setting the context slot size failed")
+            return
+        if n is None:
+            log.info("assistant: server context window unknown; using [llm].ctx_size (%d tokens)",
+                     self._context.slot_tokens)
+        else:
+            log.info("assistant: server context window is %d tokens per request", n)
 
     def _refresh_models_async(self) -> None:
         """Refresh the cached model list in the background so health checks stay fast."""

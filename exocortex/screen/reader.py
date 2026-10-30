@@ -94,6 +94,12 @@ class ScreenReader:
         self._last_lines: tuple[str, ...] = ()
         self._latest_event: ScreenTextEvent | None = None
         self._latest_snapshot: Any = None      # exocortex.screen.context.ScreenSnapshot (OCR lines + geometry)
+        # 2026-10-29: `capture_and_wait` -- a request counter the worker echoes once the pass that
+        # saw the request is over (text published, or nothing to publish: paused / off / an error).
+        self._pass_requested = 0
+        self._pass_started = 0
+        self._pass_completed = 0
+        self._pass_cv = threading.Condition(self._lock)
 
         # ---- state touched only by the worker thread itself ----
         self._engine: "OcrEngine | None" = None
@@ -121,6 +127,8 @@ class ScreenReader:
         """Signal the worker to stop and wait up to 5 s for it to exit."""
         self._stop_event.set()
         self._wake.set()
+        with self._pass_cv:
+            self._pass_cv.notify_all()        # a capture_and_wait() caller stops waiting too
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=5.0)
@@ -180,6 +188,29 @@ class ScreenReader:
             self._forced = True
             self._forced_accurate = self._forced_accurate or accurate
         self._wake.set()
+
+    def capture_and_wait(self, timeout_s: float, *, accurate: bool = False) -> bool:
+        """:meth:`capture_now`, then block -- at most ``timeout_s`` -- until the worker has run the
+        pass that saw the request: its text published (``latest_text`` is then that fresh read), or
+        nothing to publish because reading is paused / off or the grab failed. Returns whether the
+        pass finished in time; False at once when the worker is not running, or from the worker's
+        own thread. 2026-10-29: what a Code / Text job calls so it reads the screen the user is on
+        at the moment of the shortcut, not the one up to ``interval_s`` ago. Any other thread."""
+        thread = self._thread
+        if thread is None or not thread.is_alive() or thread is threading.current_thread():
+            return False
+        with self._pass_cv:
+            self._forced = True
+            self._forced_accurate = self._forced_accurate or accurate
+            self._pass_requested += 1
+            wanted = self._pass_requested
+        self._wake.set()
+        with self._pass_cv:
+            self._pass_cv.wait_for(
+                lambda: self._pass_completed >= wanted or self._stop_event.is_set(),
+                timeout=max(0.0, float(timeout_s)),
+            )
+            return self._pass_completed >= wanted
 
     def set_accurate_engine(self, name: str | None) -> None:
         """Name of the OCR engine to use for accurate re-reads (``capture_now(accurate=True)``),
@@ -273,6 +304,10 @@ class ScreenReader:
                 except Exception:
                     log.exception("screen-reader: unexpected error in worker tick")
                     wait_s = _ERROR_BACKOFF_S
+                finally:
+                    with self._pass_cv:          # the pass that saw request N is over (capture_and_wait)
+                        self._pass_completed = max(self._pass_completed, self._pass_started)
+                        self._pass_cv.notify_all()
                 if self._stop_event.is_set():
                     break
                 self._wake.wait(max(0.0, wait_s))
@@ -307,6 +342,7 @@ class ScreenReader:
             accurate = self._forced_accurate and forced
             self._forced = False
             self._forced_accurate = False
+            self._pass_started = self._pass_requested     # every request made so far is served by this pass
             interval = float(self._cfg.interval_s)
             exclude_own = bool(getattr(self._cfg, "exclude_own_windows", True))
 

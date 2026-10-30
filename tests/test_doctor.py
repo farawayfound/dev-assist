@@ -549,6 +549,36 @@ def test_llamacpp_check_prints_binary_source_when_present(
     assert "binary source: lmstudio" in out
 
 
+def test_llamacpp_check_resolves_the_binary_with_the_configured_runtime_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The doctor must name -- and run --list-devices against -- the binary the app will actually
+    start. With [llm].llama_source = "upstream" (an RTX 50 laptop whose only LM Studio CUDA pack is
+    the CUDA 11 build) that is the upstream build; an argument-less lookup found the LM Studio pack
+    instead and reported a working CUDA 12 setup as one that sees no GPU. Offline: no `ensure`."""
+    from exocortex.llm import server as server_mod
+
+    _patch_gpu(monkeypatch, vendor="nvidia")
+    _patch_llamacpp(monkeypatch)
+    seen: dict = {}
+
+    def fake_find(explicit: str, **kwargs: object) -> _FakeServerBinary:
+        seen.update(kwargs)
+        return _FakeServerBinary()
+
+    monkeypatch.setattr(server_mod, "find_server_binary", fake_find)
+    cfg = Config()
+    cfg.llm.llama_source = "upstream"
+    cfg.llm.llama_upstream_build = "b11200"
+    cfg.llm.runtime_dir = "D:/runtimes"
+    doctor._check_llm_llamacpp(doctor._Report(), cfg)
+    assert seen["source"] == "upstream"
+    assert seen["upstream_build"] == "b11200"
+    assert seen["upstream_root"] == Path("D:/runtimes")
+    assert seen["vendor"] == "nvidia"
+    assert "ensure" not in seen, "the doctor must never download a runtime"
+
+
 def _force_runtimes_module_absent(monkeypatch: pytest.MonkeyPatch) -> None:
     """Simulate exocortex.llm.runtimes not existing (this branch's state for most of its
     development): dropping only the sys.modules entry is not enough once the module has been

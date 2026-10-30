@@ -1,5 +1,5 @@
-"""Which repository is being worked on (exocortex.context.detect, 2026-10-21): the newest Claude
-Code session log names it; the context provider uses it when no [context].repo_root is set."""
+"""Which repository is being worked on (exocortex.project.detect, 2026-10-21): the newest Claude
+Code session log names it; the project context uses it when no [project].repo_root is set."""
 from __future__ import annotations
 
 import json
@@ -10,8 +10,8 @@ from pathlib import Path
 import pytest
 
 from exocortex.config import Config
-from exocortex.context import detect
-from exocortex.context.provider import ContextProvider
+from exocortex.project import detect
+from exocortex.project.provider import ProjectContext
 
 
 class ManualClock:
@@ -27,7 +27,7 @@ def _scratch_is_elsewhere(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> No
     """pytest's tmp_path lives under the system temp dir, which detection treats as scratch space:
     point "temp" somewhere else for these tests (and use it for the scratch case)."""
     monkeypatch.setattr(detect.tempfile, "gettempdir", lambda: str(tmp_path / "scratch"))
-    monkeypatch.setattr("exocortex.context.provider.detect_repo_root", detect.detect_repo_root)
+    monkeypatch.setattr("exocortex.project.provider.detect_repo_root", detect.detect_repo_root)
 
 
 def _log(home: Path, folder: str, cwd: Path | None, mtime: float, name: str = "session.jsonl", *, noise: int = 2) -> None:
@@ -100,7 +100,7 @@ def test_the_provider_uses_the_detected_repository_when_none_is_configured(tmp_p
     _log(home, "a", a, now - 60)
     cfg = Config()
     clock = ManualClock()
-    provider = ContextProvider(cfg, clock, home=home)
+    provider = ProjectContext(cfg, clock, home=home)
     assert provider.effective_root() == str(a) and provider.repo_source == "auto"
     assert provider.repo_root == a and provider.has_toolkit and provider.toolkit_summary().startswith("1 skill")
     assert provider.context_summary() == "scenario-a (detected from Claude Code): 1 skill"
@@ -119,17 +119,17 @@ def test_an_explicit_root_wins_and_the_switch_turns_detection_off(tmp_path: Path
     detected, chosen = _repo(tmp_path, "detected"), _repo(tmp_path, "chosen")
     _log(home, "d", detected, now - 5)
     cfg = Config()
-    provider = ContextProvider(cfg, ManualClock(), home=home)
+    provider = ProjectContext(cfg, ManualClock(), home=home)
     assert provider.repo_root == detected
-    cfg.context.repo_root = str(chosen)
+    cfg.project.repo_root = str(chosen)
     provider.reconfigure()
     assert provider.repo_root == chosen and provider.repo_source == "config"
-    assert provider.context_summary() == "chosen ([context].repo_root): no toolkit installed"
-    cfg.context.repo_root = ""
-    cfg.context.repo_auto = False
+    assert provider.context_summary() == "chosen ([project].repo_root): no toolkit installed"
+    cfg.project.repo_root = ""
+    cfg.project.repo_auto = False
     provider.reconfigure()
     assert provider.repo_root is None and provider.repo_source == "" and "no repository" in provider.context_summary()
-    cfg.context.repo_auto = True
-    cfg.context.repo_auto_max_age_h = 0
+    cfg.project.repo_auto = True
+    cfg.project.repo_auto_max_age_h = 0
     provider.reconfigure()
     assert provider.repo_root == detected                                        # 0 hours = no age limit

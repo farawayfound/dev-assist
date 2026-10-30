@@ -110,6 +110,9 @@ and the collapsed done items; the Screen tab's OCR readout; the Assist tab's his
 the explanations switch; the Live tab's in-progress speech. Below them, the switches every view
 shares:
 
+- **Overlay strips** -- Tabs, Controls, Status, Monitor: which strips of the full overlay show
+  (`[ui].show_*`, from exo-cortex; see [SHORTCUTS.md](SHORTCUTS.md#view-menu--show-or-hide-parts-of-the-panel)).
+  On the board the tab strip stays hidden either way; Controls, Status and Monitor apply.
 - **Screen source** -- Off, the active window, one of the **monitors** (listed by number, size
   and position; `[screen].monitor`) or a region. The same thing as the Screen tab's mode row.
 - **Screen: pause/resume**.
@@ -130,7 +133,7 @@ prompt per open task that has none yet, so the Action items column reads as a pl
 dev-assist discovers the install by itself: it reads the skills, agents, rules, workflows and
 hooks under `<repo>/.claude/` and the house rules and detected commands in `CLAUDE.local.md`,
 builds a compact catalog from the files' own frontmatter, and re-checks every
-`[context].rescan_s` seconds, so a `node "$HOME/claude-toolkit/install.mjs" --set live` run
+`[project].rescan_s` seconds, so a `node "$HOME/claude-toolkit/install.mjs" --set live` run
 mid-session is picked up within half a minute (a toast says what was found). Nothing about any
 particular skill is hard-coded: an updated toolkit describes itself, and the example command the
 model is shown is the first skill the toolkit's own working loop names.
@@ -144,13 +147,13 @@ prompt follows its actual steps.
 
 ### Which repository
 
-You need not set anything: with `[context].repo_auto` on (the default) dev-assist reads Claude
+You need not set anything: with `[project].repo_auto` on (the default) dev-assist reads Claude
 Code's own session logs (`~/.claude/projects`) and uses the directory of its most recent session
 -- the project you are working in -- re-checked every few seconds, so starting `claude` in the
 scenario's folder is all it takes for its toolkit to be found. Only sessions active within
 `repo_auto_max_age_h` (12 h) count, and scratch sessions under the temp directory never do.
 **⋯ › View › Repository** shows what was found and lets you pin a folder instead; the
-Settings dialog's **Context** tab holds the same: **Repository root** (explicit, wins over the
+Settings dialog's **Project** tab holds the same: **Repository root** (explicit, wins over the
 detection), the auto-detect switch and its age limit, **Claude Code toolkit context**, the
 on-mention lookup, whether answers / ask / recap get the catalog too (not only the dashboard),
 the opt-in `~/.claude` user layer, the catalog's size, and the optional toolkit clone
@@ -159,13 +162,13 @@ for the parts installed. Parts that are not installed are never listed.
 
 ## Repository lookups
 
-The same **Context** tab holds **Look up files / identifiers mentioned**. With a repository
+The same **Project** tab holds **Look up files / identifiers mentioned**. With a repository
 known, a refresh (and an answer, an ask, a recap) searches it for the identifier-shaped names the
 conversation, the question or the screen mention (`insights_now`, `ScreenReader`, `billing.py`,
 a path), and hands over only the matching lines, within `repo_max_files` / `repo_max_chars`.
 Nothing is read wholesale and nothing is sent when nothing identifier-like was mentioned or
 nothing matched. The scan is bounded (about a second per refresh, less for an answer) and skips
-`.git`, `node_modules`, `.venv`, build output and binaries (`[context].repo_exclude`). Inline
+`.git`, `node_modules`, `.venv`, build output and binaries (`[project].repo_exclude`). Inline
 completions never trigger a lookup (latency).
 
 The slim bar's **Context ▾** menu switches both lookups too (**Repository lookup**, **Toolkit
@@ -193,22 +196,22 @@ The **Dashboard** tab of the Settings dialog, and `config.toml`:
 | `[llm] dashboard_max_tokens` | `420` | Token budget of one refresh's answer |
 | `[hotkeys] toggle_dashboard` | `"ctrl+alt+d"` | The toggle |
 
-The **Context** tab:
+The **Project** tab:
 
 | Key | Default | Meaning |
 |---|---|---|
-| `[context] repo_root` | `""` | The project directory; `""` = the auto-detected one |
-| `[context] repo_auto` / `repo_auto_max_age_h` | `true` / `12` | Use the project of Claude Code's most recent session (within that many hours; `0` = any) |
-| `[context] repo_search` | `true` | Look up files / identifiers mentioned (answers, dashboard) |
-| `[context] repo_max_files` / `repo_max_chars` | `6` / `1800` | Budget of one lookup |
-| `[context] repo_exclude` | `.git`, `node_modules`, … | Directories never scanned (config file only) |
-| `[context] toolkit` | `true` | The toolkit catalog, auto-discovered in the repository |
-| `[context] toolkit_lookup` | `true` | A mentioned part's full text goes along |
-| `[context] toolkit_in_answers` | `true` | The catalog also for answers, ask and recap |
-| `[context] toolkit_user_layer` | `false` | Also scan `~/.claude/skills` and `~/.claude/agents` |
-| `[context] toolkit_dir` | `""` | The toolkit clone, for fuller descriptions; `""` = `~/claude-toolkit`, `~/.claude/dev-toolkit` |
-| `[context] toolkit_max_chars` | `3000` | Catalog budget in the system prompt |
-| `[context] rescan_s` | `30` | How often the repository and its `.claude/` are re-checked |
+| `[project] repo_root` | `""` | The project directory; `""` = the auto-detected one |
+| `[project] repo_auto` / `repo_auto_max_age_h` | `true` / `12` | Use the project of Claude Code's most recent session (within that many hours; `0` = any) |
+| `[project] repo_search` | `true` | Look up files / identifiers mentioned (answers, dashboard) |
+| `[project] repo_max_files` / `repo_max_chars` | `6` / `1800` | Budget of one lookup |
+| `[project] repo_exclude` | `.git`, `node_modules`, … | Directories never scanned (config file only) |
+| `[project] toolkit` | `true` | The toolkit catalog, auto-discovered in the repository |
+| `[project] toolkit_lookup` | `true` | A mentioned part's full text goes along |
+| `[project] toolkit_in_answers` | `true` | The catalog also for answers, ask and recap |
+| `[project] toolkit_user_layer` | `false` | Also scan `~/.claude/skills` and `~/.claude/agents` |
+| `[project] toolkit_dir` | `""` | The toolkit clone, for fuller descriptions; `""` = `~/claude-toolkit`, `~/.claude/dev-toolkit` |
+| `[project] toolkit_max_chars` | `3000` | Catalog budget in the system prompt |
+| `[project] rescan_s` | `30` | How often the repository and its `.claude/` are re-checked |
 
 `--doctor` prints what the context sees: the repository (and how it was found, plus the other
 recent Claude Code projects), the toolkit found (with every skill, agent and workflow by name and

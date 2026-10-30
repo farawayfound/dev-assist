@@ -15,7 +15,7 @@
 Option Explicit
 
 Dim fso, shell, here, pyw, pyExe, bat, stamp
-Dim fresh, needsSetup, stampTime
+Dim fresh, broken, needsSetup, stampTime, ready
 
 Set fso = CreateObject("Scripting.FileSystemObject")
 Set shell = CreateObject("WScript.Shell")
@@ -29,9 +29,14 @@ stamp = here & "\.venv\exocortex-setup.stamp"
 shell.CurrentDirectory = here
 
 fresh = Not fso.FileExists(pyw)
-needsSetup = fresh
+' A .venv whose Python was deleted out from under it (see :create_venv in run.bat) still has its
+' pythonw.exe on disk -- which then fails to start without a word, and so did this launcher. It is
+' still an existing install, so its repair runs hidden like any other catch-up below.
+broken = False
+If Not fresh Then broken = Not InterpreterStarts()
+needsSetup = fresh Or broken
 
-If Not fresh Then
+If Not needsSetup Then
     If Not fso.FileExists(stamp) Then
         ' A working .venv from before the stamp existed (or one whose stamp was removed by hand):
         ' treat it as needing a one-time migration setup, run silently (see IsNewerThanStamp).
@@ -61,22 +66,28 @@ If needsSetup Then
         ' step (`python -m exocortex.setup`) can ask which LLM to pull.
         shell.Run "cmd /c """ & bat & """ --setup-only", 1, True
     Else
-        ' An existing, already-working install just catching up (stamp migration, a changed
-        ' requirements*.txt/run.bat, or a changed GPU vendor): still do the real setup work and
-        ' still wait for it, but never flash a console for it. EXO_SETUP_QUIET=1 tells run.bat's
-        ' first-run step to skip its interactive "pull a model" prompt: nobody could answer it in
-        ' a hidden window, and the app offers its Models window instead.
+        ' An existing install just catching up (stamp migration, a changed requirements*.txt/
+        ' run.bat, a changed GPU vendor, or a repair of its deleted Python): still do the real
+        ' setup work and still wait for it, but never flash a console for it. EXO_SETUP_QUIET=1
+        ' tells run.bat's first-run step to skip its interactive "pull a model" prompt: nobody
+        ' could answer it in a hidden window, and the app offers its Models window instead. It
+        ' also keeps run.bat from deleting a broken .venv to rebuild it (see :create_venv there).
         shell.Environment("PROCESS")("EXO_SETUP_QUIET") = "1"
         shell.Run "cmd /c """ & bat & """ --setup-only", 0, True
     End If
 End If
 
-If fso.FileExists(pyw) Then
+' A repair that did not take leaves pythonw.exe in place, still unable to start. Launching it would
+' do nothing, and the visible run.bat below is a fresh install's fallback -- an existing install
+' never shows a console, not even to explain a failure. So: nothing, until run.bat itself is run.
+ready = fso.FileExists(pyw)
+If ready And broken Then ready = InterpreterStarts()
+If ready Then
     ' 0 = hidden window, False = don't wait. pythonw has no console at all.
     ' --replace: force-close any ExoCortex already running (and its model server) first,
     ' so this launch is always the only session (same as run.bat).
     shell.Run """" & pyw & """ -m exocortex --replace", 0, False
-Else
+ElseIf Not broken Then
     shell.Run "cmd /c """ & bat & """", 1, False
 End If
 
@@ -86,6 +97,20 @@ Function IsNewerThanStamp(path, stampTime)
     Else
         IsNewerThanStamp = False
     End If
+End Function
+
+' True when the venv's python.exe actually starts -- the same check as :create_venv in run.bat,
+' including -E (a stray PYTHONHOME or PYTHONPATH is not the venv's fault). Hidden window, for the
+' reason DetectedVendor gives below.
+Function InterpreterStarts()
+    Dim rc
+    InterpreterStarts = False
+    If Not fso.FileExists(pyExe) Then Exit Function
+    On Error Resume Next
+    rc = shell.Run("""" & pyExe & """ -E -c ""import sys""", 0, True)
+    If Err.Number = 0 And rc = 0 Then InterpreterStarts = True
+    Err.Clear
+    On Error Goto 0
 End Function
 
 ' exocortex.gpu is stdlib-only (ctypes), so this costs a few ms, same as run.bat's own probe.

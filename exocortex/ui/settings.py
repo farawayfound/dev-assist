@@ -21,16 +21,43 @@ app's own GGUF library, Hugging Face discovery and per-model tuning; ``FIELDS`` 
 "Model" entry and this dialog no longer touches the ``[llm]`` section at all. The ``model`` field
 kind and ``_ModelCombo`` stay here (still built by :func:`make_field_widget`) since nothing else
 needs a live, editable model picker yet.
+
+2026-10-07 (Optimize tab): ``FIELDS["Optimize"]`` is a normal tab (``[optimize]`` goal / limits and the
+``[asr]`` engine knobs), but its PAGE is built by :class:`exocortex.ui.optimize_panel.OptimizePanel`, which
+re-parents that form's widgets and adds the benchmark / plan / apply workflow on top. The dialog therefore
+gained a few additive hooks and nothing else changed: ``actions=`` (the engine, found WITHOUT touching
+``overlay.py`` -- see :func:`_resolve_actions`), :meth:`SettingsDialog.apply_paths` (apply only the values a
+plan wrote, leaving unrelated pending edits on other tabs alone), :meth:`SettingsDialog.set_values` /
+:meth:`SettingsDialog.widget_values` (fill / read widgets by path across tabs) and ``FieldForm.apply(only)``.
+``apply()`` keeps its no-argument signature on purpose: it is connected straight to ``clicked(bool)`` and
+PySide would otherwise feed the ``checked`` flag into an optional parameter.
+
+2026-10-29 (Audio tab): a seventh field kind, ``device`` (:class:`_DeviceCombo`: an editable picker whose value
+is a device *spec* as ``exocortex.audio.capture.resolve_device`` reads one -- "default", a name, an index), for
+``[audio].system_device`` / ``mic_device``; ``FIELDS["Audio"]`` grew the device pickers and the voice-detection
+knobs; and, like Optimize, the Audio tab's PAGE is built by :class:`exocortex.ui.audio_panel.AudioPanel`
+(device list from a background scan, a Test button and level meter per source, what the running app has open)
+around the ordinary ``FieldForm``. The page builders are listed in :data:`SettingsDialog._PAGE_BUILDERS`; a
+panel that fails to build falls back to the plain form, so the tab always exists.
+
+2026-10-29 (Shortcuts tab): ``FIELDS["Shortcuts"]`` lists every ``[hotkeys]`` entry as a ``binding`` field
+(:class:`_BindingEdit`: the binding in words, **Set** -- listen for the next key(s) or mouse button -- and
+**Default**), and its page is :class:`ShortcutsPage`, registered in ``SettingsDialog._PAGE_BUILDERS`` next to
+Optimize. The grammar is :mod:`exocortex.bindings`; a row the grammar rejects is flagged and skipped by
+``_apply()``. The overlay re-registers its shortcuts when any ``hotkeys.*`` value is applied. The Assist tab
+gained **Consider given code** (``[assist].consider_given_code``) and the Hands-free tab the hold switch of
+the third manual gesture (``manual_hold_code_fresh``).
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+import sys
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QFontMetrics, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -38,29 +65,39 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from exocortex.bindings import describe_binding, key_token_for_vk, normalize_binding
 from exocortex.config import Config
-from exocortex.ui.audio_check import AudioCheckPanel
 from exocortex.ui.theme import COLORS, build_qss
+
+if TYPE_CHECKING:  # the UI never imports the capture module at run time; the panel does
+    from exocortex.audio.capture import DeviceInfo
+
+try:
+    from exocortex.ui.llhooks import CaptureHooks, ChordRecorder
+except Exception:  # noqa: BLE001 - pure ctypes, but the dialog must open even if it cannot load
+    CaptureHooks = None  # type: ignore[assignment,misc]
+    ChordRecorder = None  # type: ignore[assignment,misc]
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class Field:
-    """One editable config value. ``kind``: bool | int | float | choice | text | model |
-    mic_device | system_device."""
+    """One editable config value. ``kind``: bool | int | float | choice | text | model | device | binding
+    (2026-10-29: ``device`` is an audio device picker, :class:`_DeviceCombo`; ``binding`` a ``[hotkeys]``
+    shortcut, edited with :class:`_BindingEdit`)."""
 
     section: str
     key: str
@@ -147,6 +184,10 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "right away -- and so does a touchpad three-finger tap once Windows Settings > "
                    "Bluetooth & devices > Touchpad maps it to 'Middle mouse button' (a tap cannot be "
                    "held). Checked: the middle button must be held for the press-and-hold time too."),
+        Field("handsfree", "manual_hold_code_fresh", "Press and hold for Code from scratch (mouse 4)", "bool",
+              help="Unchecked (default): a click of the third gesture's button (mouse button 4 by default; "
+                   "Shortcuts tab) writes the code from scratch, ignoring the code on screen. Checked: it "
+                   "must be held for the press-and-hold time."),
         Field("handsfree", "enabled", "Hands-free mode on (also at the next launch)", "bool",
               help="Same as the switch at the right of the tab strip (Ctrl+Alt+H)."),
     ),
@@ -163,6 +204,18 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "short comment above every logical step plus a one-line summary. detailed: the code "
                    "opens with a requirements + pseudo-code comment block, then a comment above most "
                    "lines (the way an engineer works a challenge through in the editor)."),
+        Field("assist", "consider_given_code", "Consider given code", "bool",
+              help="On (default): solve, Code and Text work with the code already written in the development "
+                   "window -- they complete it, or fix only what is wrong, keeping its structure, names and "
+                   "approach -- instead of jumping to the optimal solution from scratch; a platform's starter "
+                   "code is filled in. Off: the best solution from scratch, keeping only the entry point the "
+                   "task dictates. The manual-advance 'Code from scratch' gesture (Shortcuts tab) always "
+                   "ignores the given code."),
+        Field("assist", "code_only", "Code answers as plain code only", "bool",
+              help="On (default): a Code answer is one code block and nothing else -- a note or the complexity "
+                   "goes inside it as comment lines in the language's own syntax, and markdown the model slips "
+                   "in (a heading, bold, bullets) is turned into comments. With explanations on, the walkthrough "
+                   "stays and the rule applies to the code block. Off: the answer as the model wrote it."),
         Field("assist", "style", "Answer style", "choice", choices=("bullets", "short", "detailed")),
         Field("assist", "focus", "What is worth answering (screen questions, hands-free tasks)", "choice",
               choices=("auto", "technical", "all"),
@@ -233,7 +286,7 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("dashboard", "max_new_items", "New items per column (and per task) per refresh", "int", 1, 8),
         Field("dashboard", "suggest_prompts", "Suggest prompts for Claude Code under the action items", "bool",
               help="Exactly what to type into Claude Code next, one per task that needs one. With a toolkit "
-                   "installed in the repository (the Context tab) every prompt starts with one of its slash "
+                   "installed in the repository (the Project tab) every prompt starts with one of its slash "
                    "commands or agents, named exactly as installed; a prompt naming something that is not "
                    "installed is thrown away."),
         Field("dashboard", "show_resolved", "Keep answered / done / met items visible, collapsed", "bool"),
@@ -255,42 +308,53 @@ FIELDS: dict[str, tuple[Field, ...]] = {
               help="Applies to the next session (New session / the next launch); off = in memory only. "
                    "The board is also written as dashboard.md next to the notes either way."),
     ),
-    # ---- model context (2026-10-20): what the model may look up beyond transcript + screen ----
-    "Context": (
-        Field("context", "repo_root", "Repository root (the project being worked on)", "text",
+    # ---- the project (2026-10-20): what the model may look up beyond transcript + screen ----
+    "Project": (
+        Field("project", "repo_root", "Repository root (the project being worked on)", "text",
               help="A directory. Searched on demand for the file names and identifiers a prompt mentions; "
                    "never read wholesale. Also where the Claude Code toolkit is looked for (.claude/, "
                    "CLAUDE.local.md). Empty = the auto-detected one below, when that is on."),
-        Field("context", "repo_auto", "Auto-detect the repository from Claude Code", "bool",
+        Field("project", "repo_auto", "Auto-detect the repository from Claude Code", "bool",
               help="With no root above: the directory Claude Code was most recently run in, read from its own "
                    "session logs (~/.claude/projects), re-checked every few seconds -- so the toolkit installed "
                    "in the project you are working in is found with no setup. The ⋯ menu's View > Repository "
                    "shows what was found."),
-        Field("context", "repo_auto_max_age_h", "... only a session active within (hours; 0 = any)", "int", 0, 720),
-        Field("context", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
+        Field("project", "repo_auto_max_age_h", "... only a session active within (hours; 0 = any)", "int", 0, 720),
+        Field("project", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
               help="Only the matching lines go to the model, only when something identifier-like was said, "
                    "typed or shown. Not for inline completions (latency)."),
-        Field("context", "repo_max_files", "... files per lookup", "int", 1, 20),
-        Field("context", "repo_max_chars", "... characters of matched lines", "int", 200, 8000, 100),
-        Field("context", "toolkit", "Claude Code toolkit context (auto-discovered in the repository)", "bool",
+        Field("project", "repo_max_files", "... files per lookup", "int", 1, 20),
+        Field("project", "repo_max_chars", "... characters of matched lines", "int", 200, 8000, 100),
+        Field("project", "toolkit", "Claude Code toolkit context (auto-discovered in the repository)", "bool",
               help="The installed skills, agents, rules, workflows and hooks, as a compact catalog built from "
                    "their own files -- nothing hard-coded -- so the model names them exactly and suggests "
                    "the right one. Re-checked every few seconds (below): an install mid-session is picked up."),
-        Field("context", "toolkit_lookup", "... hand over the full text of a skill / agent that is mentioned", "bool"),
-        Field("context", "toolkit_in_answers", "... also for answers, ask and recap (not only the dashboard)", "bool",
+        Field("project", "toolkit_lookup", "... hand over the full text of a skill / agent that is mentioned", "bool"),
+        Field("project", "toolkit_in_answers", "... also for answers, ask and recap (not only the dashboard)", "bool",
               help="The catalog sits at the end of the system prompt, so it is prefix-cached across turns."),
-        Field("context", "toolkit_user_layer", "... also scan ~/.claude (the opt-in user layer)", "bool"),
-        Field("context", "toolkit_dir", "Toolkit clone (optional)", "text",
+        Field("project", "toolkit_user_layer", "... also scan ~/.claude (the opt-in user layer)", "bool"),
+        Field("project", "toolkit_dir", "Toolkit clone (optional)", "text",
               help="Richer one-line descriptions from its modules/index.json for the parts installed. Empty = "
                    "~/claude-toolkit or ~/.claude/dev-toolkit when present. Never lists parts that are not "
                    "installed."),
-        Field("context", "toolkit_max_chars", "Toolkit catalog budget (chars)", "int", 300, 8000, 100),
-        Field("context", "rescan_s", "Re-check the repository's .claude/ every (s)", "int", 5, 600, 5),
+        Field("project", "toolkit_max_chars", "Toolkit catalog budget (chars)", "int", 300, 8000, 100),
+        Field("project", "rescan_s", "Re-check the repository's .claude/ every (s)", "int", 5, 600, 5),
     ),
     "Screen": (
         Field("screen", "interval_s", "Capture interval (s)", "float", 0.5, 10.0, 0.5),
         Field("screen", "monitor", "Monitor to read in monitor mode (0 = primary)", "int", 0, 8,
               help="The ⋯ menu's View > Screen source lists the monitors by number with their size and position."),
+        Field("screen", "read_on_shortcut", "Read the screen when Code / Text is pressed", "bool",
+              help="On (default): the Code and Text shortcuts, buttons and gestures read the screen at that moment "
+                   "and work on the file you are in, instead of the last pass (up to the capture interval old). "
+                   "Waits at most the read timeout for the OCR."),
+        Field("screen", "read_timeout_s", "Read timeout (s)", "float", 0.5, 15.0, 0.5),
+        Field("screen", "workspace", "Workspace: hand the other files of the task to Code / Text", "bool",
+              help="On (default): every file or pane seen since the checkpoint -- the task statement, a parent "
+                   "class, an interface, a test -- is kept as the task's workspace and handed to Code / Text "
+                   "next to the screen, so the answer is written for the file on screen in the context of the "
+                   "others. A checkpoint starts a new workspace."),
+        Field("screen", "workspace_chars", "Workspace text handed to the model (chars)", "int", 500, 12000, 250),
         Field("screen", "auto_suggest", "Solve / suggest when the screen changes", "bool",
               help="Off by default while you drive: your editor changes all the time, and every change "
                    "would start an unrequested solve that takes over the Assist tab. On for an interview / "
@@ -313,30 +377,135 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "never the NVIDIA GPU. npu = Intel AI Boost via OpenVINO (1.5 s, ~0 CPU). cpu = OpenVINO CPU "
                    "(1.9 s) or onnxruntime (3.7 s, all cores). auto = igpu, else npu, else cpu."),
     ),
+    "Monitor": (
+        Field("monitor", "show_performance", "LLM performance (speed, tokens/second)", "bool"),
+        Field("monitor", "show_context", "Context window and its contents", "bool"),
+        Field("monitor", "show_cpu", "CPU utilisation", "bool"),
+        Field("monitor", "show_ram", "System RAM utilisation", "bool"),
+        Field("monitor", "show_gpu", "GPU utilisation and VRAM (dedicated GPU)", "bool"),
+        Field("monitor", "show_igpu", "Integrated GPU (iGPU) utilisation", "bool",
+              help="Hidden automatically when the machine has no integrated GPU."),
+        Field("monitor", "show_npu", "NPU utilisation", "bool",
+              help="The AI accelerator (e.g. Intel AI Boost). Hidden automatically when absent."),
+    ),
     "Window": (
         Field("ui", "opacity", "Opacity", "float", 0.4, 1.0, 0.05),
         Field("ui", "start_hidden", "Start hidden", "bool"),
         Field("ui", "font_size", "Font size (pt)", "int", 8, 18, restart=True),
     ),
-    # ---- 2026-10-21: device pickers (applied at once) + the Check panel below them ----
+    # 2026-10-29: the page is built by exocortex.ui.audio_check.CheckedAudioPanel (exo-cortex's
+    # AudioPanel -- device list, a Test per source, level meters -- plus this fork's Windows-mute and
+    # speaker-routing checks) around this form. The on/off switches, the devices and the keep-alive tone
+    # apply live (Engine.apply_settings -> SpeechPipeline.restart_source); the voice-detection knobs feed
+    # a segmenter that is built once per source, so they stay restart-only.
     "Audio": (
-        Field("audio", "mic_device", "Microphone (you)", "mic_device",
-              help="Everything this device hears is transcribed as Me and never clustered. default = the "
-                   "Windows default input, followed when it changes; or pick a device (part of a name, or a "
-                   "device number, works too). Applied at once. Test devices below shows whether it hears you."),
-        Field("audio", "system_device", "Output feed (everyone else)", "system_device",
+        Field("audio", "capture_system", "Capture system audio", "bool",
+              help="The other side of the call: a WASAPI loopback of an output device. Applies at once."),
+        Field("audio", "system_device", "System audio device", "device",
               help="The [Loopback] of the device your speakers or headset play through: what it plays is "
-                   "transcribed and clustered into Speaker 1, 2, ... default = the Windows default output, "
-                   "followed when it changes. Applied at once."),
-        Field("audio", "capture_mic", "Capture the microphone", "bool", restart=True),
-        Field("audio", "capture_system", "Capture system audio", "bool", restart=True),
+                   "transcribed and clustered into Speaker 1, 2, ... Default = the loopback of the Windows "
+                   "default output device, followed when it changes. Pick a device from the list (stored by "
+                   "name), or type part of a name or a device index. Test opens it for a moment and reports "
+                   "what arrives. Applies at once."),
+        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool",
+              help="A -80 dBFS tone on the default output keeps WASAPI loopback delivering audio while nothing "
+                   "plays (Windows idles the endpoint otherwise). Applies at once."),
+        Field("audio", "capture_mic", "Capture the microphone", "bool", help="You. Applies at once."),
+        Field("audio", "mic_device", "Microphone", "device",
+              help="Everything this device hears is transcribed as Me and never clustered. Default = the Windows "
+                   "default input device, followed when it changes. Pick a device from the list (stored by "
+                   "name), or type part of a name or a device index. Applies at once."),
         Field("audio", "mic_start_muted", "Start with the mic muted", "bool"),
         Field("audio", "echo_suppression", "Echo suppression (drop mic text that echoes the other side)", "bool",
               help="For a mic that hears the speakers (laptop speakers, no headset): a line that repeats what "
                    "the other feed said in the last 8 s is dropped. With clean routing (Check speaker routing "
                    "below) there is no echo to catch, and it can only drop real lines -- both sides saying "
                    "\"okay\"."),
-        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool", restart=True),
+        Field("audio", "vad_threshold", "Speech probability that counts as speech", "float", 0.1, 0.95, 0.05,
+              restart=True, help="Silero VAD threshold. Lower catches quieter speech and more noise; higher misses "
+                                 "soft starts."),
+        Field("audio", "min_silence_s", "Silence that ends an utterance (s)", "float", 0.1, 2.0, 0.05, restart=True,
+              help="Shorter gives finals sooner; 0.45 merges closely spoken sentences."),
+        Field("audio", "min_speech_s", "Shortest speech kept (s)", "float", 0.05, 2.0, 0.05, restart=True),
+        Field("audio", "max_utterance_s", "Longest utterance before a forced split (s)", "float", 5.0, 60.0, 1.0,
+              restart=True),
+        Field("audio", "pre_roll_s", "Audio kept from before speech starts (s)", "float", 0.0, 1.0, 0.05,
+              restart=True),
+    ),
+    # 2026-10-29 (Shortcuts tab): every [hotkeys] entry, in the order the page lists them -- the global
+    # shortcuts, then the manual-advance gestures -- as "binding" fields (one grammar for key combinations,
+    # single-key taps and mouse buttons: exocortex.bindings), plus the thumb-button swallow switch. The page
+    # is built by ShortcutsPage (see _PAGE_BUILDERS); tests pin that every HotkeysConfig field is here.
+    "Shortcuts": (
+        Field("hotkeys", "toggle_visible", "Show / hide the overlay", "binding"),
+        Field("hotkeys", "ask_focus", "Show the overlay and focus the ask box", "binding"),
+        Field("hotkeys", "answer_last", "Answer the last thing the other side said", "binding"),
+        Field("hotkeys", "toggle_auto", "Auto-answer on / off", "binding"),
+        Field("hotkeys", "suggest_now", "Suggestions from the screen and the conversation, now", "binding"),
+        Field("hotkeys", "notes", "Regenerate the notes", "binding"),
+        Field("hotkeys", "insights", "Suggested questions and blind spots / follow-ups, now", "binding"),
+        Field("hotkeys", "recap", "Recap the session so far", "binding"),
+        Field("hotkeys", "code", "Code: write the code for the task", "binding"),
+        Field("hotkeys", "checkpoint", "Checkpoint: the coding context starts fresh", "binding"),
+        Field("hotkeys", "toggle_explanations", "Explanations on / off", "binding"),
+        Field("hotkeys", "toggle_completion", "Completion mode on / off", "binding"),
+        Field("hotkeys", "toggle_handsfree", "Hands-free mode on / off", "binding"),
+        Field("hotkeys", "toggle_manual", "Manual advance on / off", "binding"),
+        Field("hotkeys", "toggle_dashboard", "Dashboard mode on / off", "binding"),
+        Field("hotkeys", "select_region", "Drag a screen region to read", "binding"),
+        Field("hotkeys", "toggle_screen", "Pause / resume screen reading", "binding"),
+        Field("hotkeys", "toggle_mic", "Mute / unmute the mic", "binding"),
+        Field("hotkeys", "toggle_pause", "Pause / resume everything automatic", "binding",
+              help="A tap of a single key by default (Right Shift): pressed and released with no other key "
+                   "in between, so typing capitals never trips it."),
+        Field("hotkeys", "click_through", "Click-through on / off", "binding"),
+        Field("hotkeys", "move_left", "Move the overlay left", "binding"),
+        Field("hotkeys", "move_right", "Move the overlay right", "binding"),
+        Field("hotkeys", "move_up", "Move the overlay up", "binding"),
+        Field("hotkeys", "move_down", "Move the overlay down", "binding"),
+        Field("hotkeys", "quit", "Quit (saves the session)", "binding"),
+        Field("hotkeys", "manual_text", "Manual advance: Text", "binding",
+              help="The left button, held, by default (the Hands-free tab decides which gestures need the hold)."),
+        Field("hotkeys", "manual_code", "Manual advance: Code", "binding",
+              help="A middle click by default. Works with the given code when 'Consider given code' (Assist "
+                   "tab) is on."),
+        Field("hotkeys", "manual_code_fresh", "Manual advance: Code from scratch", "binding",
+              help="Mouse button 4 (the rear thumb button) by default. Always ignores the code on screen: "
+                   "straight to the best solution."),
+        Field("hotkeys", "swallow_thumb_buttons", "Keep thumb-button presses (mouse 4 / 5) from the app underneath",
+              "bool",
+              help="A bound thumb button would otherwise make a browser or an editor go Back / Forward on the "
+                   "very press that asks for code. Modified clicks (Ctrl+left) are always kept, bare left / "
+                   "middle / right presses never."),
+    ),
+    # 2026-10-07 (Optimize tab): appended LAST on purpose ("Completion" must stay first). This tab's page is built
+    # by exocortex.ui.optimize_panel.OptimizePanel, which re-parents these widgets into its own layout; the
+    # FieldForm underneath stays the source of truth for load / changes / apply / restore_defaults, so every
+    # invariant tests/test_settings.py pins for the other tabs holds here too. Nothing under [llm] is edited.
+    "Optimize": (
+        Field("optimize", "goal", "Optimise for", "choice",
+              choices=("latency", "balanced", "context", "quality"),
+              help="latency: fastest answers and 3 GB of GPU memory kept free. balanced: today's behaviour plus the "
+                   "safe fixes. context: every spare GB becomes conversation window. quality: 16-bit KV cache where "
+                   ">= 32k fits."),
+        Field("optimize", "reserve_vram_mb", "GPU memory kept free (MB, 0 = automatic)", "int", 0, 12000, 256,
+              help="Never planned into: the desktop shares this GPU. 0 = the VRAM-guard floor + 256 plus a per-goal "
+                   "allowance. Any value is raised to the guard floor + 256 if lower."),
+        Field("optimize", "ctx_cap", "Longest window to plan (tokens, 0 = the model's maximum)", "int", 0, 262144, 2048),
+        Field("optimize", "asr_gpu", "Speech recognition on the display GPU", "choice", choices=("auto", "never"),
+              help="never = Whisper is not planned onto the GPU (the 2026-09-25 rule). auto = only when Parakeet "
+                   "cannot be used (hotwords, an unsupported language) or measurably loses on accuracy."),
+        Field("asr", "engine", "Speech engine", "choice", choices=("auto", "faster-whisper", "sherpa"), restart=True,
+              help="auto = Whisper whenever CUDA exists, EVEN when the device below is cpu. Measured on this machine: "
+                   "Whisper on the CPU 6.2 s per utterance, Parakeet (sherpa) on the CPU 0.15 s, Whisper on CUDA "
+                   "0.11 s but it holds 0.9 GB of GPU memory. sherpa = Parakeet-TDT on the CPU: no GPU memory, "
+                   "English or 25 European languages, no hotwords."),
+        Field("asr", "device", "Whisper device", "choice", choices=("auto", "cuda", "cpu"), restart=True,
+              help="Where Whisper runs. cpu keeps ~1-2.5 GB off the display GPU but costs seconds per utterance."),
+        Field("asr", "compute_type", "Whisper precision", "choice",
+              choices=("auto", "float16", "int8_float16", "int8"), restart=True,
+              help="int8_float16 on CUDA holds about 0.9 GB, float16 about 2.4 GB; int8 is the CPU precision."),
+        Field("asr", "cpu_threads", "Speech CPU threads (0 = automatic)", "int", 0, 32, 1, restart=True),
     ),
 }
 
@@ -367,6 +536,10 @@ QComboBox QAbstractItemView {{ background: {COLORS['bg_solid']}; color: {COLORS[
 QCheckBox {{ spacing: 6px; }}
 QLabel#restart {{ color: {COLORS['warn']}; }}
 QLabel#help {{ color: {COLORS['text_faint']}; }}
+QLabel#section {{ color: {COLORS['accent']}; font-weight: 600; margin-top: 6px; }}
+QLabel#fixed {{ color: {COLORS['text_dim']}; }}
+QLabel#binding[state="invalid"] {{ color: {COLORS['err']}; }}
+QLabel#binding[state="listening"] {{ color: {COLORS['accent']}; }}
 """
 
 
@@ -429,72 +602,69 @@ def _widen_popup(combo: QComboBox) -> None:
     view.setMinimumWidth(max(combo.width(), min(widest + _LIST_CHROME_PX, cap)))
 
 
-def _list_audio_devices() -> list[Any]:
-    """Every WASAPI device PortAudio knows (imported lazily: pyaudiowpatch is Windows-only)."""
-    from exocortex.audio.capture import list_devices
-
-    return list_devices()
-
-
 class _DeviceCombo(QComboBox):
-    """Editable audio device picker for a ``mic_device`` / ``system_device`` field.
+    """Editable device picker for a ``device``-kind field (``[audio].system_device`` / ``mic_device``).
 
-    The items are values the config takes: ``default`` (the Windows default, which capture follows
-    when it changes), then every WASAPI device of that kind by its full name; part of a name or a
-    PortAudio index can be typed too, exactly as in config.toml. Like :class:`_ModelCombo`, the list
-    is re-read every time it drops down -- a headset plugged in while the dialog is open shows up on
-    the next click -- and widened to the longest name; each row's tool tip has its rate, channels
-    and whether Windows uses it by default. Nothing is enumerated until the first drop-down."""
+    Its value is a *spec* exactly as :func:`exocortex.audio.capture.resolve_device` reads one:
+    ``"default"``, a device name (matched as a case-insensitive substring) or a PortAudio index.
+    The rows are "Default" (with the device it resolves to appended once a scan has said) plus
+    every candidate device by its full name; a row's spec is its item data, so what is painted may
+    say more than what is stored. Text typed that matches no row is stored as typed (a substring,
+    an index), and a config value that matches no row is shown as typed rather than altered, so
+    loading never produces a phantom change. :class:`exocortex.ui.audio_panel.AudioPanel` fills the
+    rows from a background scan; the plain-form fallback leaves "Default" and the ability to type.
+    No completer: what is typed is what is stored.
+    """
 
-    def __init__(self, kind: str, help_text: str = "", parent: QWidget | None = None) -> None:
+    DEFAULT = "default"
+
+    def __init__(self, help_text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setEditable(True)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)   # device names are long
-        self.kind = kind             # "mic" | "system"
-        self._help = help_text
-        self.addItem("default")
-        self.currentTextChanged.connect(lambda _text: self.sync_tooltip())
-        # a picked name shows from its start (the field is narrower than most names)
-        self.currentIndexChanged.connect(lambda _i: self.lineEdit().setCursorPosition(0))
-        self.sync_tooltip()
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setCompleter(None)  # type: ignore[arg-type]
+        self.setMinimumContentsLength(18)
+        if help_text:
+            self.setToolTip(help_text)
+        self.set_devices([], None)
 
-    def refresh(self) -> None:
-        """Re-read the devices, keeping whatever is selected or typed."""
-        current = self.currentText().strip()
-        try:
-            devices = _list_audio_devices()
-        except Exception:  # noqa: BLE001 - keep the items there are
-            log.warning("audio device list unavailable", exc_info=True)
-            return
-        if self.kind == "system":
-            picks = [d for d in devices if d.is_loopback]
-        else:
-            picks = [d for d in devices if d.is_input and not d.is_loopback]
-        default = next((d for d in picks if d.is_default), None)
+    def set_devices(self, devices: "list[DeviceInfo]", default_name: str | None) -> None:
+        """Replace the rows, keeping the current spec (chosen or typed). Emits no signals."""
+        spec = self.spec()
         self.blockSignals(True)
-        self.clear()
-        self.addItem("default")
-        self.setItemData(0, "The Windows default" + (f": {default.name}" if default else "")
-                         + " -- followed when it changes", Qt.ItemDataRole.ToolTipRole)
-        for d in picks:
-            self.addItem(d.name)
-            tip = f"{d.name}\n{d.sample_rate} Hz, {d.channels} ch" + ("\nthe Windows default" if d.is_default else "")
-            self.setItemData(self.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
-        idx = self.findText(current)
-        if idx >= 0:
-            self.setCurrentIndex(idx)
-        else:
-            self.setEditText(current)
-        self.blockSignals(False)
-        self.sync_tooltip()
+        try:
+            self.clear()
+            self.addItem("Default" + (f"  ({default_name})" if default_name else ""), self.DEFAULT)
+            self.setItemData(0, "Follows the Windows default device", Qt.ItemDataRole.ToolTipRole)
+            for d in devices:
+                self.addItem(d.name, d.name)
+                tip = f"index {d.index} · {d.sample_rate} Hz · {d.channels} ch" + (" · Windows default" if d.is_default else "")
+                self.setItemData(self.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+            self.set_spec(spec)
+        finally:
+            self.blockSignals(False)
 
-    def sync_tooltip(self) -> None:
-        self.setToolTip("\n".join(t for t in (self.currentText().strip(), self._help) if t))
+    def spec(self) -> str:
+        """The stored value: the chosen row's spec, else the typed text ("" and "Default" -> "default")."""
+        text = self.currentText().strip()
+        idx = self.currentIndex()
+        if idx >= 0 and text == self.itemText(idx).strip():
+            return str(self.itemData(idx) or self.DEFAULT)
+        if not text or text.lower() == self.DEFAULT:
+            return self.DEFAULT
+        return text
 
-    def showPopup(self) -> None:  # noqa: N802 - Qt override
-        self.refresh()
-        _widen_popup(self)
-        super().showPopup()
+    def set_spec(self, spec: object) -> None:
+        """Select the row whose spec this is, or show it as typed text."""
+        text = str(spec if spec is not None else "").strip() or self.DEFAULT
+        if text.lower() == self.DEFAULT:
+            text = self.DEFAULT
+        for i in range(self.count()):
+            if str(self.itemData(i)) == text:
+                self.setCurrentIndex(i)
+                return
+        self.setCurrentIndex(-1)
+        self.setEditText(text)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -525,6 +695,8 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
         w = QComboBox(parent)
         w.addItems(list(f.choices))
         return w
+    if f.kind == "device":
+        return _DeviceCombo(f.help, parent)
     if f.kind == "model":
         w = _ModelCombo(refresh_models or (lambda: None), f.help, parent)
         if list_models is not None:
@@ -533,14 +705,17 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
             except Exception:  # noqa: BLE001
                 log.exception("list_models() failed")
         return w
-    if f.kind in ("mic_device", "system_device"):
-        return _DeviceCombo("mic" if f.kind == "mic_device" else "system", f.help, parent)
+    if f.kind == "binding":
+        # 2026-10-29: the row's Default button needs the built-in value of this very field
+        return _BindingEdit(str(getattr(getattr(_defaults(), f.section), f.key)), parent)
     return QLineEdit(parent)
 
 
 def set_field_value(widget: QWidget, f: Field, value: Any) -> None:
     """Write ``value`` into ``widget`` (the inverse of :func:`get_field_value`)."""
-    if isinstance(widget, QCheckBox):
+    if isinstance(widget, _DeviceCombo):
+        widget.set_spec(value)
+    elif isinstance(widget, QCheckBox):
         widget.setChecked(bool(value))
     elif isinstance(widget, QDoubleSpinBox):
         widget.setValue(float(value))
@@ -555,12 +730,16 @@ def set_field_value(widget: QWidget, f: Field, value: Any) -> None:
         widget.setCurrentIndex(idx)
     elif isinstance(widget, QLineEdit):
         widget.setText(str(value))
+    elif isinstance(widget, _BindingEdit):
+        widget.set_value(str(value))
     else:  # pragma: no cover - every kind above returns one of these
         raise TypeError(type(widget))
 
 
 def get_field_value(widget: QWidget, f: Field) -> Any:
     """Read ``widget``'s current value back out, as the type ``f.kind`` implies."""
+    if isinstance(widget, _DeviceCombo):
+        return widget.spec()
     if isinstance(widget, QCheckBox):
         return widget.isChecked()
     if isinstance(widget, QDoubleSpinBox):
@@ -571,6 +750,8 @@ def get_field_value(widget: QWidget, f: Field) -> Any:
         return widget.currentText().strip()
     if isinstance(widget, QLineEdit):
         return widget.text().strip()
+    if isinstance(widget, _BindingEdit):
+        return widget.value()
     raise TypeError(type(widget))  # pragma: no cover - every kind above returns one of these
 
 
@@ -603,11 +784,6 @@ class FieldForm:
             form.addRow(label, widget)
         scroll.setWidget(inner)
         self.widget = scroll
-        self._layout = form
-
-    def add_row(self, widget: QWidget) -> None:
-        """Append a full-width widget below the fields (the Audio tab's Check panel)."""
-        self._layout.addRow(widget)
 
     def load(self) -> None:
         """Fill every widget from the current config."""
@@ -627,9 +803,12 @@ class FieldForm:
                 out[f.path] = new
         return out
 
-    def apply(self) -> dict[str, Any]:
-        """Write the changed values into the config; returns the changes."""
-        changed = self.changes()
+    def apply(self, only: Collection[str] | None = None) -> dict[str, Any]:
+        """Write the changed values into the config; returns the changes. ``only`` (2026-10-07,
+        Optimize tab) limits the write to those ``"section.key"`` paths: everything else stays a
+        pending edit in its widget. Nothing connects this method to a Qt signal (it is called, never
+        wired), so the optional parameter cannot receive a ``checked`` flag."""
+        changed = {k: v for k, v in self.changes().items() if only is None or k in only}
         for f in self.fields:
             if f.path in changed:
                 setattr(getattr(self._cfg, f.section), f.key, changed[f.path])
@@ -645,6 +824,425 @@ class FieldForm:
             set_field_value(self.widgets[f.path], f, getattr(getattr(defaults, f.section), f.key))
 
 
+
+# ---------------------------------------------------------------------------------------------
+# Shortcuts tab (2026-10-29): every [hotkeys] binding in one list -- the current binding in words,
+# a Set button that listens for the next key(s) / mouse button, a Default button per row -- plus
+# the fixed in-overlay keys, so the tab shows every shortcut the app has.
+# ---------------------------------------------------------------------------------------------
+#: How long the Set button waits after the last press before taking the combination.
+CAPTURE_QUIET_S = 0.5
+
+#: (where, key or gesture, action): the shortcuts that are NOT rebindable, listed for completeness.
+#: Mirrors docs/SHORTCUTS.md "Inside the overlay".
+FIXED_SHORTCUTS: tuple[tuple[str, str, str], ...] = (
+    ("Ask box", "Enter", "Send the question"),
+    ("Ask box", "Esc", "Clear the box"),
+    ("Region picker", "Drag", "Select the region"),
+    ("Region picker", "Enter or double-click", "Accept the region"),
+    ("Region picker", "Esc or right-click", "Cancel"),
+    ("Live tab", "Double-click a speaker name", "Rename the speaker"),
+    ("Title bar or slim bar", "Drag", "Move the overlay"),
+    ("Window edges, bottom-right corner", "Drag", "Resize the overlay"),
+    ("Panel, except over text", "Right-click", "The \u22ef menu"),
+    ("Text panes and the ask box", "Right-click", "The text menu, Hide overlay, Quit"),
+    ("Hands-free view, over the answer or the history", "Mouse wheel", "Scroll it (the view stays click-through)"),
+    ("Hands-free view, over the expanded history", "Tap Up / Down", "Previous / next answer"),
+    ("Shortcuts tab, while Set listens", "Esc", "Cancel"),
+)
+
+
+def _real_windows() -> bool:
+    """True only on real Windows with the native "windows" Qt platform (never under the offscreen
+    QPA the tests use): the one case the capture hooks may touch the real keyboard and mouse."""
+    return sys.platform == "win32" and QGuiApplication.platformName() == "windows"
+
+
+def _restyle(widget: QWidget, name: str) -> None:
+    """Switch a widget's object name (its QSS role) and repolish it so the new style shows."""
+    if widget.objectName() != name:
+        widget.setObjectName(name)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+
+_QT_KEY_TOKENS: dict[int, str] = {
+    int(Qt.Key.Key_Space): "space", int(Qt.Key.Key_Left): "left", int(Qt.Key.Key_Up): "up",
+    int(Qt.Key.Key_Right): "right", int(Qt.Key.Key_Down): "down", int(Qt.Key.Key_Return): "enter",
+    int(Qt.Key.Key_Enter): "enter", int(Qt.Key.Key_Escape): "esc", int(Qt.Key.Key_Tab): "tab",
+    int(Qt.Key.Key_Backspace): "backspace", int(Qt.Key.Key_Insert): "insert", int(Qt.Key.Key_Delete): "delete",
+    int(Qt.Key.Key_Home): "home", int(Qt.Key.Key_End): "end", int(Qt.Key.Key_PageUp): "pageup",
+    int(Qt.Key.Key_PageDown): "pagedown", int(Qt.Key.Key_QuoteLeft): "grave", int(Qt.Key.Key_Minus): "-",
+    int(Qt.Key.Key_Equal): "=", int(Qt.Key.Key_BracketLeft): "[", int(Qt.Key.Key_BracketRight): "]",
+    int(Qt.Key.Key_Semicolon): ";", int(Qt.Key.Key_Apostrophe): "'", int(Qt.Key.Key_Comma): ",",
+    int(Qt.Key.Key_Period): ".", int(Qt.Key.Key_Slash): "/", int(Qt.Key.Key_Backslash): "backslash",
+    int(Qt.Key.Key_Shift): "shift", int(Qt.Key.Key_Control): "ctrl", int(Qt.Key.Key_Alt): "alt",
+    int(Qt.Key.Key_Meta): "win",
+}
+_KEY_A, _KEY_Z, _KEY_0, _KEY_9 = int(Qt.Key.Key_A), int(Qt.Key.Key_Z), int(Qt.Key.Key_0), int(Qt.Key.Key_9)
+_KEY_F1, _KEY_F12 = int(Qt.Key.Key_F1), int(Qt.Key.Key_F12)
+
+
+def _qt_key_token(event: QKeyEvent) -> str | None:
+    """The binding token of a Qt key event (the capture's fallback path, when the low-level hooks
+    are unavailable): the native virtual key when Qt reports one (side-specific modifiers), else
+    the Qt key code. ``None`` for a key the grammar has no name for."""
+    try:
+        vk = int(event.nativeVirtualKey() or 0)
+    except Exception:  # noqa: BLE001
+        vk = 0
+    token = key_token_for_vk(vk) if vk else None
+    if token:
+        return token
+    key = int(event.key())
+    if key in _QT_KEY_TOKENS:
+        return _QT_KEY_TOKENS[key]
+    if _KEY_A <= key <= _KEY_Z or _KEY_0 <= key <= _KEY_9:
+        return chr(key).lower()
+    if _KEY_F1 <= key <= _KEY_F12:
+        return f"f{key - _KEY_F1 + 1}"
+    return None
+
+
+class _BindingEdit(QWidget):
+    """The Shortcuts tab's editor for ONE binding (kind ``"binding"``): the current binding in
+    words, **Set** -- listen for the next key combination or mouse button -- and **Default**.
+    ``value()`` / ``set_value()`` carry the canonical binding text (``""`` = unbound); a text the
+    grammar rejects is kept as typed and flagged, and the dialog refuses to apply it."""
+
+    valueChanged = Signal(str)
+    setRequested = Signal(object)        # this row: start listening
+    cancelRequested = Signal(object)     # this row: stop listening
+
+    def __init__(self, default: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._default = default
+        self._value = ""
+        self._valid = True
+        self._listening = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.label = QLabel(self)
+        self.label.setObjectName("binding")
+        self.label.setMinimumWidth(170)
+        self.set_btn = QPushButton("Set", self)
+        self.set_btn.setCheckable(True)
+        self.set_btn.setToolTip("Listen for the next key combination or mouse button, anywhere on screen; "
+                                "a combination is taken half a second after the last key. Esc cancels.")
+        self.default_btn = QPushButton("Default", self)
+        self.default_btn.setToolTip(f"Back to the default: {describe_binding(default)}")
+        row.addWidget(self.label, 1)
+        row.addWidget(self.set_btn)
+        row.addWidget(self.default_btn)
+        self.set_btn.toggled.connect(self._on_set_toggled)
+        self.default_btn.clicked.connect(lambda: self.set_value(self._default))
+        self._refresh()
+
+    @property
+    def default(self) -> str:
+        return self._default
+
+    @property
+    def listening(self) -> bool:
+        return self._listening
+
+    def value(self) -> str:
+        return self._value
+
+    def is_valid(self) -> bool:
+        return self._valid
+
+    def set_value(self, text: str) -> None:
+        raw = str(text or "").strip()
+        try:
+            self._value, self._valid = normalize_binding(raw), True
+        except ValueError:
+            self._value, self._valid = raw.lower(), False
+        self._refresh()
+        self.valueChanged.emit(self._value)
+
+    def set_listening(self, on: bool) -> None:
+        self._listening = on
+        self.set_btn.blockSignals(True)
+        self.set_btn.setChecked(on)
+        self.set_btn.blockSignals(False)
+        self.set_btn.setText("Listening\u2026" if on else "Set")
+        self._refresh()
+
+    def _on_set_toggled(self, checked: bool) -> None:
+        (self.setRequested if checked else self.cancelRequested).emit(self)
+
+    def _refresh(self) -> None:
+        if self._listening:
+            text, state = "press keys or a mouse button\u2026", "listening"
+        elif not self._valid:
+            text, state = f"{self._value or '?'} (invalid)", "invalid"
+        else:
+            text, state = describe_binding(self._value), ""
+        self.label.setText(text)
+        self.label.setToolTip(self._value or "unbound")
+        if self.label.property("state") != state:
+            self.label.setProperty("state", state)
+            self.label.style().unpolish(self.label)
+            self.label.style().polish(self.label)
+
+
+class ShortcutsPage(QWidget):
+    """The Shortcuts tab's page, built around the tab's :class:`FieldForm` (which stays the source
+    of truth for load / changes / apply / restore): one list of every ``[hotkeys]`` entry -- the
+    global shortcuts, then the manual-advance gestures -- as :class:`_BindingEdit` rows, a status
+    line (invalid entries, a binding used twice, a bare left / middle / right button on a global
+    shortcut), and the fixed in-overlay keys (:data:`FIXED_SHORTCUTS`).
+
+    **Set** listens through a :class:`~exocortex.ui.llhooks.ChordRecorder`: on the real Windows
+    platform fed by the low-level :class:`~exocortex.ui.llhooks.CaptureHooks` (any key or mouse
+    button, anywhere on screen, swallowed while listening -- so no hotkey fires and nothing is
+    typed into the app underneath; a click on this dialog cancels instead), elsewhere by a Qt event
+    filter (keys typed while the dialog has focus). The binding is taken ``CAPTURE_QUIET_S`` after
+    the last press, once no key is held; Esc cancels. One row listens at a time."""
+
+    def __init__(self, form: FieldForm, dialog: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._form = form
+        self._dialog = dialog
+        self._capture_row: _BindingEdit | None = None
+        self._recorder: Any = None
+        self._capture_hooks: Any = None
+        self._filter_installed = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget(scroll)
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        intro = QLabel(
+            "Click Set, then press the key combination or the mouse button -- anywhere on screen. A "
+            "combination is taken half a second after the last key; Esc cancels. Default puts one "
+            "shortcut back (Restore defaults below: every tab). Apply / OK re-register the shortcuts at "
+            "once. A single key (F9, Right Shift) works as a tap; mouse buttons 4 and 5 are the thumb "
+            "buttons.", inner)
+        intro.setWordWrap(True)
+        intro.setObjectName("help")
+        self.status = QLabel("", inner)
+        self.status.setWordWrap(True)
+        self.status.setObjectName("help")
+        layout.addWidget(intro)
+        layout.addWidget(self.status)
+
+        fields = list(form.fields)
+        bindings = [f for f in fields if f.kind == "binding"]
+        general = [f for f in bindings if not f.key.startswith("manual_")]
+        manual = [f for f in bindings if f.key.startswith("manual_")]
+        others = [f for f in fields if f.kind != "binding"]
+        self._add_section(layout, inner, "Global shortcuts (work while any app has focus)", general)
+        self._add_section(layout, inner, "Manual advance (while the Manual switch is on; whether a mouse "
+                                         "gesture needs the press-and-hold is on the Hands-free tab)",
+                          manual + others)
+        self._add_fixed(layout, inner)
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+
+        self.rows: dict[str, _BindingEdit] = {}
+        for f in bindings:
+            widget = form.widgets[f.path]
+            if isinstance(widget, _BindingEdit):
+                self.rows[f.path] = widget
+                widget.valueChanged.connect(lambda _value: self.refresh_status())
+                widget.setRequested.connect(self.start_capture)
+                widget.cancelRequested.connect(lambda _row: self.cancel_capture())
+        self.refresh_status()
+
+    # ---- layout --------------------------------------------------------------------------------
+    def _add_section(self, layout: QVBoxLayout, inner: QWidget, title: str, fields: list[Field]) -> None:
+        head = QLabel(title, inner)
+        head.setObjectName("section")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+        form = QFormLayout()
+        form.setSpacing(6)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for f in fields:
+            widget = self._form.widgets[f.path]
+            if f.help and not widget.toolTip():
+                widget.setToolTip(f.help)
+            label = QLabel(f.label, inner)
+            label.setWordWrap(True)
+            if f.help:
+                label.setToolTip(f.help)
+            form.addRow(label, widget)
+        layout.addLayout(form)
+
+    def _add_fixed(self, layout: QVBoxLayout, inner: QWidget) -> None:
+        head = QLabel("Fixed, inside the overlay (not rebindable)", inner)
+        head.setObjectName("section")
+        layout.addWidget(head)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        for r, (where, key, action) in enumerate(FIXED_SHORTCUTS):
+            for c, text in enumerate((where, key, action)):
+                cell = QLabel(text, inner)
+                cell.setWordWrap(True)
+                if c != 1:
+                    cell.setObjectName("fixed")
+                grid.addWidget(cell, r, c)
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+
+    # ---- validation -----------------------------------------------------------------------------
+    def _label_of(self, path: str) -> str:
+        return next((f.label for f in self._form.fields if f.path == path), path)
+
+    def invalid(self) -> dict[str, str]:
+        """``{path: label}`` of the rows whose text the grammar rejects (the dialog skips them)."""
+        return {path: self._label_of(path) for path, row in self.rows.items() if not row.is_valid()}
+
+    def duplicates(self) -> list[tuple[str, list[str]]]:
+        """``[(binding text, [labels])]`` for every non-blank binding used by more than one row."""
+        users: dict[str, list[str]] = {}
+        for path, row in self.rows.items():
+            if row.is_valid() and row.value():
+                users.setdefault(row.value(), []).append(self._label_of(path))
+        return [(text, labels) for text, labels in users.items() if len(labels) > 1]
+
+    def refresh_status(self) -> None:
+        problems: list[str] = []
+        invalid = self.invalid()
+        if invalid:
+            problems.append("Invalid: " + ", ".join(invalid.values()))
+        for text, labels in self.duplicates():
+            problems.append(f"{describe_binding(text)} is used twice: {' and '.join(labels)}")
+        for path, row in self.rows.items():
+            if path.rsplit(".", 1)[-1].startswith("manual_"):
+                continue
+            if row.value() in ("mouse_left", "mouse_middle", "mouse_right"):
+                problems.append(f"{self._label_of(path)}: a bare {describe_binding(row.value()).lower()} "
+                                "fires on every click -- add a modifier")
+        self.status.setText("\n".join(problems) if problems else "Every shortcut has its own key.")
+        _restyle(self.status, "restart" if problems else "help")
+
+    # ---- the Set button: capture ----------------------------------------------------------------
+    @property
+    def capturing(self) -> bool:
+        return self._capture_row is not None
+
+    def start_capture(self, row: _BindingEdit) -> None:
+        """Listen for ``row``'s next binding (cancelling a capture already in progress)."""
+        if self._capture_row is not None:
+            self._finish_capture(None, self._capture_row)
+        if ChordRecorder is None:
+            row.set_listening(False)
+            self.status.setText("Shortcut capture is unavailable here.")
+            return
+        self._capture_row = row
+        row.set_listening(True)
+        self._recorder = ChordRecorder(
+            lambda text, row=row: self._on_recorded(text, row), quiet_s=CAPTURE_QUIET_S,
+            schedule=lambda delay_s, check: QTimer.singleShot(max(1, int(delay_s * 1000)), self, check),
+        )
+        self._recorder.start()
+        self._capture_hooks = None
+        if _real_windows() and CaptureHooks is not None:
+            hooks = CaptureHooks(self._recorder, ignore_mouse_at=self._over_dialog)
+            if hooks.install():
+                self._capture_hooks = hooks
+            else:
+                log.warning("shortcut capture: the input hooks could not be installed; keys typed into "
+                            "the dialog only")
+        app = QApplication.instance()
+        if app is not None and not self._filter_installed:
+            app.installEventFilter(self)
+            self._filter_installed = True
+        label = next((self._label_of(p) for p, r in self.rows.items() if r is row), "the shortcut")
+        self.status.setText(f"Listening for \u201c{label}\u201d: press the keys or the mouse button. Esc cancels.")
+        _restyle(self.status, "help")
+
+    def cancel_capture(self) -> None:
+        """Stop listening without changing the row (the row's own Set button, Esc, a click on the
+        dialog, the dialog closing)."""
+        recorder = self._recorder
+        if recorder is not None and recorder.listening:
+            recorder.cancel()                       # reports None -> _on_recorded -> _finish_capture
+        elif self._capture_row is not None:
+            self._finish_capture(None, self._capture_row)
+
+    def _on_recorded(self, text: str | None, row: _BindingEdit) -> None:
+        # may run inside a hook callback: the teardown (unhooking) is deferred to the event loop
+        QTimer.singleShot(0, self, lambda: self._finish_capture(text, row))
+
+    def _finish_capture(self, text: str | None, row: _BindingEdit) -> None:
+        if self._capture_row is row:
+            self._capture_row = None
+            hooks, self._capture_hooks = self._capture_hooks, None
+            self._recorder = None
+            if hooks is not None:
+                try:
+                    hooks.uninstall()
+                except Exception:  # noqa: BLE001
+                    log.exception("shortcut capture: unhooking failed")
+            app = QApplication.instance()
+            if app is not None and self._filter_installed:
+                app.removeEventFilter(self)
+                self._filter_installed = False
+        row.set_listening(False)
+        if text is not None:
+            row.set_value(text)
+        self.refresh_status()
+
+    def _over_dialog(self, x: int, y: int) -> bool:
+        try:
+            return self._dialog.isVisible() and self._dialog.frameGeometry().contains(QPoint(x, y))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt override
+        recorder = self._recorder
+        if recorder is None or not recorder.listening:
+            return False
+        kind = event.type()
+        if kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            if self._capture_hooks is not None or not isinstance(event, QKeyEvent):
+                return False                         # the hooks saw (and swallowed) the key first
+            if event.isAutoRepeat():
+                return True
+            token = _qt_key_token(event)
+            if token is not None:
+                if kind == QEvent.Type.KeyPress:
+                    recorder.press(token)
+                else:
+                    recorder.release(token)
+            return True
+        if kind == QEvent.Type.MouseButtonPress:
+            row = self._capture_row
+            if (row is not None and isinstance(obj, QWidget)
+                    and (obj is row.set_btn or row.set_btn.isAncestorOf(obj))):
+                return False                         # the row's own Set button: its toggle cancels
+            self.cancel_capture()
+        return False
+
+
+def _resolve_actions(explicit: Any, list_models: Any, parent: Any) -> Any:
+    """2026-10-07 (Optimize tab): the object that implements the optimizer actions, or ``None``.
+
+    Order: the explicit ``actions=``; ``list_models.__self__`` (``OverlayWindow.open_settings`` passes
+    ``actions.list_models``, so on a real Engine that bound method's ``__self__`` IS the engine, with no
+    change to ``overlay.py``); ``parent._actions`` (an ``OverlayWindow``). A candidate counts only if
+    its CLASS defines ``optimize_snapshot``: the test fakes use a ``__getattr__`` catch-all that makes
+    ``hasattr`` true for every name, and such a fake must not look like an engine (the tab would then
+    show a "connected" page full of ``None`` answers).
+    """
+    for cand in (explicit, getattr(list_models, "__self__", None), getattr(parent, "_actions", None)):
+        if cand is not None and callable(getattr(type(cand), "optimize_snapshot", None)):
+            return cand
+    return None
+
+
 class SettingsDialog(QDialog):
     """Tabbed editor for :data:`FIELDS`, one :class:`FieldForm` per tab. ``applied`` carries
     ``{"section.key": new_value}`` for every value that changed on Apply / OK (empty dict when
@@ -652,34 +1250,46 @@ class SettingsDialog(QDialog):
 
     applied = Signal(dict)
 
+    #: Tab name -> the method that builds its page around the tab's FieldForm (2026-10-29: Optimize, then
+    #: Audio and Shortcuts). Every other tab is the form's own scroll area; the form stays the source of truth
+    #: for load / changes / apply / restore. Each builder falls back to the plain form on any failure.
+    _PAGE_BUILDERS: dict[str, str] = {
+        "Optimize": "_build_optimize_page", "Audio": "_build_audio_page", "Shortcuts": "_build_shortcuts_page",
+    }
+
     def __init__(self, cfg: Config, list_models: Callable[[], list[str]] | None = None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, *, actions: Any = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._list_models = list_models          # kept for callers built against the old surface;
         self._forms: dict[str, FieldForm] = {}    # no FIELDS entry is kind "model" any more.
+        self._actions = _resolve_actions(actions, list_models, parent)   # None = Optimize tab degraded
+        self._optimize_panel: Any = None
+        self._audio_panel: Any = None
+        self._shortcuts_page: Any = None
         self.setWindowTitle("Settings")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(build_qss(cfg.ui.font_size) + _DIALOG_QSS)
         self.setMinimumSize(520, 420)
-        self.resize(560, 520)
+        self.resize(680, 640)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
         outer.setSpacing(8)
         self.tabs = QTabWidget(self)
         outer.addWidget(self.tabs, 1)
-        self.audio_check: AudioCheckPanel | None = None
         for name, group in FIELDS.items():
-            form = FieldForm(group, cfg, self.tabs)
+            builder = self._PAGE_BUILDERS.get(name)
+            if builder is not None:
+                # parent None: the panel re-parents the widgets into its own layout, and the (then
+                # empty) scroll shell is never shown
+                form = FieldForm(group, cfg, None)
+                page = getattr(self, builder)(form)
+            else:
+                form = FieldForm(group, cfg, self.tabs)
+                page = form.widget
             self._forms[name] = form
-            self.tabs.addTab(form.widget, name)
-            if name == "Audio":
-                self.audio_check = AudioCheckPanel(
-                    form.widgets["audio.mic_device"], form.widgets["audio.system_device"],
-                    form.widgets["audio.echo_suppression"], form.widget,
-                )
-                form.add_row(self.audio_check)
+            self.tabs.addTab(page, name)
 
         self.note = QLabel("", self)
         self.note.setObjectName("restart")
@@ -703,6 +1313,12 @@ class SettingsDialog(QDialog):
         outer.addLayout(row)
         self.load()
 
+    @property
+    def audio_check(self) -> Any:
+        """The Audio page's Check panel (:class:`~exocortex.ui.audio_check.AudioCheckPanel`), or None
+        when the page fell back to the plain form."""
+        return getattr(self._audio_panel, "check", None)
+
     # ---- merged view over every tab's FieldForm ------------------------------------------------
     @property
     def _widgets(self) -> dict[str, QWidget]:
@@ -713,12 +1329,66 @@ class SettingsDialog(QDialog):
             merged.update(form.widgets)
         return merged
 
+    def _build_optimize_page(self, form: FieldForm) -> QWidget:
+        """The Optimize tab's page: an :class:`~exocortex.ui.optimize_panel.OptimizePanel` around
+        ``form``'s widgets. Imported lazily and guarded so a defect in the panel can never take the
+        whole Settings dialog down: on any failure the tab falls back to ``form``'s plain scrollable
+        form (the panel moves the form's widgets as the LAST step of its construction, so a failure
+        before that leaves the form intact)."""
+        try:
+            from exocortex.ui.optimize_panel import OptimizePanel
+
+            panel = OptimizePanel(self._cfg, self._actions, form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its panel cannot be built
+            log.exception("Optimize panel unavailable; showing the plain form")
+            return form.widget
+        self._optimize_panel = panel
+        return panel
+
+    def _build_audio_page(self, form: FieldForm) -> QWidget:
+        """The Audio tab's page (2026-10-29): an :class:`~exocortex.ui.audio_panel.AudioPanel` around
+        ``form``'s widgets -- device pickers filled from a background scan, a Test button and level
+        meter per source, what the running app has open -- with this fork's checks below it
+        (:class:`~exocortex.ui.audio_check.CheckedAudioPanel`: the Windows mute of a silent mic, the
+        speaker routing). Same guard as the Optimize page: on any failure the tab falls back to
+        ``form``'s plain scrollable form."""
+        try:
+            from exocortex.ui.audio_check import CheckedAudioPanel
+
+            panel = CheckedAudioPanel(self._cfg, self._actions, form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its panel cannot be built
+            log.exception("Audio panel unavailable; showing the plain form")
+            return form.widget
+        self._audio_panel = panel
+        return panel
+
+    def _build_shortcuts_page(self, form: FieldForm) -> QWidget:
+        """The Shortcuts tab's page (2026-10-29): a :class:`ShortcutsPage` around ``form``'s widgets,
+        with the same fallback to the plain form as the Optimize tab."""
+        try:
+            page = ShortcutsPage(form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its page cannot be built
+            log.exception("Shortcuts page unavailable; showing the plain form")
+            return form.widget
+        self._shortcuts_page = page
+        return page
+
+    def _invalid_shortcuts(self) -> dict[str, str]:
+        """``{path: label}`` of the binding rows the grammar rejects -- never written to the config."""
+        if self._shortcuts_page is None:
+            return {}
+        return dict(self._shortcuts_page.invalid())
+
     # ---- values --------------------------------------------------------------------------------
     def load(self) -> None:
         """Fill every widget from the current config."""
         for form in self._forms.values():
             form.load()
         self.note.setText("")
+        if self._optimize_panel is not None:
+            self._optimize_panel.refresh()
+        if self._audio_panel is not None:
+            self._audio_panel.refresh()
 
     def show_tab(self, name: str) -> bool:
         """Bring the tab called `name` to the front (the Assist menu's "Assist settings…"); False
@@ -748,10 +1418,53 @@ class SettingsDialog(QDialog):
         return out
 
     def apply(self) -> dict[str, Any]:
-        """Write the changed values into the config and announce them; returns the changes."""
+        """Write the changed values into the config and announce them; returns the changes.
+
+        No parameters, deliberately: the Apply button's ``clicked(bool)`` is connected straight to
+        this method, and PySide passes the ``checked`` flag to an optional first parameter. The
+        filtered variant is :meth:`apply_paths`."""
+        return self._apply(None)
+
+    def apply_paths(self, paths: Collection[str]) -> dict[str, Any]:
+        """Like :meth:`apply`, but only for the given ``"section.key"`` paths (2026-10-07, Optimize
+        tab: a plan writes a handful of values; edits pending on other tabs stay pending). Emits
+        ``applied`` once with exactly the paths that changed."""
+        return self._apply(frozenset(paths))
+
+    def set_values(self, values: dict[str, Any]) -> list[str]:
+        """Fill widgets by ``"section.key"`` path across every tab (nothing is written to the config
+        until :meth:`apply` / :meth:`apply_paths`). Returns the paths that could not be set: unknown
+        paths, or a value the widget cannot take."""
+        widgets = self._widgets
+        by_path = {f.path: f for f in all_fields()}
+        failed: list[str] = []
+        for path, value in values.items():
+            widget, field_ = widgets.get(path), by_path.get(path)
+            if widget is None or field_ is None:
+                failed.append(path)
+                continue
+            try:
+                set_field_value(widget, field_, value)
+            except (TypeError, ValueError, OverflowError):
+                log.warning("set_values: %s cannot take %r", path, value)
+                failed.append(path)
+        return failed
+
+    def widget_values(self, paths: Collection[str]) -> dict[str, Any]:
+        """The current widget value of each known path (the inverse of :meth:`set_values`; the
+        Optimize tab's Undo snapshot). Unknown paths are left out."""
+        widgets = self._widgets
+        by_path = {f.path: f for f in all_fields()}
+        return {p: get_field_value(widgets[p], by_path[p]) for p in paths if p in widgets and p in by_path}
+
+    def _apply(self, only: Collection[str] | None) -> dict[str, Any]:
+        invalid = self._invalid_shortcuts()          # 2026-10-29: a rejected shortcut stays pending
+        if invalid:
+            allowed = set(self._widgets) if only is None else set(only)
+            only = allowed - set(invalid)
         changed: dict[str, Any] = {}
         for form in self._forms.values():
-            changed.update(form.apply())
+            changed.update(form.apply(only))
         by_path = {f.path: f for f in all_fields()}
         restart = [by_path[path].label for path in changed if by_path[path].restart]
         if restart:
@@ -760,6 +1473,9 @@ class SettingsDialog(QDialog):
             self.note.setText("Applied.")
         else:
             self.note.setText("")
+        if invalid:
+            skipped = "Not applied, invalid shortcut: " + ", ".join(invalid.values())
+            self.note.setText((self.note.text() + " " if self.note.text() else "") + skipped)
         if changed:
             log.info("settings changed: %s", ", ".join(f"{k}={v!r}" for k, v in changed.items()))
             self.applied.emit(changed)
@@ -768,3 +1484,13 @@ class SettingsDialog(QDialog):
     def _on_ok(self) -> None:
         self.apply()
         self.accept()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt override
+        """A capture in progress must not outlive the dialog on screen (its hooks would keep
+        swallowing input): Cancel / OK / the close button all end it."""
+        if self._shortcuts_page is not None:
+            try:
+                self._shortcuts_page.cancel_capture()
+            except Exception:  # noqa: BLE001
+                log.exception("cancelling the shortcut capture failed")
+        super().hideEvent(event)

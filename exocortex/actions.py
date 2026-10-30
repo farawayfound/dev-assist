@@ -65,10 +65,21 @@ class EngineActions(Protocol):
         problem starts fresh). The transcript, notes, answer history and the ask box keep the
         whole meeting. Publishes a `CheckpointEvent`."""
 
-    def code(self, focus: str = "") -> None:
+    def compact(self) -> int:
+        """Compact the active context window now (the Controls row's "Compact" button, like the
+        ``/compact`` command): fold everything but the newest lines of the current scope's
+        transcript window into a short running summary straight away, instead of waiting for the
+        window to overflow. The scope is the current checkpoint's (the coding context), or the
+        whole meeting when none is set. The drop is immediate and the summary is produced on the
+        notes lane (never blocking a live answer). Returns the transcript characters folded (0
+        when there was nothing to fold, or ``[context].compaction`` is off)."""
+
+    def code(self, focus: str = "", fresh: bool = False) -> None:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now, in the primary language unless the task calls for another.
-        Manual: works while paused. `focus` is an optional extra instruction."""
+        Manual: works while paused. `focus` is an optional extra instruction. `fresh`
+        (2026-10-29): ignore the code already written on screen and give the best solution from
+        scratch, whatever `[assist].consider_given_code` says (the "Code from scratch" gesture)."""
 
     def text(self, focus: str = "") -> None:
         """Walk through the task discussed (transcript since the last checkpoint) and/or shown on
@@ -146,10 +157,12 @@ class EngineActions(Protocol):
         hands-free mode on or off. Publishes a `ManualAdvanceEvent`."""
 
     def manual_advance(self, kind: str) -> None:
-        """The press-and-hold gesture fired: generate now. `kind` is "text" (the left button) or
-        "code" (the middle button / a quick middle-click). With hands-free on, runs that step for
-        the task on screen (its kind's ask, the cumulative context); otherwise a plain
-        `text()` / `code()`. Never brings the overlay to the foreground."""
+        """A manual-advance gesture fired: generate now. `kind` is "text" (the left button held, by
+        default), "code" (a middle click: works with the given code when
+        `[assist].consider_given_code` is on) or "code_fresh" (mouse button 4: Code from scratch,
+        the given code ignored) -- the bindings are `[hotkeys].manual_*`. With hands-free on, runs
+        that step for the task on screen (its kind's ask, the cumulative context); otherwise a plain
+        `text()` / `code()` / `code(fresh=True)`. Never brings the overlay to the foreground."""
 
     # ---- explanations ----
     def set_explanations(self, enabled: bool) -> None:
@@ -233,6 +246,127 @@ class EngineActions(Protocol):
     def auto_tune_model(self, key: str) -> dict[str, object] | None:
         """Compute (and save) the profile `exocortex.llm.library.auto_profile` recommends for
         `key` on this machine; returns it."""
+
+
+    # ---- context library + the context window (2026-10-06: the Models window's "Context" tab) ----
+    # Every method returns at once; the library reports back through ContextLibraryEvent, the
+    # window through ContextUsageEvent (one per assist job).
+    def context_documents(self) -> list[dict[str, object]]:
+        """Every uploaded reference document, as plain dicts: id, name, kind ("markdown" | "text"
+        | "code" | "html" | "docx" | "pptx" | "pdf"), chars, tokens (estimate), enabled (bool),
+        mode ("inject" | "reference"), digest (the model-written catalogue text, "" until ready),
+        digest_state ("pending" | "ready" | "failed" | "n/a"), source_path, added_at (ISO).
+        Synchronous but cheap (the in-memory manifest)."""
+
+    def add_context_document(self, path: str, *, mode: str | None = None) -> None:
+        """Copy the file at `path` into the context library (text extracted on the way in: .md /
+        .txt / code / .html / .docx / .pptx / .pdf), enabled, in `mode` (None = [context].default_mode).
+        A reference-mode document gets its digest generated on the notes lane when
+        [context].digest is on. Publishes ContextLibraryEvent (or one with a failure reason)."""
+
+    def add_context_text(self, name: str, text: str, *, mode: str | None = None) -> None:
+        """Same as `add_context_document` for pasted text (stored as a markdown document `name`)."""
+
+    def remove_context_document(self, doc_id: str) -> None:
+        """Delete a document (and its stored copy) from the library. Publishes ContextLibraryEvent."""
+
+    def set_context_document(self, doc_id: str, *, enabled: bool | None = None, mode: str | None = None) -> None:
+        """Toggle a document on/off and/or switch its mode ("inject" | "reference"); a None leaves
+        that attribute alone. Switching to "reference" queues a digest when none exists yet.
+        Publishes ContextLibraryEvent."""
+
+    def refresh_context_digest(self, doc_id: str) -> None:
+        """Re-generate the model-written digest of one document (reference mode) now."""
+
+    def context_usage(self) -> dict[str, object]:
+        """The context window as it stands: the last assist job's ContextUsageEvent fields (empty
+        values before any job ran) plus "slot_tokens" (the server's per-request context the budget
+        is sized to), "chars_per_token" (the calibrated estimate), "earlier_summary" (the running
+        summary of the transcript that fell out of the window, "" when none) and
+        "documents" (how many documents are enabled)."""
+
+    # ---- optimizer (2026-10-07: Settings > Optimize) ----
+    # Every method returns at once; the work runs on named daemon threads inside the engine and the
+    # tab POLLS optimize_snapshot() (the overlay forwards no new event kinds to the settings dialog).
+    # OptimizeEvents are also published on the bus, for the log and for anything that wants them.
+    def optimize_snapshot(self) -> dict[str, object]:
+        """Cheap, thread-safe, never raises: a copy of the optimizer's cached state (see
+        exocortex.optimize_run.OptimizeController.snapshot): engine, facts, models, plans (all four
+        goals as plain dicts), selected, gates, analysis, run, measured, apply. {} means the
+        controller itself failed; the UI treats None / {} as "engine not connected"."""
+
+    def optimize_analyze(self, goal: str = "", options: dict[str, object] | None = None, model_key: str = "") -> None:
+        """Recompute the plans (all four goals) on an "optimize-analyze" thread from the hardware, the
+        model header, the saved profile and benchmarks.json. `options` carries the dialog's UNSAVED
+        goal / reserve_vram_mb / ctx_cap / asr_gpu; "" `model_key` = the loaded model, else [llm].model.
+        Returns at once; the result appears in the next snapshot. A request made while one runs is
+        remembered (the latest wins) and run right after."""
+
+    def optimize_benchmark(self, scopes: list[str] | None = None, force: bool = False) -> bool:
+        """Start a benchmark on an "optimize-bench" thread. `scopes`: any of "llm", "speech" (default
+        both). `force` overrides only the "someone is speaking" check of the llm scope. False = refused
+        (the reason is in the next snapshot's run.message): busy, a gate is closed (answer in flight,
+        speech active, model change running, the shared model server holds the GPU), or there is no
+        private llama-server to measure. It measures the RUNNING server; it never starts another."""
+
+    def optimize_cancel(self) -> None:
+        """Cancel the running benchmark (the probe child is killed within about half a second)."""
+
+    def optimize_apply(self, digest: str) -> bool:
+        """Apply the MODEL part of the plan with this digest (the settings part goes through the dialog
+        and apply_settings): journal, write the profile, relaunch llama-server, verify (window, canary,
+        free VRAM), roll back automatically on any failure. The engine applies the plan it computed
+        itself; a stale or unknown digest is refused. False = refused, nothing was changed."""
+
+    def optimize_undo(self) -> bool:
+        """Restore the previous profile recorded by the last verified apply (the same transaction with
+        a canary-only check). False = nothing to undo, or refused."""
+    # ---- capabilities (2026-10-07: the Models window's "Capabilities" tab) ----
+    # The engine owns an `exocortex.capabilities.ToolRunner`; the Assistant runs the tool loop
+    # with it. These six are the tab's surface. Every one returns at once; the maps report back
+    # through CapabilityMapEvent, an MCP tool listing through McpToolsEvent.
+    def capability_maps(self) -> list[dict[str, object]]:
+        """Every saved project map, as plain dicts: name, path, roots (list[str]), files, dirs,
+        indexed_at (ISO), truncated (bool), active (bool: the map loaded last), settings (the
+        map's narrowing settings snapshot, for the Load confirmation). Cached by the engine
+        (refreshed by the index thread and on first call); never blocks on a path."""
+
+    def index_capability_map(self, name: str) -> None:
+        """Build (or rebuild) the map `name` of the current readable folders in the background:
+        walk them (excludes honoured, junctions never followed), summarise every file on a basic
+        understanding (no model call), save <maps_dir>/<slug>.json together with the
+        [capabilities] settings as they stand, copy it into the session folder, hand its text to
+        the tool runner (the <map> block of every tool-enabled prompt) and make it the active
+        map. Publishes CapabilityMapEvent("indexing") at once, then "indexed" or "error: ..."."""
+
+    def load_capability_map(self, name: str) -> None:
+        """Make `name` the active map: apply the NARROWING subset of the settings it was saved
+        with (the five switches, the folders, the excludes, the allowed commands as a subset,
+        the domain lists, the limits -- never allow_all_commands, web_allow_local, the MCP server
+        specs or any folder of the app's own), save the config, refresh the runner, copy the map
+        into the session folder. Publishes CapabilityMapEvent("loaded"). The tab confirms with
+        the user BEFORE calling this."""
+
+    def delete_capability_map(self, name: str) -> None:
+        """Delete the map file; clears the active map when it was the one. Publishes
+        CapabilityMapEvent("deleted")."""
+
+    def mcp_server_tools(self, name: str, request_id: int) -> None:
+        """List the tools of the configured MCP server `name` (connecting in the background when
+        needed); answers with McpToolsEvent(request_id)."""
+
+    def capability_status(self) -> dict[str, object]:
+        """For the tab's status line: {"tools": [the tool names the ask box would get right now],
+        "read_roots": [the configured folders], "mcp": {server name: "idle" | "connecting" |
+        "connected" | "error: ..."}, "active_map": name, "notes": [human lines, e.g. "no readable
+        folder: the model gets no tools"]}. Synchronous; never touches the filesystem or the
+        network (a folder's existence is reported by the index thread, not here); never raises."""
+
+    def audio_status(self) -> dict[str, object]:
+        """Settings > Audio's status line (2026-10-29): {"running": bool, "system": {"enabled": bool,
+        "spec": the configured device spec, "device": the open capture's device name or ""}, "mic":
+        {...}}. Synchronous; never raises; never touches a device (the dialog's "Test" button runs
+        its own short capture through exocortex.audio.capture.probe_device instead)."""
 
     def quit(self) -> None:
         """Save the session and shut everything down."""

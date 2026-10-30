@@ -9,16 +9,25 @@ the differences below. This page is the starting point for the next sync.
 | | |
 |---|---|
 | Forked from | exo-cortex `18542ae` (2026-09-27) |
-| Synced through | exo-cortex `main` at `c97590e` (2026-10-29) |
-| Taken | `6b90e21` context library + window, `968ddc0` View strips / Monitor / Compact, `f998fe3` Optimize, `4d40fce..5594dd4` Capabilities, `02216bc` audio devices, `1fc5aef` given code / Code from scratch / Shortcuts (and the merges `4f304c0`, `6c994ea`, `1f43166`, `c97590e`) |
-| Not taken yet | `93231bf` (`feat/background-focus`: shortcuts never move the focus, multi-file workspace, read-on-shortcut, code-only answers), which reached exo-cortex `main` on 2026-10-29 at 23:42, while this sync was being validated; `feat/compiled-exe-tester-build`, still in progress |
+| Synced through | exo-cortex `main` at `93231bf` (2026-10-29) |
+| Taken | `6b90e21` context library + window, `968ddc0` View strips / Monitor / Compact, `f998fe3` Optimize, `4d40fce..5594dd4` Capabilities, `02216bc` audio devices, `1fc5aef` given code / Code from scratch / Shortcuts (and the merges `4f304c0`, `6c994ea`, `1f43166`, `c97590e`), `93231bf` shortcuts keep the focus / multi-file workspace / read-on-shortcut / code-only answers |
+| Not taken yet | `feat/compiled-exe-tester-build` (`c6b04fd`, 2026-10-12), still in progress |
 
 ## Differences to keep
 
 - **No capture exclusion.** dev-assist is an ordinary window that screen sharing shows. exo-cortex's
   `stealth.py`, display affinity, the fail-closed veil, the exposure guard and their `[ui]` keys are
   not here, so upstream changes to them are dropped (968ddc0's veil fix and
-  `MonitorView.set_content_allowed`, the SHORTCUTS row about the exposure guard).
+  `MonitorView.set_content_allowed`, the SHORTCUTS row about the exposure guard, 93231bf's veil
+  check in `focus_ask`). The region picker has upstream's focus handling (the Esc / Enter key hook,
+  the hand-back through `win32.foreground_window` / `activate_window`) without its capture gate
+  (`_ensure_capture_exclusion`, `_refuse`, the `failed` signal); `win32._load_dlls` declares only
+  the prototypes the remaining helpers use.
+- **The overlay is a normal top-level window** (taskbar, Alt-Tab), not `Qt.Tool`. 93231bf's
+  `WA_ShowWithoutActivating` is what keeps a shown overlay from taking the keyboard here; the
+  `WM_MOUSEACTIVATE` click policy (`_click_activates`) is upstream's.
+- **`SPEC.md` is upstream's**, byte for byte, stealth-era wording included: it is exo-cortex's design
+  record. dev-assist's behaviour is described in the README and `docs/`.
 - **`[project]` is dev-assist's.** The repository and Claude Code toolkit lookups live in
   `exocortex/project/` and `[project]`; upstream's `exocortex/context.py` and `[context]` are its
   document library and context window. An older `config.toml` with repo / toolkit keys under
@@ -39,7 +48,7 @@ the differences below. This page is the starting point for the next sync.
 ## Next time
 
 1. `git fetch --no-tags ../exo-cortex +main:refs/exo-cortex/main` (only reads exo-cortex).
-2. `git log --first-parent --oneline c97590e..refs/exo-cortex/main` lists what is new.
+2. `git log --first-parent --oneline 93231bf..refs/exo-cortex/main` lists what is new.
 3. Cherry-pick commit by commit, oldest first. A feature that arrived as a branch with an
    upstream merge in the middle goes over as one change: `git commit-tree <last>^{tree} -p <commit
    before it>` and cherry-pick that commit.

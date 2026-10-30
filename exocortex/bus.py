@@ -429,6 +429,21 @@ class ContextUsageEvent(Event):
     documents: int = 0          # reference documents that contributed something to this prompt
 
 
+@dataclass(frozen=True)
+class OptimizeEvent(Event):
+    """Progress of the Optimize tab's background work (2026-10-07, exocortex.optimize_run): an
+    analysis, a benchmark run, or an apply/verify/rollback transaction. Published for the log and
+    for anything that wants to follow along; the Optimize tab itself POLLS
+    ``EngineActions.optimize_snapshot()`` (the overlay forwards no new event kinds to the
+    settings dialog), so nothing depends on a subscriber seeing these."""
+    kind: Literal["analysis", "started", "progress", "done", "error", "cancelled",
+                  "applied", "rolled-back", "recovered"]
+    run_id: int = 0
+    step: str = ""            # facts | llm | speech | apply | verify
+    fraction: float = 0.0     # 0..1 over the whole run
+    detail: str = ""
+
+
 class EventBus:
     """Fan-out bus: each subscriber owns a queue; publish copies the reference to all."""
 

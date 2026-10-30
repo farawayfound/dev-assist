@@ -358,6 +358,17 @@ show_gpu = true           # the dedicated GPU: utilisation + VRAM in use
 show_igpu = true          # the integrated GPU (iGPU) utilisation
 show_npu = true           # the NPU / AI accelerator utilisation (e.g. Intel AI Boost)
 
+[optimize]
+# Settings > Optimize (2026-10-07): the goal the planner tailors this machine's compute split to.
+# Only these four values live here. A plan's RESULTS land where they already live -- the model's
+# tuning profile (context size, KV type, launch flags), [asr] (speech engine / device), [screen] and
+# [handsfree] (prompt budgets) -- and benchmark numbers go to <library>/benchmarks.json. Nothing
+# here changes behaviour by itself: a plan is applied only by pressing "Apply plan" on that tab.
+goal = "balanced"         # latency | balanced | context | quality
+reserve_vram_mb = 0       # GPU memory never planned into (MB); 0 = VRAM-guard floor + 256 MB + the goal's slack
+ctx_cap = 0               # longest context window to plan (tokens); 0 = the model's trained maximum
+asr_gpu = "auto"          # auto | never: "never" keeps Whisper off the display GPU whatever the goal
+
 [ui]
 opacity = 0.93
 width = 460

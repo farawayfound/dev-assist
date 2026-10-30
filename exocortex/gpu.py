@@ -653,6 +653,119 @@ def vram_source() -> str:
     return "none"
 
 
+# ---- NVML power / clock state (2026-10-07, the Optimize tab) ------------------------------------
+#: ``nvmlClocksEventReasons`` bits worth naming to a person. 0x4 (SW power cap) is what this
+#: laptop's 5090 shows the whole time a 27B model generates: 115 W enforced limit, ~700 MHz of
+#: 3090 -- the card is power-bound, which is why batching knobs barely move the numbers.
+_NVML_EVENT_REASONS: tuple[tuple[int, str], ...] = (
+    (0x1, "gpu idle"),
+    (0x2, "application clock setting"),
+    (0x4, "power cap"),
+    (0x8, "hardware slowdown"),
+    (0x10, "sync boost"),
+    (0x20, "software thermal slowdown"),
+    (0x40, "hardware thermal slowdown"),
+    (0x80, "hardware power brake"),
+    (0x100, "display clock setting"),
+)
+_NVML_CLOCK_SM = 1
+_NVML_TEMPERATURE_GPU = 0
+
+
+@dataclass(frozen=True)
+class GpuPowerState:
+    """One NVML reading of the primary NVIDIA GPU's power/clock situation. Every field is ``None``
+    when that one call failed; :func:`power_state` itself returns ``None`` only when NVML is off."""
+
+    sm_mhz: int | None            # current SM clock
+    sm_max_mhz: int | None        # the card's maximum SM clock
+    power_w: float | None         # current draw
+    power_limit_w: float | None   # the ENFORCED limit right now (Dynamic Boost raises it from the default)
+    power_default_w: float | None # the driver default limit
+    power_max_w: float | None     # the upper constraint the OEM allows
+    temperature_c: int | None
+    utilization_pct: int | None
+    reasons: tuple[str, ...]      # named active clock-event reasons ("power cap", ...)
+
+    @property
+    def power_capped(self) -> bool:
+        return "power cap" in self.reasons or "hardware power brake" in self.reasons
+
+    @property
+    def thermal(self) -> bool:
+        return any("thermal" in r for r in self.reasons) or "hardware slowdown" in self.reasons
+
+
+def power_state() -> GpuPowerState | None:
+    """Clocks, power draw / limits, temperature, utilisation and the active throttle reasons of
+    GPU 0 via NVML, or ``None`` when NVML is unavailable (parked off like the VRAM readers). Each
+    individual call fails soft to ``None``; nothing here raises. Used by the Optimize tab to say
+    *why* the measured speeds are what they are (a power-capped laptop GPU cannot be tuned faster
+    from inside the app) -- it never changes anything."""
+    if not _init():
+        return None
+    lib, handle = _state["lib"], _state["handle"]
+
+    def _uint(name: str, *args: int) -> int | None:
+        fn = getattr(lib, name, None)
+        if fn is None:
+            return None
+        out = ctypes.c_uint()
+        try:
+            rc = fn(handle, *[ctypes.c_uint(a) for a in args], ctypes.byref(out))
+        except Exception:  # noqa: BLE001 - a driver reset mid-call must not escape
+            return None
+        return int(out.value) if rc == _NVML_SUCCESS else None
+
+    def _mw_to_w(v: int | None) -> float | None:
+        return round(v / 1000.0, 1) if v is not None else None
+
+    reasons: list[str] = []
+    for name in ("nvmlDeviceGetCurrentClocksEventReasons", "nvmlDeviceGetCurrentClocksThrottleReasons"):
+        fn = getattr(lib, name, None)
+        if fn is None:
+            continue
+        mask = ctypes.c_ulonglong()
+        try:
+            if fn(handle, ctypes.byref(mask)) == _NVML_SUCCESS:
+                reasons = [label for bit, label in _NVML_EVENT_REASONS if mask.value & bit]
+                break
+        except Exception:  # noqa: BLE001
+            break
+
+    util: int | None = None
+    try:
+        class _Util(ctypes.Structure):
+            _fields_ = [("gpu", ctypes.c_uint), ("memory", ctypes.c_uint)]
+
+        u = _Util()
+        if lib.nvmlDeviceGetUtilizationRates(handle, ctypes.byref(u)) == _NVML_SUCCESS:
+            util = int(u.gpu)
+    except Exception:  # noqa: BLE001
+        util = None
+
+    power_max: float | None = None
+    try:
+        lo, hi = ctypes.c_uint(), ctypes.c_uint()
+        fn = getattr(lib, "nvmlDeviceGetPowerManagementLimitConstraints", None)
+        if fn is not None and fn(handle, ctypes.byref(lo), ctypes.byref(hi)) == _NVML_SUCCESS:
+            power_max = _mw_to_w(int(hi.value))
+    except Exception:  # noqa: BLE001
+        power_max = None
+
+    return GpuPowerState(
+        sm_mhz=_uint("nvmlDeviceGetClockInfo", _NVML_CLOCK_SM),
+        sm_max_mhz=_uint("nvmlDeviceGetMaxClockInfo", _NVML_CLOCK_SM),
+        power_w=_mw_to_w(_uint("nvmlDeviceGetPowerUsage")),
+        power_limit_w=_mw_to_w(_uint("nvmlDeviceGetEnforcedPowerLimit")),
+        power_default_w=_mw_to_w(_uint("nvmlDeviceGetPowerManagementDefaultLimit")),
+        power_max_w=power_max,
+        temperature_c=_uint("nvmlDeviceGetTemperature", _NVML_TEMPERATURE_GPU),
+        utilization_pct=util,
+        reasons=tuple(reasons),
+    )
+
+
 # ---- PDH fallback (non-NVIDIA adapters): "GPU Adapter Memory" performance counters ------------
 #: Lazy PDH state, one query kept open for the process lifetime -- same parking discipline as
 #: NVML's ``_state``: ``ok`` is None until first use, then True/False forever (a failure never

@@ -281,5 +281,42 @@ class EngineActions(Protocol):
         summary of the transcript that fell out of the window, "" when none) and
         "documents" (how many documents are enabled)."""
 
+    # ---- optimizer (2026-10-07: Settings > Optimize) ----
+    # Every method returns at once; the work runs on named daemon threads inside the engine and the
+    # tab POLLS optimize_snapshot() (the overlay forwards no new event kinds to the settings dialog).
+    # OptimizeEvents are also published on the bus, for the log and for anything that wants them.
+    def optimize_snapshot(self) -> dict[str, object]:
+        """Cheap, thread-safe, never raises: a copy of the optimizer's cached state (see
+        exocortex.optimize_run.OptimizeController.snapshot): engine, facts, models, plans (all four
+        goals as plain dicts), selected, gates, analysis, run, measured, apply. {} means the
+        controller itself failed; the UI treats None / {} as "engine not connected"."""
+
+    def optimize_analyze(self, goal: str = "", options: dict[str, object] | None = None, model_key: str = "") -> None:
+        """Recompute the plans (all four goals) on an "optimize-analyze" thread from the hardware, the
+        model header, the saved profile and benchmarks.json. `options` carries the dialog's UNSAVED
+        goal / reserve_vram_mb / ctx_cap / asr_gpu; "" `model_key` = the loaded model, else [llm].model.
+        Returns at once; the result appears in the next snapshot. A request made while one runs is
+        remembered (the latest wins) and run right after."""
+
+    def optimize_benchmark(self, scopes: list[str] | None = None, force: bool = False) -> bool:
+        """Start a benchmark on an "optimize-bench" thread. `scopes`: any of "llm", "speech" (default
+        both). `force` overrides only the "someone is speaking" check of the llm scope. False = refused
+        (the reason is in the next snapshot's run.message): busy, a gate is closed (answer in flight,
+        speech active, model change running, the shared model server holds the GPU), or there is no
+        private llama-server to measure. It measures the RUNNING server; it never starts another."""
+
+    def optimize_cancel(self) -> None:
+        """Cancel the running benchmark (the probe child is killed within about half a second)."""
+
+    def optimize_apply(self, digest: str) -> bool:
+        """Apply the MODEL part of the plan with this digest (the settings part goes through the dialog
+        and apply_settings): journal, write the profile, relaunch llama-server, verify (window, canary,
+        free VRAM), roll back automatically on any failure. The engine applies the plan it computed
+        itself; a stale or unknown digest is refused. False = refused, nothing was changed."""
+
+    def optimize_undo(self) -> bool:
+        """Restore the previous profile recorded by the last verified apply (the same transaction with
+        a canary-only check). False = nothing to undo, or refused."""
+
     def quit(self) -> None:
         """Save the session and shut everything down."""

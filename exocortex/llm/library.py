@@ -230,6 +230,21 @@ class GgufMeta:
     file_type: int | None
     quant: str
     name: str
+    # 2026-10-07 (Optimize tab): the header keys a HYBRID architecture (qwen35 / Qwen3.5-3.8: Gated
+    # DeltaNet in most layers, full attention in every Nth) needs for an honest KV-cache size. Only
+    # ``n_layer // full_attention_interval`` layers hold a per-token KV cache; the others keep a
+    # fixed-size recurrent state sized by the ``ssm.*`` keys; ``nextn_predict_layers`` counts the
+    # MTP (multi-token-prediction) draft layers included in block_count. All default to None so a
+    # header without them (every dense model) reads exactly as before; :func:`kv_bytes_per_token`
+    # is unchanged (it still counts every layer -- an upper bound) and exocortex.optimize does the
+    # hybrid-aware math.
+    full_attention_interval: int | None = None
+    nextn_predict_layers: int | None = None
+    ssm_conv_kernel: int | None = None
+    ssm_state_size: int | None = None
+    ssm_inner_size: int | None = None
+    ssm_group_count: int | None = None
+    ssm_time_step_rank: int | None = None
 
 
 _SIZE_LABEL_RE = re.compile(r"^(\d+(?:\.\d+)?)\s*([KMBT])$", re.IGNORECASE)
@@ -288,6 +303,17 @@ def gguf_metadata(path: Path) -> GgufMeta:
     file_type = size_label = None
     n_layer = n_ctx_train = n_embd = n_head = head_dim = None
     head_count_kv_raw: Any = None
+    # hybrid-architecture keys (2026-10-07), ``<arch>.<suffix>`` -> value; see GgufMeta
+    hybrid: dict[str, Any] = {}
+    hybrid_suffixes = {
+        ".full_attention_interval": "full_attention_interval",
+        ".nextn_predict_layers": "nextn_predict_layers",
+        ".ssm.conv_kernel": "ssm_conv_kernel",
+        ".ssm.state_size": "ssm_state_size",
+        ".ssm.inner_size": "ssm_inner_size",
+        ".ssm.group_count": "ssm_group_count",
+        ".ssm.time_step_rank": "ssm_time_step_rank",
+    }
 
     with open(path, "rb") as f:
         magic = f.read(4)
@@ -323,7 +349,12 @@ def gguf_metadata(path: Path) -> GgufMeta:
             elif key.endswith(_SUFFIX_KEY_LENGTH):
                 head_dim = _read_value(f, vtype, want_value=True)
             else:
-                _read_value(f, vtype, want_value=False)   # everything else: skip cheaply
+                for suffix, field_name in hybrid_suffixes.items():
+                    if key.endswith(suffix):
+                        hybrid[field_name] = _read_value(f, vtype, want_value=True)
+                        break
+                else:
+                    _read_value(f, vtype, want_value=False)   # everything else: skip cheaply
 
     def _int_or_none(v: Any) -> int | None:
         return int(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else None
@@ -355,6 +386,7 @@ def gguf_metadata(path: Path) -> GgufMeta:
         n_head_kv=n_head_kv, kv_heads_total=kv_heads_total, head_dim=head_dim,
         params=_params_from_size_label(size_label), file_type=_int_or_none(file_type),
         quant=quant, name=str(name) if name is not None else path.stem,
+        **{field_name: _int_or_none(v) for field_name, v in hybrid.items()},
     )
 
 

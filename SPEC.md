@@ -2901,6 +2901,104 @@ counts of every backend, `/props`), `test_assistant_context.py`, `test_app_conte
 adversarial review of 16 findings, 5 of them confirmed and fixed, and three live runs on the
 owner's machine later): **2868 passed, 24 deselected (live)** on 2026-10-06.
 
+### Optimize tab + in-app benchmark (added 2026-10-07)
+The owner asked for a re-benchmark of this machine (Core Ultra 9 285H, Arc 140T iGPU, AI Boost NPU,
+RTX 5090 Laptop 24 GB, 64 GB DDR5-7467) and for a Settings tab that tailors the compute split to a
+goal ("maximize context window vs minimize latency"). Measured first, designed second.
+
+**Verified findings (2026-10-07, this machine; the machine was busy with other work, treat ±15 % as
+noise and compare interleaved runs only).**
+- Speech: `[asr] device = "cpu"` + `engine = "auto"` runs Whisper large-v3-turbo int8 on four CPU
+  threads at **6.2 s per utterance** (8 threads 7.6 s, 14 threads 8.0 s -- more threads land on the
+  E-cores). `resolve_engine("auto")` picks Whisper whenever CUDA exists regardless of `device`.
+  Whisper on CUDA int8_float16: 0.110 s, 874 MiB (float16: 0.125 s, 2,374 MiB; CTranslate2 4.8.2
+  int8 works on Blackwell). Parakeet-TDT on the CPU: 0.15 s isolated, 0.34 s at 4 threads under
+  load, 1.1 s at 8 threads; word overlap 0.99. The installed sherpa-onnx 1.13.8 wheel is CPU-only
+  (`provider="openvino"|"directml"|"cuda"` all fall back silently). The README's 2026-09-25 line
+  "int8 on the CPU is fast enough" was wrong on this box.
+- OCR unchanged: Windows OCR 0.24 s (CPU), RapidOCR iGPU 1.33 s, NPU 2.65 s, OpenVINO CPU 3.2 s,
+  onnxruntime 9.8 s. `auto` already picks the fastest split; nothing is faster on the NPU.
+- Language model (lmstudio-community/Qwen3.8-27B Q4_K_M, CUDA 12 pack 2.44.0, 2,000-token prompt):
+  pp 800-950 tok/s, tg 17-25 tok/s, cached ttft 0.5 s on a quiet machine (1.2-1.9 s with the CPU
+  loaded by other apps). The GPU is at its **power cap** the whole time: NVML enforced limit
+  ~115 W (default 95, OEM max 130), SM clock 640-1,000 MHz of 3,090, 83-88 C, event reason 0x4.
+  `--ubatch-size 1024/2048`, `--threads-batch 16`, f16 / q4_0 KV, `mmap+mlock`: no measurable
+  change. `--spec-type draft-mtp` (the GGUF carries the MTP head: block_count 65 = 64 + 1):
+  acceptance 49 % (n_max 3, one slot) to 64 % (n_max 2, two slots), tg +15-30 %, pp -10-20 %;
+  `ngram-mod` halved tg. With `parallel = 2` + `--kv-unified` llama.cpp disables `--cache-reuse`
+  (a moved prefix is re-evaluated); `parallel = 1` restores KV shifting.
+- VRAM: `qwen35` is a hybrid (Gated DeltaNet in 48 layers, full attention in 16): header keys
+  `full_attention_interval = 4`, `nextn_predict_layers = 1`, `ssm.*`; KV = 2 x 16 x 4 x 256 x
+  elem = **34,816 B/token at q8_0** (65,536 f16, 18,432 q4_0) plus ~150 MiB of recurrent state per
+  slot. `library.kv_bytes_per_token` counts every layer (141,440 B) -- a 4x over-estimate, left as
+  the upper bound. Footprints: 8k 16,059 MiB, 32k 16,932, 81,920 18,884, 131,072 20,717 (a direct
+  probe; `/props n_ctx` confirmed a repeated `--ctx-size` in the extra args wins, and filling a slot
+  with 99k tokens grew VRAM by only 282 MiB -- the cache is allocated up front). 204,800 filled the
+  card to its last 57 MiB and thrashed (pp 43 tok/s): the 2026-09-24 freeze signature. `--fit on`
+  (llama.cpp's default) never reduces an explicit `--ctx-size` and aborts weight placement because
+  the app pins `-ngl`.
+
+**What ships.**
+- `exocortex/optimize.py` -- the pure planner (no I/O, threads or Qt; a test patches `socket` and
+  `Popen` to raise). `PlanInputs` (Settings, Machine/GpuFacts, ModelFacts, LaunchConfig, CfgFacts,
+  Evidence) -> `recommend(goal)` / `plan_all()` -> `Plan` of `Item`s (now / proposed / applies /
+  evidence / why / settings / profile / tick), all JSON round-trippable. VRAM model per evidence
+  tier: `fit` (>= 2 measured footprints; slope floored at the header's bytes-per-token and intercept
+  at weights + state), `calibrated` (running server), `header` (12 % margin), `pessimistic` (dense
+  bound); `need(max_ctx) <= avail < need(max_ctx + 2048)` exactly; the reserve is never below the
+  VRAM-guard floor + 256 MiB. Goals: context = the whole fitting window; balanced / quality = 60 %;
+  latency = 60 % with 1.3 GB more reserve, shrunk further only when two measured runs prove a
+  longer window costs answer time. Speech: the lowest-VRAM engine that keeps up (median <= 50 % of
+  the partial interval), latency takes the fastest when it is > 0.1 s quicker, `asr_gpu = "never"`
+  keeps Whisper off the GPU, quality prefers GPU Whisper only for a measured >= 0.03 overlap gain.
+  Launch flags come only from measured wins (8 % floor, 15 % for speculation, 2 x spread). Prompt
+  budgets scale off the app DEFAULTS so a plan is a fixed point. A pinned profile leaves a smaller
+  window unticked. `effective_launch` mirrors `build_args` (a drift-guard test pins them).
+- `exocortex/optimize_bench.py` -- `Store` (`<library>/benchmarks.json`: atomic writes, soft reads,
+  caps, dedup, fingerprint + 30-day staleness; the apply journal in its own file), importers for
+  `scripts/bench_llm.py --json` and the ASR sweep JSON (last-wins flag parsing; the two everyday
+  warnings `cache_reuse is not supported` / `common_fit_params: failed to fit` are benign),
+  `probe_llm` (HTTP against the RUNNING server, pinned to an idle slot, never a second server),
+  `run_child` (killable `python -m exocortex.optimize_bench probe-devices|probe-asr` children:
+  `CREATE_NO_WINDOW`, below-normal priority, hard deadline, `HF_HUB_OFFLINE=1`, killed when
+  speech resumes or free VRAM collapses; heavy imports only inside the child), `sample_vram`,
+  `swap_resident`, `canary`. `python -m exocortex.optimize_bench import <json...>` loads a sweep.
+- `exocortex/optimize_run.py` -- `OptimizeController`: `snapshot()` (polled by the tab),
+  `analyze()` (thread, latest request wins), `benchmark()` (gated by `optimize.gate`: not over a
+  live answer, not while someone speaks, not while llama-swap holds the GPU), `apply(digest)` (the
+  transaction on the engine's `llm-swap` thread: journal `pending` -> merged profile -> relaunch ->
+  verify window / canary / free VRAM -> `verified`, else restore + relaunch + `rolled-back` + toast),
+  `undo()`, `recover()` (a `pending` entry at start is undone before llama-server launches),
+  `note_baseline()`, `shutdown()`. `_activity()` is the only place that peeks at engine internals.
+- `Engine`: thin `optimize_*` delegates (never raise), `_relaunch_blocking()` (the body of
+  `set_model._swap` for a caller already on the swap thread), start/stop hooks.
+  `EngineActions` gained the six methods. `bus.OptimizeEvent`.
+- `exocortex/ui/optimize_panel.py` + `settings.py`: `FIELDS["Optimize"]` (appended last; `[optimize]`
+  + the `[asr]` engine knobs, `restart=True`) rendered by `OptimizePanel`, which re-parents the
+  form's widgets; the dialog gained `actions=` (resolved from `list_models.__self__` or
+  `parent._actions`, accepted only when the CLASS defines `optimize_snapshot`, so the tests'
+  `__getattr__` fakes degrade the page), `apply_paths`, `set_values`, `widget_values`,
+  `FieldForm.apply(only)`. `apply()` keeps its no-argument signature (PySide feeds `clicked(bool)`).
+  The dialog still edits nothing under `[llm]`: the model part goes through the profile.
+- `library.GgufMeta`: seven defaulted hybrid fields (`full_attention_interval`,
+  `nextn_predict_layers`, `ssm_*`), parsed by suffix. `gpu.power_state()` / `GpuPowerState`
+  (NVML clocks, power draw / enforced / default / max limit, temperature, utilisation, named
+  throttle reasons). `config.OptimizeConfig`. `config.example.toml`, README ("Optimize", the
+  Settings tab list, the `[optimize]` block, the NVIDIA "What to expect" table).
+- Tests: `tests/test_optimize.py` (104, pure), `test_optimize_bench.py` (142), `test_optimize_run.py`
+  (22, fake engine; a fixture makes `LlamaServerManager` raise so a benchmark can never build one),
+  `test_optimize_panel.py` (46, offscreen). Nothing under `tests/test_overlay_*` changed. Full suite
+  2026-10-07 after this change: 3,219 offline tests, 24 live deselected, one pre-existing failure
+  unrelated to this work (`tests/test_server.py::test_attempt_non_sycl_framework_gets_no_sysman_default`,
+  a `_NoOpProc` stub without `kill`), everything else green.
+
+**Decisions.** The owner's 2026-09-25 "Whisper off the display GPU" rule is now a switch
+(`asr_gpu = "never"`), not a hard-coded truth: measured, it cost 6 s per utterance. A plan never
+proposes a window the header math says will not fit, even when a measured footprint looks
+smaller (the cache is paid in full once the window fills). Nothing is downloaded by a benchmark.
+The build agents for this feature were cut off by a session rate limit mid-way; the controller
+module and the planner's integration fixes were finished by hand and the full suite re-run.
+
 ## Coding rules for implementers
 - Windows-only OK, but guard imports so `pytest` runs (e.g., import pyaudiowpatch inside functions or try/except at module import with a clear error at use time).
 - Never call the network except LM Studio (localhost), the model download in `models_dl.py`, and

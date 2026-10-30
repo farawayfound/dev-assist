@@ -763,8 +763,9 @@ off, accurate OCR, **manual advance** with its press-and-hold time and the quick
 option), Assist (including **Focus**, **Use libraries** and **Comments in generated
 code**), Notes, **Dashboard** (the board's tracking, columns and width), **Project** (the
 repository root, the on-demand repository lookups and the Claude Code toolkit catalog), Screen
-(including **OCR device**), Window, Audio — covering everything in the Configuration section
-below. The old **Model** tab (backend, model, context size, llama.cpp
+(including **OCR device**), Monitor, Window, Audio and **Optimize** (where each job runs on this
+machine, a benchmark, a plan per goal — see "Optimize" below) — covering everything in the
+Configuration section below. The old **Model** tab (backend, model, context size, llama.cpp
 knobs) has moved to **`⋯ › Models…`** (see above) — this dialog no longer touches `[llm]` at all.
 **Apply**/**OK** write the values into the running app (most take effect at once;
 the few that need a restart, such as the OCR engine or capture exclusion, are marked *(restart)*
@@ -854,6 +855,65 @@ draw on them.
   pool, so this share of it is kept for the notes lane (notes, summaries, digests) and answers get
   the rest. The old `[llm].context_tokens` still caps the transcript; `auto` sizing only ever
   lowers it.
+
+### Optimize: where each job runs
+
+**`⋯ › Settings… › Optimize`** (added 2026-10-07) tailors this machine's compute split to one
+goal and shows the evidence for every decision. The planner is pure arithmetic
+(`exocortex/optimize.py`); the benchmark (`exocortex/optimize_bench.py`) and the engine side
+(`exocortex/optimize_run.py`) feed and apply it.
+
+- **Optimise for** — `latency` (fastest answers; the fastest speech engine even if it costs GPU
+  memory; 60 % of the fitting window and 1.3 GB more kept free; shorter screen prompts),
+  `balanced` (today's behaviour plus the safe fixes: the cheapest speech engine that keeps up,
+  60 % of the fitting window), `context` (every spare GB becomes conversation window; longer
+  screen prompts), `quality` (a 16-bit KV cache where at least 32k tokens still fit).
+- **Where each job runs.** One row per job — speech recognition, the language model (window,
+  KV type, slots, launch flags), accurate OCR, the screen / hands-free prompt budgets, speaker
+  identification, the NPU, the GPU's power state — with *now*, *recommended*, when it takes
+  effect (live / next launch / a model reload of ~15 s) and an evidence glyph: ● measured on
+  this machine, ○ recorded (an imported sweep), ◌ estimated (GGUF header arithmetic or the
+  shipped "typical" numbers). Selecting a row shows the reasoning with the numbers behind it.
+- **Run benchmark** measures the *running* llama-server over HTTP (it never starts a second one:
+  two on the display GPU crashed both) and the speech engines in killable child processes:
+  Whisper on CUDA, Whisper on the CPU, Parakeet on the CPU. About 1–1.5 minutes; refused while an
+  answer is being generated, while someone is speaking, or while the shared model server holds
+  the GPU. Numbers land in `<library>/benchmarks.json` with the machine's fingerprint and age;
+  rows from another machine or older than 30 days are shown dim and never turn into a launch flag.
+- **Apply** writes each ticked row where it already lives: speech and OCR into `[asr]` /
+  `[screen]` (next launch), prompt budgets into `[screen]` / `[handsfree]` (live), the model
+  row into that model's tuning profile (the same one *Models › Tuning* edits) followed by a
+  reload that is **verified** — the server must come up with the requested window, answer a
+  one-token canary within 5 s and leave the VRAM-guard floor free — and **rolled back
+  automatically** otherwise. A journal next to `benchmarks.json` records every apply; an apply the
+  app died in the middle of is undone at the next start, before llama-server launches, and
+  **Undo** replays the last verified one's previous profile.
+- **Launch flags only from measurements.** `--spec-type draft-mtp` (speculative decoding off the
+  model's own MTP head), `--ubatch-size`, `--threads-batch`, `--load-mode mmap+mlock` and a
+  single-slot variant are proposed only when a run on this machine beat its baseline by more than
+  the noise floor (8 %, 15 % for speculation). Without such a run the planner does arithmetic
+  only; the row says so.
+- **The VRAM math** reads the GGUF header: a hybrid model (`qwen35`, i.e. Qwen3.5/3.8) keeps a KV
+  cache in only 16 of its 64 layers — 34 KiB per token at q8_0, not the 138 KiB the dense
+  formula gives — plus a fixed recurrent state per slot. Until a footprint has been measured on
+  this machine a 12 % margin is added; measured footprints lower the fixed-buffer estimate but
+  never the per-token cost (the cache is paid in full once the window fills).
+- Settings on the tab: `[optimize].goal`, `reserve_vram_mb` (GPU memory never planned into;
+  0 = the VRAM-guard floor + 256 MB + the goal's slack), `ctx_cap`, `asr_gpu = "never"` (keep
+  Whisper off the display GPU whatever the goal), and the `[asr]` engine knobs. The tab also works
+  without a running engine (it then only edits those values).
+
+What it found on the development laptop (Core Ultra 9 285H, Arc 140T iGPU, AI Boost NPU, RTX 5090
+Laptop 24 GB, 64 GB DDR5-7467), 2026-10-07: speech ran Whisper large-v3-turbo int8 on four CPU
+threads at **6.2 s per utterance** (`[asr] device = "cpu"` with `engine = "auto"`, which picks
+Whisper whenever CUDA exists) — Parakeet on the CPU does it in 0.15–0.34 s with no GPU memory,
+Whisper on CUDA in 0.11 s for 874 MiB; the 5090 is **power-capped** (115 W enforced, ~700 MHz of
+3090 while generating, 83–88 °C), so batching, thread and KV-type knobs do not move the numbers
+(prompt ~800–950 tok/s, generation 17–25 tok/s on the 27B Q4_K_M); `--spec-type draft-mtp` gave
++15–30 % generation at 49–64 % draft acceptance, n-gram speculation hurt; a 204,800-token window
+fills the card to its last 57 MiB and thrashes, 131,072 loads at 20.7 GB; Windows OCR on the CPU
+and RapidOCR on the iGPU were already the right split, and nothing runs faster on the NPU than on
+the iGPU.
 
 ## Configuration
 
@@ -993,6 +1053,15 @@ hide_from_capture = true
 hide_when_exposed = true   # see the capture note under "Limitations & honesty notes"
 opacity = 0.93
 
+[optimize]
+# 2026-10-07: Settings > Optimize. Only the goal and three limits live here; a plan's results land
+# in the model's tuning profile, [asr], [screen] and [handsfree], and measurements in
+# <library>/benchmarks.json. Nothing changes until "Apply plan" is pressed.
+goal = "balanced"           # latency | balanced | context | quality
+reserve_vram_mb = 0         # GPU memory never planned into (MB); 0 = guard floor + 256 + the goal's slack
+ctx_cap = 0                 # longest window to plan (tokens); 0 = the model's trained maximum
+asr_gpu = "auto"            # auto | never: "never" keeps Whisper off the display GPU whatever the goal
+
 [stealth]
 enabled = true
 process_caption = "ExoCortex"  # what a live process listing reads for this app; "" = leave it as recorded
@@ -1005,14 +1074,15 @@ Switch models from `⋯ › Models…` (any GGUF in this app's own library or LM
 
 ### What to expect
 
-**NVIDIA (RTX 5090 Laptop, measured 2026-09-20):**
+**NVIDIA (RTX 5090 Laptop, measured 2026-09-20 with `maple-preview`; the 2026-10-07 re-benchmark
+with the 16.8 GB Qwen3.8-27B Q4_K_M in brackets — see "Optimize" above):**
 
 | | |
 |---|---|
-| Startup | ~5 s warm; **20–30 s the first time after a reboot** (the 5 GB model is read from disk) |
-| Transcription | each utterance appears ~0.15 s after the speaker pauses; partial text while they talk |
-| Answer, first token | 60 ms when only new speech was added; **2–5 s when the screen text changed** (it is re-evaluated by the CPU-bound model: ~1 s per 1000 characters, hence `max_text_chars`) |
-| Generation | ~58 tokens/s |
+| Startup | ~5 s warm; **20–30 s the first time after a reboot** (the 5 GB model is read from disk) [27B: 12–50 s depending on the page cache] |
+| Transcription | each utterance appears ~0.15 s after the speaker pauses; partial text while they talk [Whisper on CUDA 0.11 s, Parakeet on the CPU 0.15–0.34 s, **Whisper on the CPU 6.2 s** — the Optimize tab moves it] |
+| Answer, first token | 60 ms when only new speech was added; **2–5 s when the screen text changed** (it is re-evaluated by the CPU-bound model: ~1 s per 1000 characters, hence `max_text_chars`) [27B: 0.5 s cached on a quiet machine, 1.2–1.9 s with other apps loading the CPU; a fresh 2000-token prompt reads at 800–950 tok/s] |
+| Generation | ~58 tokens/s [27B: 17–25 tok/s — the GPU sits at its 115 W power limit at ~700 MHz; `--spec-type draft-mtp` adds 15–30 %] |
 | Screen reading | active window every 1.5 s, 15–45 ms capture + 108 ms OCR (Windows OCR) |
 | OCR, RapidOCR (hands-free's accurate re-read, or `ocr_engine = "rapidocr"`) | 0.73 s on the iGPU, 1.45 s on the NPU, 1.9–3.7 s on the CPU — see "OCR on the iGPU / NPU" |
 

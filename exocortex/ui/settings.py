@@ -21,11 +21,21 @@ app's own GGUF library, Hugging Face discovery and per-model tuning; ``FIELDS`` 
 "Model" entry and this dialog no longer touches the ``[llm]`` section at all. The ``model`` field
 kind and ``_ModelCombo`` stay here (still built by :func:`make_field_widget`) since nothing else
 needs a live, editable model picker yet.
+
+2026-10-07 (Optimize tab): ``FIELDS["Optimize"]`` is a normal tab (``[optimize]`` goal / limits and the
+``[asr]`` engine knobs), but its PAGE is built by :class:`exocortex.ui.optimize_panel.OptimizePanel`, which
+re-parents that form's widgets and adds the benchmark / plan / apply workflow on top. The dialog therefore
+gained a few additive hooks and nothing else changed: ``actions=`` (the engine, found WITHOUT touching
+``overlay.py`` -- see :func:`_resolve_actions`), :meth:`SettingsDialog.apply_paths` (apply only the values a
+plan wrote, leaving unrelated pending edits on other tabs alone), :meth:`SettingsDialog.set_values` /
+:meth:`SettingsDialog.widget_values` (fill / read widgets by path across tabs) and ``FieldForm.apply(only)``.
+``apply()`` keeps its no-argument signature on purpose: it is connected straight to ``clicked(bool)`` and
+PySide would otherwise feed the ``checked`` flag into an optional parameter.
 """
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import Any
 
@@ -349,6 +359,35 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "\"okay\"."),
         Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool", restart=True),
     ),
+    # 2026-10-07 (Optimize tab): appended LAST on purpose ("Completion" must stay first). This tab's page is built
+    # by exocortex.ui.optimize_panel.OptimizePanel, which re-parents these widgets into its own layout; the
+    # FieldForm underneath stays the source of truth for load / changes / apply / restore_defaults, so every
+    # invariant tests/test_settings.py pins for the other tabs holds here too. Nothing under [llm] is edited.
+    "Optimize": (
+        Field("optimize", "goal", "Optimise for", "choice",
+              choices=("latency", "balanced", "context", "quality"),
+              help="latency: fastest answers and 3 GB of GPU memory kept free. balanced: today's behaviour plus the "
+                   "safe fixes. context: every spare GB becomes conversation window. quality: 16-bit KV cache where "
+                   ">= 32k fits."),
+        Field("optimize", "reserve_vram_mb", "GPU memory kept free (MB, 0 = automatic)", "int", 0, 12000, 256,
+              help="Never planned into: the desktop shares this GPU. 0 = the VRAM-guard floor + 256 plus a per-goal "
+                   "allowance. Any value is raised to the guard floor + 256 if lower."),
+        Field("optimize", "ctx_cap", "Longest window to plan (tokens, 0 = the model's maximum)", "int", 0, 262144, 2048),
+        Field("optimize", "asr_gpu", "Speech recognition on the display GPU", "choice", choices=("auto", "never"),
+              help="never = Whisper is not planned onto the GPU (the 2026-09-25 rule). auto = only when Parakeet "
+                   "cannot be used (hotwords, an unsupported language) or measurably loses on accuracy."),
+        Field("asr", "engine", "Speech engine", "choice", choices=("auto", "faster-whisper", "sherpa"), restart=True,
+              help="auto = Whisper whenever CUDA exists, EVEN when the device below is cpu. Measured on this machine: "
+                   "Whisper on the CPU 6.2 s per utterance, Parakeet (sherpa) on the CPU 0.15 s, Whisper on CUDA "
+                   "0.11 s but it holds 0.9 GB of GPU memory. sherpa = Parakeet-TDT on the CPU: no GPU memory, "
+                   "English or 25 European languages, no hotwords."),
+        Field("asr", "device", "Whisper device", "choice", choices=("auto", "cuda", "cpu"), restart=True,
+              help="Where Whisper runs. cpu keeps ~1-2.5 GB off the display GPU but costs seconds per utterance."),
+        Field("asr", "compute_type", "Whisper precision", "choice",
+              choices=("auto", "float16", "int8_float16", "int8"), restart=True,
+              help="int8_float16 on CUDA holds about 0.9 GB, float16 about 2.4 GB; int8 is the CPU precision."),
+        Field("asr", "cpu_threads", "Speech CPU threads (0 = automatic)", "int", 0, 32, 1, restart=True),
+    ),
 }
 
 
@@ -638,9 +677,12 @@ class FieldForm:
                 out[f.path] = new
         return out
 
-    def apply(self) -> dict[str, Any]:
-        """Write the changed values into the config; returns the changes."""
-        changed = self.changes()
+    def apply(self, only: Collection[str] | None = None) -> dict[str, Any]:
+        """Write the changed values into the config; returns the changes. ``only`` (2026-10-07,
+        Optimize tab) limits the write to those ``"section.key"`` paths: everything else stays a
+        pending edit in its widget. Nothing connects this method to a Qt signal (it is called, never
+        wired), so the optional parameter cannot receive a ``checked`` flag."""
+        changed = {k: v for k, v in self.changes().items() if only is None or k in only}
         for f in self.fields:
             if f.path in changed:
                 setattr(getattr(self._cfg, f.section), f.key, changed[f.path])
@@ -656,6 +698,22 @@ class FieldForm:
             set_field_value(self.widgets[f.path], f, getattr(getattr(defaults, f.section), f.key))
 
 
+def _resolve_actions(explicit: Any, list_models: Any, parent: Any) -> Any:
+    """2026-10-07 (Optimize tab): the object that implements the optimizer actions, or ``None``.
+
+    Order: the explicit ``actions=``; ``list_models.__self__`` (``OverlayWindow.open_settings`` passes
+    ``actions.list_models``, so on a real Engine that bound method's ``__self__`` IS the engine, with no
+    change to ``overlay.py``); ``parent._actions`` (an ``OverlayWindow``). A candidate counts only if
+    its CLASS defines ``optimize_snapshot``: the test fakes use a ``__getattr__`` catch-all that makes
+    ``hasattr`` true for every name, and such a fake must not look like an engine (the tab would then
+    show a "connected" page full of ``None`` answers).
+    """
+    for cand in (explicit, getattr(list_models, "__self__", None), getattr(parent, "_actions", None)):
+        if cand is not None and callable(getattr(type(cand), "optimize_snapshot", None)):
+            return cand
+    return None
+
+
 class SettingsDialog(QDialog):
     """Tabbed editor for :data:`FIELDS`, one :class:`FieldForm` per tab. ``applied`` carries
     ``{"section.key": new_value}`` for every value that changed on Apply / OK (empty dict when
@@ -664,16 +722,18 @@ class SettingsDialog(QDialog):
     applied = Signal(dict)
 
     def __init__(self, cfg: Config, list_models: Callable[[], list[str]] | None = None,
-                 parent: QWidget | None = None) -> None:
+                 parent: QWidget | None = None, *, actions: Any = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
         self._list_models = list_models          # kept for callers built against the old surface;
         self._forms: dict[str, FieldForm] = {}    # no FIELDS entry is kind "model" any more.
+        self._actions = _resolve_actions(actions, list_models, parent)   # None = Optimize tab degraded
+        self._optimize_panel: Any = None
         self.setWindowTitle("Settings")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(build_qss(cfg.ui.font_size) + _DIALOG_QSS)
         self.setMinimumSize(520, 420)
-        self.resize(560, 520)
+        self.resize(680, 640)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(10, 10, 10, 10)
@@ -682,9 +742,16 @@ class SettingsDialog(QDialog):
         outer.addWidget(self.tabs, 1)
         self.audio_check: AudioCheckPanel | None = None
         for name, group in FIELDS.items():
-            form = FieldForm(group, cfg, self.tabs)
+            if name == "Optimize":
+                # parent None: the panel re-parents the widgets into its own layout, and the (then
+                # empty) scroll shell is never shown
+                form = FieldForm(group, cfg, None)
+                page = self._build_optimize_page(form)
+            else:
+                form = FieldForm(group, cfg, self.tabs)
+                page = form.widget
             self._forms[name] = form
-            self.tabs.addTab(form.widget, name)
+            self.tabs.addTab(page, name)
             if name == "Audio":
                 self.audio_check = AudioCheckPanel(
                     form.widgets["audio.mic_device"], form.widgets["audio.system_device"],
@@ -724,12 +791,30 @@ class SettingsDialog(QDialog):
             merged.update(form.widgets)
         return merged
 
+    def _build_optimize_page(self, form: FieldForm) -> QWidget:
+        """The Optimize tab's page: an :class:`~exocortex.ui.optimize_panel.OptimizePanel` around
+        ``form``'s widgets. Imported lazily and guarded so a defect in the panel can never take the
+        whole Settings dialog down: on any failure the tab falls back to ``form``'s plain scrollable
+        form (the panel moves the form's widgets as the LAST step of its construction, so a failure
+        before that leaves the form intact)."""
+        try:
+            from exocortex.ui.optimize_panel import OptimizePanel
+
+            panel = OptimizePanel(self._cfg, self._actions, form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its panel cannot be built
+            log.exception("Optimize panel unavailable; showing the plain form")
+            return form.widget
+        self._optimize_panel = panel
+        return panel
+
     # ---- values --------------------------------------------------------------------------------
     def load(self) -> None:
         """Fill every widget from the current config."""
         for form in self._forms.values():
             form.load()
         self.note.setText("")
+        if self._optimize_panel is not None:
+            self._optimize_panel.refresh()
 
     def show_tab(self, name: str) -> bool:
         """Bring the tab called `name` to the front (the Assist menu's "Assist settings…"); False
@@ -759,10 +844,49 @@ class SettingsDialog(QDialog):
         return out
 
     def apply(self) -> dict[str, Any]:
-        """Write the changed values into the config and announce them; returns the changes."""
+        """Write the changed values into the config and announce them; returns the changes.
+
+        No parameters, deliberately: the Apply button's ``clicked(bool)`` is connected straight to
+        this method, and PySide passes the ``checked`` flag to an optional first parameter. The
+        filtered variant is :meth:`apply_paths`."""
+        return self._apply(None)
+
+    def apply_paths(self, paths: Collection[str]) -> dict[str, Any]:
+        """Like :meth:`apply`, but only for the given ``"section.key"`` paths (2026-10-07, Optimize
+        tab: a plan writes a handful of values; edits pending on other tabs stay pending). Emits
+        ``applied`` once with exactly the paths that changed."""
+        return self._apply(frozenset(paths))
+
+    def set_values(self, values: dict[str, Any]) -> list[str]:
+        """Fill widgets by ``"section.key"`` path across every tab (nothing is written to the config
+        until :meth:`apply` / :meth:`apply_paths`). Returns the paths that could not be set: unknown
+        paths, or a value the widget cannot take."""
+        widgets = self._widgets
+        by_path = {f.path: f for f in all_fields()}
+        failed: list[str] = []
+        for path, value in values.items():
+            widget, field_ = widgets.get(path), by_path.get(path)
+            if widget is None or field_ is None:
+                failed.append(path)
+                continue
+            try:
+                set_field_value(widget, field_, value)
+            except (TypeError, ValueError, OverflowError):
+                log.warning("set_values: %s cannot take %r", path, value)
+                failed.append(path)
+        return failed
+
+    def widget_values(self, paths: Collection[str]) -> dict[str, Any]:
+        """The current widget value of each known path (the inverse of :meth:`set_values`; the
+        Optimize tab's Undo snapshot). Unknown paths are left out."""
+        widgets = self._widgets
+        by_path = {f.path: f for f in all_fields()}
+        return {p: get_field_value(widgets[p], by_path[p]) for p in paths if p in widgets and p in by_path}
+
+    def _apply(self, only: Collection[str] | None) -> dict[str, Any]:
         changed: dict[str, Any] = {}
         for form in self._forms.values():
-            changed.update(form.apply())
+            changed.update(form.apply(only))
         by_path = {f.path: f for f in all_fields()}
         restart = [by_path[path].label for path in changed if by_path[path].restart]
         if restart:

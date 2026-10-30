@@ -633,6 +633,21 @@ class MonitorConfig:
 
 
 @dataclass
+class OptimizeConfig:
+    """Settings > Optimize (2026-10-07): the goal the planner (:mod:`exocortex.optimize`) tailors
+    this machine's compute split to, plus three limits. Only these four values are remembered
+    here. A plan's RESULTS are never stored in this section: they land where they already live
+    (the per-model tuning profile for the language model, ``[asr]`` for speech, ``[screen]`` /
+    ``[handsfree]`` for the prompt budgets), and benchmark numbers live next to the model library
+    in ``benchmarks.json``. Nothing here changes behaviour by itself -- a plan is only ever applied
+    by pressing "Apply plan" on the Optimize tab."""
+    goal: str = "balanced"        # latency | balanced | context | quality
+    reserve_vram_mb: int = 0      # 0 = automatic per goal (VRAM-guard floor + 256 MiB + the goal's slack); else as given
+    ctx_cap: int = 0              # 0 = the model's trained context; else never plan a longer window than this
+    asr_gpu: str = "auto"         # auto | never: "never" = Whisper is never planned onto the display GPU
+
+
+@dataclass
 class CompletionConfig:
     """Completion mode: inline ghost-text completions at the caret of whatever text field or code
     editor has focus, from the whole session's context (transcript, answers, notes, screen).
@@ -816,6 +831,7 @@ class Config:
     handsfree: HandsFreeConfig = field(default_factory=HandsFreeConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
+    optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)

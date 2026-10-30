@@ -197,6 +197,9 @@ class Engine(EngineActions):
         # model yet) and _init_llm never starts it, so the first load_model() has to (see
         # _mark_llm_ready).
         self._assistant_started = False
+        # 2026-10-07 (Settings > Optimize): the OptimizeController (exocortex.optimize_run), built on
+        # first use by _optimizer() so importing this module never imports the planner or the bench.
+        self._optimize_ctl: Any = None
 
     # ---- clock / ids -----------------------------------------------------------------
     def clock(self) -> float:
@@ -238,6 +241,16 @@ class Engine(EngineActions):
         log.info("session folder: %s", folder)
         self._init_project()
         self._init_dashboard(folder)
+
+        # 2026-10-07 (Settings > Optimize): an apply that died half-way is rolled back HERE, before
+        # llama-server launches (a profile the model cannot start with must not crash-loop every
+        # launch), and the VRAM everything else holds is noted for the planner's budget.
+        try:
+            ctl = self._optimizer()
+            ctl.recover()
+            ctl.note_baseline()
+        except Exception:  # noqa: BLE001 - the optimizer must never block start-up
+            log.exception("optimizer start-up hooks failed")
 
         self._llm_thread = threading.Thread(target=self._init_llm, name="llm-init", daemon=True)
         self._llm_thread.start()
@@ -608,6 +621,11 @@ class Engine(EngineActions):
         if self._stopped.is_set():
             return
         self._stopped.set()
+        if self._optimize_ctl is not None:
+            try:
+                self._optimize_ctl.shutdown()      # cancel, kill probe children, join the workers (<= 3 s)
+            except Exception:  # noqa: BLE001
+                log.exception("error stopping the optimizer")
         log.info("engine stopping")
         self._pull_cancel.set()
         if self._pull_thread is not None and self._pull_thread.is_alive():
@@ -1199,6 +1217,40 @@ class Engine(EngineActions):
         self.bus.publish(ModelLibraryEvent(reason="loaded", loaded_key=self.loaded_model()))
         self._replay_pending()
 
+    def _relaunch_blocking(self, model_id: str) -> str | None:
+        """Relaunch llama-server with `model_id` (profile re-read from disk), for a caller that is
+        ALREADY on the "llm-swap" thread: the Optimize tab's apply / verify / rollback transaction
+        (exocortex.optimize_run), which must write a profile, relaunch, look at the result and maybe
+        relaunch again without ever starting a second thread. The body of `set_model`'s `_swap` minus
+        the cfg commit (the model is not changing, only its flags): it publishes the same
+        `ComponentStatusEvent`s `_swap` would (only the first detail differs: "applying settings"
+        instead of "switching to ...") and, instead of only toasting a failure, returns None on
+        success or the error text so the caller can roll back. Do NOT call it from another thread:
+        `_start_swap` is what keeps swaps one at a time."""
+        try:
+            if self._stopped.is_set():
+                return "the app is stopping"
+            self._status("llm", "loading", "applying settings")
+            if self.assistant is not None and hasattr(self.assistant, "cancel"):
+                self.assistant.cancel()
+            if self._stopped.is_set():
+                return "the app is stopping"
+            server = self._ensure_server()
+            if self._stopped.is_set():
+                return "the app is stopping"
+            url = server.swap_model(model_id, on_status=lambda d: self._status("llm", "loading", d))
+            self.client.set_base_url(url)
+            if self.assistant and hasattr(self.assistant, "set_model"):
+                self.assistant.set_model(model_id)
+            else:
+                self._status("llm", "ready", model_id)
+            self._mark_llm_ready()
+            return None
+        except Exception as e:  # noqa: BLE001
+            log.exception("model relaunch failed")
+            self._status("llm", "error", f"model swap failed: {e}")
+            return str(e) or type(e).__name__
+
     # ---- model manager (2026-09-27, portable-install: the "Models..." window) ------------
     # Same shape as set_model: return at once, do the work on a named daemon thread, report through
     # ModelLibraryEvent / ModelPullEvent / ModelSearchEvent / ModelInfoEvent / ComponentStatusEvent.
@@ -1595,6 +1647,57 @@ class Engine(EngineActions):
         except Exception:  # noqa: BLE001
             log.exception("could not read the context usage")
             return {}
+
+    # ---- optimizer (2026-10-07: Settings > Optimize) -----------------------------------------
+    # Thin delegates to exocortex.optimize_run.OptimizeController, built on first use. Each one
+    # swallows its own failure (logged) and returns the "nothing" value, which the tab reads as
+    # "engine not connected" -- a user action must never raise into the UI thread.
+    def _optimizer(self) -> Any:
+        if self._optimize_ctl is None:
+            from exocortex.optimize_run import OptimizeController
+
+            self._optimize_ctl = OptimizeController(self)
+        return self._optimize_ctl
+
+    def optimize_snapshot(self) -> dict[str, object]:
+        try:
+            return self._optimizer().snapshot()
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_snapshot failed")
+            return {}
+
+    def optimize_analyze(self, goal: str = "", options: dict[str, object] | None = None, model_key: str = "") -> None:
+        try:
+            self._optimizer().analyze(goal, options, model_key)
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_analyze failed")
+
+    def optimize_benchmark(self, scopes: list[str] | None = None, force: bool = False) -> bool:
+        try:
+            return bool(self._optimizer().benchmark(scopes, force))
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_benchmark failed")
+            return False
+
+    def optimize_cancel(self) -> None:
+        try:
+            self._optimizer().cancel()
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_cancel failed")
+
+    def optimize_apply(self, digest: str) -> bool:
+        try:
+            return bool(self._optimizer().apply(digest))
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_apply failed")
+            return False
+
+    def optimize_undo(self) -> bool:
+        try:
+            return bool(self._optimizer().undo())
+        except Exception:  # noqa: BLE001
+            log.exception("optimize_undo failed")
+            return False
 
     def quit(self) -> None:
         if self._on_quit:

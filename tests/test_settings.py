@@ -39,7 +39,8 @@ def qapp() -> QApplication:
 
 def test_every_field_names_a_real_config_value_of_the_right_kind() -> None:
     cfg = Config()
-    kinds = {"bool": bool, "int": int, "float": float, "choice": str, "text": str, "model": str, "device": str}
+    kinds = {"bool": bool, "int": int, "float": float, "choice": str, "text": str, "model": str,
+             "device": str, "binding": str}
     seen: set[str] = set()
     for f in all_fields():
         assert f.path not in seen, f.path

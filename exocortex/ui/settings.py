@@ -39,16 +39,25 @@ knobs; and, like Optimize, the Audio tab's PAGE is built by :class:`exocortex.ui
 (device list from a background scan, a Test button and level meter per source, what the running app has open)
 around the ordinary ``FieldForm``. The page builders are listed in :data:`SettingsDialog._PAGE_BUILDERS`; a
 panel that fails to build falls back to the plain form, so the tab always exists.
+
+2026-10-29 (Shortcuts tab): ``FIELDS["Shortcuts"]`` lists every ``[hotkeys]`` entry as a ``binding`` field
+(:class:`_BindingEdit`: the binding in words, **Set** -- listen for the next key(s) or mouse button -- and
+**Default**), and its page is :class:`ShortcutsPage`, registered in ``SettingsDialog._PAGE_BUILDERS`` next to
+Optimize. The grammar is :mod:`exocortex.bindings`; a row the grammar rejects is flagged and skipped by
+``_apply()``. The overlay re-registers its shortcuts when any ``hotkeys.*`` value is applied. The Assist tab
+gained **Consider given code** (``[assist].consider_given_code``) and the Hands-free tab the hold switch of
+the third manual gesture (``manual_hold_code_fresh``).
 """
 from __future__ import annotations
 
 import logging
+import sys
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFontMetrics
+from PySide6.QtCore import QEvent, QObject, QPoint, Qt, QTimer, Signal
+from PySide6.QtGui import QFontMetrics, QGuiApplication, QKeyEvent
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -56,30 +65,39 @@ from PySide6.QtWidgets import (
     QDialog,
     QDoubleSpinBox,
     QFormLayout,
+    QGridLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
     QScrollArea,
-    QSizePolicy,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
+from exocortex.bindings import describe_binding, key_token_for_vk, normalize_binding
 from exocortex.config import Config
 from exocortex.ui.theme import COLORS, build_qss
 
 if TYPE_CHECKING:  # the UI never imports the capture module at run time; the panel does
     from exocortex.audio.capture import DeviceInfo
 
+try:
+    from exocortex.ui.llhooks import CaptureHooks, ChordRecorder
+except Exception:  # noqa: BLE001 - pure ctypes, but the dialog must open even if it cannot load
+    CaptureHooks = None  # type: ignore[assignment,misc]
+    ChordRecorder = None  # type: ignore[assignment,misc]
+
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class Field:
-    """One editable config value. ``kind``: bool | int | float | choice | text | model | device."""
+    """One editable config value. ``kind``: bool | int | float | choice | text | model | device | binding
+    (2026-10-29: ``device`` is an audio device picker, :class:`_DeviceCombo`; ``binding`` a ``[hotkeys]``
+    shortcut, edited with :class:`_BindingEdit`)."""
 
     section: str
     key: str
@@ -166,6 +184,10 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "right away -- and so does a touchpad three-finger tap once Windows Settings > "
                    "Bluetooth & devices > Touchpad maps it to 'Middle mouse button' (a tap cannot be "
                    "held). Checked: the middle button must be held for the press-and-hold time too."),
+        Field("handsfree", "manual_hold_code_fresh", "Press and hold for Code from scratch (mouse 4)", "bool",
+              help="Unchecked (default): a click of the third gesture's button (mouse button 4 by default; "
+                   "Shortcuts tab) writes the code from scratch, ignoring the code on screen. Checked: it "
+                   "must be held for the press-and-hold time."),
         Field("handsfree", "enabled", "Hands-free mode on (also at the next launch)", "bool",
               help="Same as the switch at the right of the tab strip (Ctrl+Alt+H)."),
     ),
@@ -182,6 +204,13 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "short comment above every logical step plus a one-line summary. detailed: the code "
                    "opens with a requirements + pseudo-code comment block, then a comment above most "
                    "lines (the way an engineer works a challenge through in the editor)."),
+        Field("assist", "consider_given_code", "Consider given code", "bool",
+              help="On (default): solve, Code and Text work with the code already written in the development "
+                   "window -- they complete it, or fix only what is wrong, keeping its structure, names and "
+                   "approach -- instead of jumping to the optimal solution from scratch; a platform's starter "
+                   "code is filled in. Off: the best solution from scratch, keeping only the entry point the "
+                   "task dictates. The manual-advance 'Code from scratch' gesture (Shortcuts tab) always "
+                   "ignores the given code."),
         Field("assist", "style", "Answer style", "choice", choices=("bullets", "short", "detailed")),
         Field("assist", "focus", "What is worth answering (screen questions, hands-free tasks)", "choice",
               choices=("auto", "technical", "all"),
@@ -387,6 +416,52 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("audio", "pre_roll_s", "Audio kept from before speech starts (s)", "float", 0.0, 1.0, 0.05,
               restart=True),
     ),
+    # 2026-10-29 (Shortcuts tab): every [hotkeys] entry, in the order the page lists them -- the global
+    # shortcuts, then the manual-advance gestures -- as "binding" fields (one grammar for key combinations,
+    # single-key taps and mouse buttons: exocortex.bindings), plus the thumb-button swallow switch. The page
+    # is built by ShortcutsPage (see _PAGE_BUILDERS); tests pin that every HotkeysConfig field is here.
+    "Shortcuts": (
+        Field("hotkeys", "toggle_visible", "Show / hide the overlay", "binding"),
+        Field("hotkeys", "ask_focus", "Show the overlay and focus the ask box", "binding"),
+        Field("hotkeys", "answer_last", "Answer the last thing the other side said", "binding"),
+        Field("hotkeys", "toggle_auto", "Auto-answer on / off", "binding"),
+        Field("hotkeys", "suggest_now", "Suggestions from the screen and the conversation, now", "binding"),
+        Field("hotkeys", "notes", "Regenerate the notes", "binding"),
+        Field("hotkeys", "insights", "Suggested questions and blind spots / follow-ups, now", "binding"),
+        Field("hotkeys", "recap", "Recap the session so far", "binding"),
+        Field("hotkeys", "code", "Code: write the code for the task", "binding"),
+        Field("hotkeys", "checkpoint", "Checkpoint: the coding context starts fresh", "binding"),
+        Field("hotkeys", "toggle_explanations", "Explanations on / off", "binding"),
+        Field("hotkeys", "toggle_completion", "Completion mode on / off", "binding"),
+        Field("hotkeys", "toggle_handsfree", "Hands-free mode on / off", "binding"),
+        Field("hotkeys", "toggle_manual", "Manual advance on / off", "binding"),
+        Field("hotkeys", "toggle_dashboard", "Dashboard mode on / off", "binding"),
+        Field("hotkeys", "select_region", "Drag a screen region to read", "binding"),
+        Field("hotkeys", "toggle_screen", "Pause / resume screen reading", "binding"),
+        Field("hotkeys", "toggle_mic", "Mute / unmute the mic", "binding"),
+        Field("hotkeys", "toggle_pause", "Pause / resume everything automatic", "binding",
+              help="A tap of a single key by default (Right Shift): pressed and released with no other key "
+                   "in between, so typing capitals never trips it."),
+        Field("hotkeys", "click_through", "Click-through on / off", "binding"),
+        Field("hotkeys", "move_left", "Move the overlay left", "binding"),
+        Field("hotkeys", "move_right", "Move the overlay right", "binding"),
+        Field("hotkeys", "move_up", "Move the overlay up", "binding"),
+        Field("hotkeys", "move_down", "Move the overlay down", "binding"),
+        Field("hotkeys", "quit", "Quit (saves the session)", "binding"),
+        Field("hotkeys", "manual_text", "Manual advance: Text", "binding",
+              help="The left button, held, by default (the Hands-free tab decides which gestures need the hold)."),
+        Field("hotkeys", "manual_code", "Manual advance: Code", "binding",
+              help="A middle click by default. Works with the given code when 'Consider given code' (Assist "
+                   "tab) is on."),
+        Field("hotkeys", "manual_code_fresh", "Manual advance: Code from scratch", "binding",
+              help="Mouse button 4 (the rear thumb button) by default. Always ignores the code on screen: "
+                   "straight to the best solution."),
+        Field("hotkeys", "swallow_thumb_buttons", "Keep thumb-button presses (mouse 4 / 5) from the app underneath",
+              "bool",
+              help="A bound thumb button would otherwise make a browser or an editor go Back / Forward on the "
+                   "very press that asks for code. Modified clicks (Ctrl+left) are always kept, bare left / "
+                   "middle / right presses never."),
+    ),
     # 2026-10-07 (Optimize tab): appended LAST on purpose ("Completion" must stay first). This tab's page is built
     # by exocortex.ui.optimize_panel.OptimizePanel, which re-parents these widgets into its own layout; the
     # FieldForm underneath stays the source of truth for load / changes / apply / restore_defaults, so every
@@ -445,6 +520,10 @@ QComboBox QAbstractItemView {{ background: {COLORS['bg_solid']}; color: {COLORS[
 QCheckBox {{ spacing: 6px; }}
 QLabel#restart {{ color: {COLORS['warn']}; }}
 QLabel#help {{ color: {COLORS['text_faint']}; }}
+QLabel#section {{ color: {COLORS['accent']}; font-weight: 600; margin-top: 6px; }}
+QLabel#fixed {{ color: {COLORS['text_dim']}; }}
+QLabel#binding[state="invalid"] {{ color: {COLORS['err']}; }}
+QLabel#binding[state="listening"] {{ color: {COLORS['accent']}; }}
 """
 
 
@@ -610,6 +689,9 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
             except Exception:  # noqa: BLE001
                 log.exception("list_models() failed")
         return w
+    if f.kind == "binding":
+        # 2026-10-29: the row's Default button needs the built-in value of this very field
+        return _BindingEdit(str(getattr(getattr(_defaults(), f.section), f.key)), parent)
     return QLineEdit(parent)
 
 
@@ -632,6 +714,8 @@ def set_field_value(widget: QWidget, f: Field, value: Any) -> None:
         widget.setCurrentIndex(idx)
     elif isinstance(widget, QLineEdit):
         widget.setText(str(value))
+    elif isinstance(widget, _BindingEdit):
+        widget.set_value(str(value))
     else:  # pragma: no cover - every kind above returns one of these
         raise TypeError(type(widget))
 
@@ -650,6 +734,8 @@ def get_field_value(widget: QWidget, f: Field) -> Any:
         return widget.currentText().strip()
     if isinstance(widget, QLineEdit):
         return widget.text().strip()
+    if isinstance(widget, _BindingEdit):
+        return widget.value()
     raise TypeError(type(widget))  # pragma: no cover - every kind above returns one of these
 
 
@@ -722,6 +808,409 @@ class FieldForm:
             set_field_value(self.widgets[f.path], f, getattr(getattr(defaults, f.section), f.key))
 
 
+
+# ---------------------------------------------------------------------------------------------
+# Shortcuts tab (2026-10-29): every [hotkeys] binding in one list -- the current binding in words,
+# a Set button that listens for the next key(s) / mouse button, a Default button per row -- plus
+# the fixed in-overlay keys, so the tab shows every shortcut the app has.
+# ---------------------------------------------------------------------------------------------
+#: How long the Set button waits after the last press before taking the combination.
+CAPTURE_QUIET_S = 0.5
+
+#: (where, key or gesture, action): the shortcuts that are NOT rebindable, listed for completeness.
+#: Mirrors docs/SHORTCUTS.md "Inside the overlay".
+FIXED_SHORTCUTS: tuple[tuple[str, str, str], ...] = (
+    ("Ask box", "Enter", "Send the question"),
+    ("Ask box", "Esc", "Clear the box"),
+    ("Region picker", "Drag", "Select the region"),
+    ("Region picker", "Enter or double-click", "Accept the region"),
+    ("Region picker", "Esc or right-click", "Cancel"),
+    ("Live tab", "Double-click a speaker name", "Rename the speaker"),
+    ("Title bar or slim bar", "Drag", "Move the overlay"),
+    ("Window edges, bottom-right corner", "Drag", "Resize the overlay"),
+    ("Panel, except over text", "Right-click", "The \u22ef menu"),
+    ("Text panes and the ask box", "Right-click", "The text menu, Hide overlay, Quit"),
+    ("Hands-free view, over the answer or the history", "Mouse wheel", "Scroll it (the view stays click-through)"),
+    ("Hands-free view, over the expanded history", "Tap Up / Down", "Previous / next answer"),
+    ("Shortcuts tab, while Set listens", "Esc", "Cancel"),
+)
+
+
+def _real_windows() -> bool:
+    """True only on real Windows with the native "windows" Qt platform (never under the offscreen
+    QPA the tests use): the one case the capture hooks may touch the real keyboard and mouse."""
+    return sys.platform == "win32" and QGuiApplication.platformName() == "windows"
+
+
+def _restyle(widget: QWidget, name: str) -> None:
+    """Switch a widget's object name (its QSS role) and repolish it so the new style shows."""
+    if widget.objectName() != name:
+        widget.setObjectName(name)
+        widget.style().unpolish(widget)
+        widget.style().polish(widget)
+
+
+_QT_KEY_TOKENS: dict[int, str] = {
+    int(Qt.Key.Key_Space): "space", int(Qt.Key.Key_Left): "left", int(Qt.Key.Key_Up): "up",
+    int(Qt.Key.Key_Right): "right", int(Qt.Key.Key_Down): "down", int(Qt.Key.Key_Return): "enter",
+    int(Qt.Key.Key_Enter): "enter", int(Qt.Key.Key_Escape): "esc", int(Qt.Key.Key_Tab): "tab",
+    int(Qt.Key.Key_Backspace): "backspace", int(Qt.Key.Key_Insert): "insert", int(Qt.Key.Key_Delete): "delete",
+    int(Qt.Key.Key_Home): "home", int(Qt.Key.Key_End): "end", int(Qt.Key.Key_PageUp): "pageup",
+    int(Qt.Key.Key_PageDown): "pagedown", int(Qt.Key.Key_QuoteLeft): "grave", int(Qt.Key.Key_Minus): "-",
+    int(Qt.Key.Key_Equal): "=", int(Qt.Key.Key_BracketLeft): "[", int(Qt.Key.Key_BracketRight): "]",
+    int(Qt.Key.Key_Semicolon): ";", int(Qt.Key.Key_Apostrophe): "'", int(Qt.Key.Key_Comma): ",",
+    int(Qt.Key.Key_Period): ".", int(Qt.Key.Key_Slash): "/", int(Qt.Key.Key_Backslash): "backslash",
+    int(Qt.Key.Key_Shift): "shift", int(Qt.Key.Key_Control): "ctrl", int(Qt.Key.Key_Alt): "alt",
+    int(Qt.Key.Key_Meta): "win",
+}
+_KEY_A, _KEY_Z, _KEY_0, _KEY_9 = int(Qt.Key.Key_A), int(Qt.Key.Key_Z), int(Qt.Key.Key_0), int(Qt.Key.Key_9)
+_KEY_F1, _KEY_F12 = int(Qt.Key.Key_F1), int(Qt.Key.Key_F12)
+
+
+def _qt_key_token(event: QKeyEvent) -> str | None:
+    """The binding token of a Qt key event (the capture's fallback path, when the low-level hooks
+    are unavailable): the native virtual key when Qt reports one (side-specific modifiers), else
+    the Qt key code. ``None`` for a key the grammar has no name for."""
+    try:
+        vk = int(event.nativeVirtualKey() or 0)
+    except Exception:  # noqa: BLE001
+        vk = 0
+    token = key_token_for_vk(vk) if vk else None
+    if token:
+        return token
+    key = int(event.key())
+    if key in _QT_KEY_TOKENS:
+        return _QT_KEY_TOKENS[key]
+    if _KEY_A <= key <= _KEY_Z or _KEY_0 <= key <= _KEY_9:
+        return chr(key).lower()
+    if _KEY_F1 <= key <= _KEY_F12:
+        return f"f{key - _KEY_F1 + 1}"
+    return None
+
+
+class _BindingEdit(QWidget):
+    """The Shortcuts tab's editor for ONE binding (kind ``"binding"``): the current binding in
+    words, **Set** -- listen for the next key combination or mouse button -- and **Default**.
+    ``value()`` / ``set_value()`` carry the canonical binding text (``""`` = unbound); a text the
+    grammar rejects is kept as typed and flagged, and the dialog refuses to apply it."""
+
+    valueChanged = Signal(str)
+    setRequested = Signal(object)        # this row: start listening
+    cancelRequested = Signal(object)     # this row: stop listening
+
+    def __init__(self, default: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._default = default
+        self._value = ""
+        self._valid = True
+        self._listening = False
+        row = QHBoxLayout(self)
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(6)
+        self.label = QLabel(self)
+        self.label.setObjectName("binding")
+        self.label.setMinimumWidth(170)
+        self.set_btn = QPushButton("Set", self)
+        self.set_btn.setCheckable(True)
+        self.set_btn.setToolTip("Listen for the next key combination or mouse button, anywhere on screen; "
+                                "a combination is taken half a second after the last key. Esc cancels.")
+        self.default_btn = QPushButton("Default", self)
+        self.default_btn.setToolTip(f"Back to the default: {describe_binding(default)}")
+        row.addWidget(self.label, 1)
+        row.addWidget(self.set_btn)
+        row.addWidget(self.default_btn)
+        self.set_btn.toggled.connect(self._on_set_toggled)
+        self.default_btn.clicked.connect(lambda: self.set_value(self._default))
+        self._refresh()
+
+    @property
+    def default(self) -> str:
+        return self._default
+
+    @property
+    def listening(self) -> bool:
+        return self._listening
+
+    def value(self) -> str:
+        return self._value
+
+    def is_valid(self) -> bool:
+        return self._valid
+
+    def set_value(self, text: str) -> None:
+        raw = str(text or "").strip()
+        try:
+            self._value, self._valid = normalize_binding(raw), True
+        except ValueError:
+            self._value, self._valid = raw.lower(), False
+        self._refresh()
+        self.valueChanged.emit(self._value)
+
+    def set_listening(self, on: bool) -> None:
+        self._listening = on
+        self.set_btn.blockSignals(True)
+        self.set_btn.setChecked(on)
+        self.set_btn.blockSignals(False)
+        self.set_btn.setText("Listening\u2026" if on else "Set")
+        self._refresh()
+
+    def _on_set_toggled(self, checked: bool) -> None:
+        (self.setRequested if checked else self.cancelRequested).emit(self)
+
+    def _refresh(self) -> None:
+        if self._listening:
+            text, state = "press keys or a mouse button\u2026", "listening"
+        elif not self._valid:
+            text, state = f"{self._value or '?'} (invalid)", "invalid"
+        else:
+            text, state = describe_binding(self._value), ""
+        self.label.setText(text)
+        self.label.setToolTip(self._value or "unbound")
+        if self.label.property("state") != state:
+            self.label.setProperty("state", state)
+            self.label.style().unpolish(self.label)
+            self.label.style().polish(self.label)
+
+
+class ShortcutsPage(QWidget):
+    """The Shortcuts tab's page, built around the tab's :class:`FieldForm` (which stays the source
+    of truth for load / changes / apply / restore): one list of every ``[hotkeys]`` entry -- the
+    global shortcuts, then the manual-advance gestures -- as :class:`_BindingEdit` rows, a status
+    line (invalid entries, a binding used twice, a bare left / middle / right button on a global
+    shortcut), and the fixed in-overlay keys (:data:`FIXED_SHORTCUTS`).
+
+    **Set** listens through a :class:`~exocortex.ui.llhooks.ChordRecorder`: on the real Windows
+    platform fed by the low-level :class:`~exocortex.ui.llhooks.CaptureHooks` (any key or mouse
+    button, anywhere on screen, swallowed while listening -- so no hotkey fires and nothing is
+    typed into the app underneath; a click on this dialog cancels instead), elsewhere by a Qt event
+    filter (keys typed while the dialog has focus). The binding is taken ``CAPTURE_QUIET_S`` after
+    the last press, once no key is held; Esc cancels. One row listens at a time."""
+
+    def __init__(self, form: FieldForm, dialog: QWidget, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._form = form
+        self._dialog = dialog
+        self._capture_row: _BindingEdit | None = None
+        self._recorder: Any = None
+        self._capture_hooks: Any = None
+        self._filter_installed = False
+
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        inner = QWidget(scroll)
+        layout = QVBoxLayout(inner)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+        intro = QLabel(
+            "Click Set, then press the key combination or the mouse button -- anywhere on screen. A "
+            "combination is taken half a second after the last key; Esc cancels. Default puts one "
+            "shortcut back (Restore defaults below: every tab). Apply / OK re-register the shortcuts at "
+            "once. A single key (F9, Right Shift) works as a tap; mouse buttons 4 and 5 are the thumb "
+            "buttons.", inner)
+        intro.setWordWrap(True)
+        intro.setObjectName("help")
+        self.status = QLabel("", inner)
+        self.status.setWordWrap(True)
+        self.status.setObjectName("help")
+        layout.addWidget(intro)
+        layout.addWidget(self.status)
+
+        fields = list(form.fields)
+        bindings = [f for f in fields if f.kind == "binding"]
+        general = [f for f in bindings if not f.key.startswith("manual_")]
+        manual = [f for f in bindings if f.key.startswith("manual_")]
+        others = [f for f in fields if f.kind != "binding"]
+        self._add_section(layout, inner, "Global shortcuts (work while any app has focus)", general)
+        self._add_section(layout, inner, "Manual advance (while the Manual switch is on; whether a mouse "
+                                         "gesture needs the press-and-hold is on the Hands-free tab)",
+                          manual + others)
+        self._add_fixed(layout, inner)
+        layout.addStretch(1)
+        scroll.setWidget(inner)
+        outer.addWidget(scroll, 1)
+
+        self.rows: dict[str, _BindingEdit] = {}
+        for f in bindings:
+            widget = form.widgets[f.path]
+            if isinstance(widget, _BindingEdit):
+                self.rows[f.path] = widget
+                widget.valueChanged.connect(lambda _value: self.refresh_status())
+                widget.setRequested.connect(self.start_capture)
+                widget.cancelRequested.connect(lambda _row: self.cancel_capture())
+        self.refresh_status()
+
+    # ---- layout --------------------------------------------------------------------------------
+    def _add_section(self, layout: QVBoxLayout, inner: QWidget, title: str, fields: list[Field]) -> None:
+        head = QLabel(title, inner)
+        head.setObjectName("section")
+        head.setWordWrap(True)
+        layout.addWidget(head)
+        form = QFormLayout()
+        form.setSpacing(6)
+        form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
+        for f in fields:
+            widget = self._form.widgets[f.path]
+            if f.help and not widget.toolTip():
+                widget.setToolTip(f.help)
+            label = QLabel(f.label, inner)
+            label.setWordWrap(True)
+            if f.help:
+                label.setToolTip(f.help)
+            form.addRow(label, widget)
+        layout.addLayout(form)
+
+    def _add_fixed(self, layout: QVBoxLayout, inner: QWidget) -> None:
+        head = QLabel("Fixed, inside the overlay (not rebindable)", inner)
+        head.setObjectName("section")
+        layout.addWidget(head)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        for r, (where, key, action) in enumerate(FIXED_SHORTCUTS):
+            for c, text in enumerate((where, key, action)):
+                cell = QLabel(text, inner)
+                cell.setWordWrap(True)
+                if c != 1:
+                    cell.setObjectName("fixed")
+                grid.addWidget(cell, r, c)
+        grid.setColumnStretch(2, 1)
+        layout.addLayout(grid)
+
+    # ---- validation -----------------------------------------------------------------------------
+    def _label_of(self, path: str) -> str:
+        return next((f.label for f in self._form.fields if f.path == path), path)
+
+    def invalid(self) -> dict[str, str]:
+        """``{path: label}`` of the rows whose text the grammar rejects (the dialog skips them)."""
+        return {path: self._label_of(path) for path, row in self.rows.items() if not row.is_valid()}
+
+    def duplicates(self) -> list[tuple[str, list[str]]]:
+        """``[(binding text, [labels])]`` for every non-blank binding used by more than one row."""
+        users: dict[str, list[str]] = {}
+        for path, row in self.rows.items():
+            if row.is_valid() and row.value():
+                users.setdefault(row.value(), []).append(self._label_of(path))
+        return [(text, labels) for text, labels in users.items() if len(labels) > 1]
+
+    def refresh_status(self) -> None:
+        problems: list[str] = []
+        invalid = self.invalid()
+        if invalid:
+            problems.append("Invalid: " + ", ".join(invalid.values()))
+        for text, labels in self.duplicates():
+            problems.append(f"{describe_binding(text)} is used twice: {' and '.join(labels)}")
+        for path, row in self.rows.items():
+            if path.rsplit(".", 1)[-1].startswith("manual_"):
+                continue
+            if row.value() in ("mouse_left", "mouse_middle", "mouse_right"):
+                problems.append(f"{self._label_of(path)}: a bare {describe_binding(row.value()).lower()} "
+                                "fires on every click -- add a modifier")
+        self.status.setText("\n".join(problems) if problems else "Every shortcut has its own key.")
+        _restyle(self.status, "restart" if problems else "help")
+
+    # ---- the Set button: capture ----------------------------------------------------------------
+    @property
+    def capturing(self) -> bool:
+        return self._capture_row is not None
+
+    def start_capture(self, row: _BindingEdit) -> None:
+        """Listen for ``row``'s next binding (cancelling a capture already in progress)."""
+        if self._capture_row is not None:
+            self._finish_capture(None, self._capture_row)
+        if ChordRecorder is None:
+            row.set_listening(False)
+            self.status.setText("Shortcut capture is unavailable here.")
+            return
+        self._capture_row = row
+        row.set_listening(True)
+        self._recorder = ChordRecorder(
+            lambda text, row=row: self._on_recorded(text, row), quiet_s=CAPTURE_QUIET_S,
+            schedule=lambda delay_s, check: QTimer.singleShot(max(1, int(delay_s * 1000)), self, check),
+        )
+        self._recorder.start()
+        self._capture_hooks = None
+        if _real_windows() and CaptureHooks is not None:
+            hooks = CaptureHooks(self._recorder, ignore_mouse_at=self._over_dialog)
+            if hooks.install():
+                self._capture_hooks = hooks
+            else:
+                log.warning("shortcut capture: the input hooks could not be installed; keys typed into "
+                            "the dialog only")
+        app = QApplication.instance()
+        if app is not None and not self._filter_installed:
+            app.installEventFilter(self)
+            self._filter_installed = True
+        label = next((self._label_of(p) for p, r in self.rows.items() if r is row), "the shortcut")
+        self.status.setText(f"Listening for \u201c{label}\u201d: press the keys or the mouse button. Esc cancels.")
+        _restyle(self.status, "help")
+
+    def cancel_capture(self) -> None:
+        """Stop listening without changing the row (the row's own Set button, Esc, a click on the
+        dialog, the dialog closing)."""
+        recorder = self._recorder
+        if recorder is not None and recorder.listening:
+            recorder.cancel()                       # reports None -> _on_recorded -> _finish_capture
+        elif self._capture_row is not None:
+            self._finish_capture(None, self._capture_row)
+
+    def _on_recorded(self, text: str | None, row: _BindingEdit) -> None:
+        # may run inside a hook callback: the teardown (unhooking) is deferred to the event loop
+        QTimer.singleShot(0, self, lambda: self._finish_capture(text, row))
+
+    def _finish_capture(self, text: str | None, row: _BindingEdit) -> None:
+        if self._capture_row is row:
+            self._capture_row = None
+            hooks, self._capture_hooks = self._capture_hooks, None
+            self._recorder = None
+            if hooks is not None:
+                try:
+                    hooks.uninstall()
+                except Exception:  # noqa: BLE001
+                    log.exception("shortcut capture: unhooking failed")
+            app = QApplication.instance()
+            if app is not None and self._filter_installed:
+                app.removeEventFilter(self)
+                self._filter_installed = False
+        row.set_listening(False)
+        if text is not None:
+            row.set_value(text)
+        self.refresh_status()
+
+    def _over_dialog(self, x: int, y: int) -> bool:
+        try:
+            return self._dialog.isVisible() and self._dialog.frameGeometry().contains(QPoint(x, y))
+        except Exception:  # noqa: BLE001
+            return False
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt override
+        recorder = self._recorder
+        if recorder is None or not recorder.listening:
+            return False
+        kind = event.type()
+        if kind in (QEvent.Type.KeyPress, QEvent.Type.KeyRelease):
+            if self._capture_hooks is not None or not isinstance(event, QKeyEvent):
+                return False                         # the hooks saw (and swallowed) the key first
+            if event.isAutoRepeat():
+                return True
+            token = _qt_key_token(event)
+            if token is not None:
+                if kind == QEvent.Type.KeyPress:
+                    recorder.press(token)
+                else:
+                    recorder.release(token)
+            return True
+        if kind == QEvent.Type.MouseButtonPress:
+            row = self._capture_row
+            if (row is not None and isinstance(obj, QWidget)
+                    and (obj is row.set_btn or row.set_btn.isAncestorOf(obj))):
+                return False                         # the row's own Set button: its toggle cancels
+            self.cancel_capture()
+        return False
+
+
 def _resolve_actions(explicit: Any, list_models: Any, parent: Any) -> Any:
     """2026-10-07 (Optimize tab): the object that implements the optimizer actions, or ``None``.
 
@@ -745,9 +1234,12 @@ class SettingsDialog(QDialog):
 
     applied = Signal(dict)
 
-    #: Tab name -> the method that builds its page around the tab's FieldForm (2026-10-29). Every other
-    #: tab is the form's own scroll area. Each builder falls back to the plain form on any failure.
-    _PAGE_BUILDERS: dict[str, str] = {"Optimize": "_build_optimize_page", "Audio": "_build_audio_page"}
+    #: Tab name -> the method that builds its page around the tab's FieldForm (2026-10-29: Optimize, then
+    #: Audio and Shortcuts). Every other tab is the form's own scroll area; the form stays the source of truth
+    #: for load / changes / apply / restore. Each builder falls back to the plain form on any failure.
+    _PAGE_BUILDERS: dict[str, str] = {
+        "Optimize": "_build_optimize_page", "Audio": "_build_audio_page", "Shortcuts": "_build_shortcuts_page",
+    }
 
     def __init__(self, cfg: Config, list_models: Callable[[], list[str]] | None = None,
                  parent: QWidget | None = None, *, actions: Any = None) -> None:
@@ -758,6 +1250,7 @@ class SettingsDialog(QDialog):
         self._actions = _resolve_actions(actions, list_models, parent)   # None = Optimize tab degraded
         self._optimize_panel: Any = None
         self._audio_panel: Any = None
+        self._shortcuts_page: Any = None
         self.setWindowTitle("Settings")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(build_qss(cfg.ui.font_size) + _DIALOG_QSS)
@@ -853,6 +1346,23 @@ class SettingsDialog(QDialog):
         self._audio_panel = panel
         return panel
 
+    def _build_shortcuts_page(self, form: FieldForm) -> QWidget:
+        """The Shortcuts tab's page (2026-10-29): a :class:`ShortcutsPage` around ``form``'s widgets,
+        with the same fallback to the plain form as the Optimize tab."""
+        try:
+            page = ShortcutsPage(form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its page cannot be built
+            log.exception("Shortcuts page unavailable; showing the plain form")
+            return form.widget
+        self._shortcuts_page = page
+        return page
+
+    def _invalid_shortcuts(self) -> dict[str, str]:
+        """``{path: label}`` of the binding rows the grammar rejects -- never written to the config."""
+        if self._shortcuts_page is None:
+            return {}
+        return dict(self._shortcuts_page.invalid())
+
     # ---- values --------------------------------------------------------------------------------
     def load(self) -> None:
         """Fill every widget from the current config."""
@@ -932,6 +1442,10 @@ class SettingsDialog(QDialog):
         return {p: get_field_value(widgets[p], by_path[p]) for p in paths if p in widgets and p in by_path}
 
     def _apply(self, only: Collection[str] | None) -> dict[str, Any]:
+        invalid = self._invalid_shortcuts()          # 2026-10-29: a rejected shortcut stays pending
+        if invalid:
+            allowed = set(self._widgets) if only is None else set(only)
+            only = allowed - set(invalid)
         changed: dict[str, Any] = {}
         for form in self._forms.values():
             changed.update(form.apply(only))
@@ -943,6 +1457,9 @@ class SettingsDialog(QDialog):
             self.note.setText("Applied.")
         else:
             self.note.setText("")
+        if invalid:
+            skipped = "Not applied, invalid shortcut: " + ", ".join(invalid.values())
+            self.note.setText((self.note.text() + " " if self.note.text() else "") + skipped)
         if changed:
             log.info("settings changed: %s", ", ".join(f"{k}={v!r}" for k, v in changed.items()))
             self.applied.emit(changed)
@@ -951,3 +1468,13 @@ class SettingsDialog(QDialog):
     def _on_ok(self) -> None:
         self.apply()
         self.accept()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt override
+        """A capture in progress must not outlive the dialog on screen (its hooks would keep
+        swallowing input): Cancel / OK / the close button all end it."""
+        if self._shortcuts_page is not None:
+            try:
+                self._shortcuts_page.cancel_capture()
+            except Exception:  # noqa: BLE001
+                log.exception("cancelling the shortcut capture failed")
+        super().hideEvent(event)

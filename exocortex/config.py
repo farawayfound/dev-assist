@@ -379,6 +379,14 @@ class AssistConfig:
     insight_interval_s: int = 120
     insight_min_new_words: int = 60
     insight_max_items: int = 4         # bullets per section (questions / blind spots)
+    # 2026-10-29: work WITH the code the user has already written. On (default): solve, the Code
+    # button / gesture and Text treat code already in the development window (or in <previous>)
+    # as the thing to complete or fix -- its language, structure, names and approach are kept, what
+    # is missing is added, only what is wrong is changed, and a platform's starter code is filled
+    # in -- instead of jumping to the optimal solution from scratch. Off: the best solution from
+    # scratch, keeping only the entry point the task dictates. The manual-advance "Code from
+    # scratch" gesture ([hotkeys].manual_code_fresh) ignores the given code whatever this says.
+    consider_given_code: bool = True
 
 
 @dataclass
@@ -886,6 +894,9 @@ class HandsFreeConfig:
     # pointer while the button is down (a drag, an autoscroll) always cancels.
     manual_hold_text: bool = True
     manual_hold_code: bool = False
+    # 2026-10-29: the third gesture, Code from scratch ([hotkeys].manual_code_fresh, mouse button 4
+    # by default): like Code, a click unless this asks for the press-and-hold.
+    manual_hold_code_fresh: bool = False
 
 
 @dataclass
@@ -919,11 +930,28 @@ class HotkeysConfig:
     toggle_pause: str = "rshift"
     code: str = "ctrl+alt+g"            # write the code for the task discussed / shown since the last checkpoint
     toggle_handsfree: str = "ctrl+alt+h"   # hands-free mode (auto read -> checkpoint -> text -> code on screen change)
-    toggle_manual: str = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
+    toggle_manual: str = "ctrl+alt+j"   # manual advance (generate only on the mouse gesture: left = Text, middle = Code)
     insights: str = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
     recap: str = "ctrl+alt+y"           # recap the session so far (goal, done, current state, next)
     toggle_dashboard: str = "ctrl+alt+d"   # dashboard mode on / off (the ▦ title-bar button)
     quit: str = "ctrl+alt+x"
+    # 2026-10-29 (Settings > Shortcuts): every binding in this section follows one grammar
+    # (exocortex.bindings.parse_binding): "ctrl+alt+g" = a hotkey; a single key such as "rshift",
+    # "f9" or "right" = a TAP of that key; "mouse4" or "ctrl+mouse_left" = a mouse button
+    # (mouse_left, mouse_middle, mouse_right, mouse4 and mouse5 -- the two thumb buttons) with
+    # exactly those modifiers held; "" = unbound. Edited live on the Shortcuts tab.
+    # The manual-advance gestures, active only while the Manual switch is on: Text, Code (which
+    # works with the given code when [assist].consider_given_code is on) and Code from scratch
+    # (always ignores the given code). Whether a mouse gesture needs the press-and-hold is
+    # [handsfree].manual_hold_text / manual_hold_code / manual_hold_code_fresh.
+    manual_text: str = "mouse_left"
+    manual_code: str = "mouse_middle"
+    manual_code_fresh: str = "mouse4"
+    # A thumb button (mouse4 / mouse5) bound to anything above is kept from the app underneath --
+    # its press would otherwise make a browser or an editor go Back / Forward. A modified click
+    # (ctrl+mouse_left) is kept too, like a keyboard hotkey; a bare left / middle / right press
+    # never is: it must still reach the app.
+    swallow_thumb_buttons: bool = True
 
 
 @dataclass

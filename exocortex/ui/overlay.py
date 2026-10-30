@@ -14,6 +14,7 @@ import dataclasses
 import logging
 import sys
 import time
+from collections.abc import Callable
 
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
@@ -49,6 +50,7 @@ from PySide6.QtWidgets import (
 )
 
 from exocortex.actions import EngineActions
+from exocortex.bindings import describe_binding, manual_gesture_summary, normalize_binding, parse_binding
 from exocortex.bus import (
     AssistDeltaEvent,
     AssistDoneEvent,
@@ -602,10 +604,12 @@ class OverlayWindow(QWidget):
         self._wheel_hook: "MouseWheelHook | None" = None
         self._nav_key_hook: "BareKeyHook | None" = None
         self._pause_key_hook: "BareKeyHook | None" = None
-        # Manual advance ([handsfree].manual): the Manual switch next to Hands-free. While on, a
-        # fourth hook watches for the press-and-hold gesture anywhere on screen (left button held
-        # `manual_hold_s` = Text, middle = Code); installed only then, and only on the real
-        # Windows platform (the offscreen QPA tests must never hook the developer's real mouse).
+        # Manual advance ([handsfree].manual): the Manual switch next to Hands-free. While on, the
+        # mouse hook below watches for the gestures anywhere on screen ([hotkeys].manual_*: the left
+        # button held `manual_hold_s` = Text, middle = Code, mouse 4 = Code from scratch by default).
+        # Since 2026-10-29 the same hook serves any other shortcut bound to a mouse button, so it is
+        # installed whenever something is bound -- only on the real Windows platform (the offscreen
+        # QPA tests must never hook the developer's real mouse).
         self._manual = bool(cfg.handsfree.manual)
         self._manual_hook: "PressHoldMouseHook | None" = None
         # Dashboard mode (2026-10-20): the board (exocortex.ui.dashboard) replaces the tab strip
@@ -614,6 +618,7 @@ class OverlayWindow(QWidget):
         self._dashboard_mode = False
         self._project_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
         self._dashboard_normal_geometry: QRect | None = None
+        self._binding_problems: list[str] = []    # 2026-10-29: invalid / duplicate [hotkeys] entries
 
         # Window flags must be set once, before the first show(). A visible copilot: a normal
         # top-level window (it appears in the taskbar / Alt-Tab), frameless and always-on-top.
@@ -663,12 +668,11 @@ class OverlayWindow(QWidget):
             QTimer.singleShot(0, self, lambda: self.dashboard_btn.setChecked(True))
 
         self._install_hotkeys()
-        if self._manual:
-            self._install_manual_hook()
-        if self._hotkeys is not None and self._hotkeys.failed:
-            failed = list(self._hotkeys.failed)
+        self._install_manual_hook()          # every mouse-bound shortcut; the gestures only while manual is on
+        problems = self._binding_problem_text()
+        if problems:
             # Receiver context as above: no orphaned callback into a destroyed window.
-            QTimer.singleShot(0, self, lambda: self.show_toast("Hotkey conflict: " + ", ".join(failed)))
+            QTimer.singleShot(0, self, lambda: self.show_toast(problems))
 
     # ---------------------------------------------------------------- UI building --
     def _build_ui(self) -> None:
@@ -1068,6 +1072,8 @@ class OverlayWindow(QWidget):
             self._apply_view()
         if any(str(k).startswith("monitor.") for k in changed):
             self.monitor.apply_config()
+        if any(str(k).startswith("hotkeys.") for k in changed):
+            self._reinstall_hotkeys()       # 2026-10-29: the Shortcuts tab applies at once
         try:
             self._actions.apply_settings(dict(changed))
         except Exception:
@@ -1613,9 +1619,11 @@ class OverlayWindow(QWidget):
         manual_tip = (
             "Manual advance: generate only on the mouse gesture, anywhere on screen -- hold the left "
             "button for Text; click (or hold) the middle button / three-finger-tap the touchpad for "
-            "Code. Which action needs the hold is set on the Hands-free settings tab. Transcript, "
-            "screen reading and checkpoints keep running; the overlay never comes to the front. "
-            "Off = Auto: everything automatic works as usual (Ctrl+Alt+J)."
+            "Code; click mouse button 4 (the rear thumb button) for Code from scratch, ignoring the "
+            "code on screen. The buttons are set on the Shortcuts settings tab, which gestures need "
+            "the hold on the Hands-free tab. Transcript, screen reading and checkpoints keep running; "
+            "the overlay never comes to the front. Off = Auto: everything automatic works as usual "
+            "(Ctrl+Alt+J)."
         )
         self.manual_label.setToolTip(manual_tip)
         self.manual_switch.setToolTip(manual_tip)
@@ -1770,48 +1778,158 @@ class OverlayWindow(QWidget):
         self._set_manual(checked)
 
     def _set_manual(self, enabled: bool, *, notify_engine: bool = True) -> None:
-        """Manual / Auto advance. Mirrors the switch, installs / removes the press-and-hold mouse
-        hook, and (unless mirroring a bus event) tells the engine, which flips
-        ``[handsfree].manual`` -- the flag the assistant's automatic lanes and the hands-free
-        controller read live -- and publishes the `ManualAdvanceEvent` every other surface follows."""
+        """Manual / Auto advance. Mirrors the switch, rebinds the mouse hook (and, when a gesture is
+        bound to a key, re-registers the keyboard shortcuts) for the gestures, and (unless mirroring
+        a bus event) tells the engine, which flips ``[handsfree].manual`` -- the flag the assistant's
+        automatic lanes and the hands-free controller read live -- and publishes the
+        `ManualAdvanceEvent` every other surface follows."""
         changed = enabled != self._manual
         self._manual = enabled
         if self.manual_switch.isChecked() != enabled:
             self.manual_switch.blockSignals(True)
             self.manual_switch.setChecked(enabled)
             self.manual_switch.blockSignals(False)
-        if enabled:
-            self._install_manual_hook()
-        else:
-            self._uninstall_manual_hook()
+        # 2026-10-29: the gestures are [hotkeys] bindings like any other -- mouse buttons by default
+        # (the one mouse hook, rebound in place and dropped when nothing is bound), or keys, which
+        # are registered with the keyboard shortcuts only while manual advance is on.
+        self._install_manual_hook()
+        if changed and self._manual_gestures_use_keys():
+            self._reinstall_hotkeys(mouse=False)
         if notify_engine:
             try:
                 self._actions.set_manual_advance(enabled)
             except Exception:
                 log.exception("actions.set_manual_advance(%r) failed", enabled)
         if changed:
-            self.show_toast("Manual advance ON — hold left = Text, click middle = Code" if enabled
-                            else "Auto advance")
+            if enabled:
+                gestures = manual_gesture_summary(self._cfg) or "no gesture bound (Settings > Shortcuts)"
+                self.show_toast("Manual advance ON \u2014 " + gestures)
+            else:
+                self.show_toast("Auto advance")
+
+    def _trigger_table(self) -> list[tuple[str, str, Callable[[], None], bool]]:
+        """Every ``[hotkeys]`` shortcut as ``(name, binding text, callback, manual-only)`` -- what
+        `_install_hotkeys` registers (keys) and `_install_manual_hook` hooks (mouse buttons). The
+        three manual-advance gestures are manual-only: bound while the Manual switch is on."""
+        h = self._cfg.hotkeys
+        return [
+            ("toggle_visible", h.toggle_visible, self.toggle_visible, False),
+            ("answer_last", h.answer_last, self._actions.answer_last, False),
+            ("ask_focus", h.ask_focus, self.focus_ask, False),
+            ("notes", h.notes, self._actions.generate_notes, False),
+            ("toggle_auto", h.toggle_auto, lambda: self.auto_btn.setChecked(not self.auto_btn.isChecked()), False),
+            ("toggle_mic", h.toggle_mic, lambda: self.mic_btn.setChecked(not self.mic_btn.isChecked()), False),
+            ("click_through", h.click_through, lambda: self.set_click_through(not self._click_through), False),
+            ("move_left", h.move_left, lambda: self.nudge(-_NUDGE_PX, 0), False),
+            ("move_right", h.move_right, lambda: self.nudge(_NUDGE_PX, 0), False),
+            ("move_up", h.move_up, lambda: self.nudge(0, -_NUDGE_PX), False),
+            ("move_down", h.move_down, lambda: self.nudge(0, _NUDGE_PX), False),
+            ("select_region", h.select_region, self._open_region_picker, False),
+            ("suggest_now", h.suggest_now, lambda: self._actions.suggest_now(), False),
+            ("toggle_screen", h.toggle_screen, self._on_toggle_screen, False),
+            ("toggle_completion", h.toggle_completion,
+             lambda: self.completion_btn.setChecked(not self.completion_btn.isChecked()), False),
+            ("toggle_explanations", h.toggle_explanations,
+             lambda: self.explain_btn.setChecked(not self.explain_btn.isChecked()), False),
+            ("checkpoint", h.checkpoint, self._on_checkpoint, False),
+            ("toggle_pause", h.toggle_pause, self._toggle_pause_hotkey, False),
+            ("code", h.code, self._on_code, False),
+            ("toggle_handsfree", h.toggle_handsfree, lambda: self._set_hands_free(not self._hands_free), False),
+            ("toggle_manual", h.toggle_manual, lambda: self._set_manual(not self._manual), False),
+            ("insights", h.insights, lambda: self._on_insights_now(()), False),
+            ("recap", h.recap, self._on_recap, False),
+            ("toggle_dashboard", h.toggle_dashboard, lambda: self._set_dashboard_mode(not self._dashboard_mode), False),
+            ("quit", h.quit, self.close, False),
+            ("manual_text", h.manual_text, lambda: self._manual_fire("text"), True),
+            ("manual_code", h.manual_code, lambda: self._manual_fire("code"), True),
+            ("manual_code_fresh", h.manual_code_fresh, lambda: self._manual_fire("code_fresh"), True),
+        ]
+
+    def _mouse_bindings(self) -> dict[str, Callable[[], None]]:
+        """The mouse-bound shortcuts to hook right now, ``{binding text: deferred callback}``: every
+        general shortcut on a mouse button, plus the manual-advance gestures while manual advance is
+        on. Callbacks are deferred off the hook with ``QTimer.singleShot`` (a hook callback must
+        return within ~300 ms). Invalid texts are left out here and reported by `_install_hotkeys`."""
+        out: dict[str, Callable[[], None]] = {}
+        for _name, text, callback, manual_only in self._trigger_table():
+            if manual_only and not self._manual:
+                continue
+            try:
+                binding = parse_binding(text)
+            except ValueError:
+                continue
+            if binding.kind != "mouse" or binding.text in out:
+                continue
+            out[binding.text] = (lambda cb=callback: QTimer.singleShot(0, self, cb))
+        return out
+
+    def _manual_gestures_use_keys(self) -> bool:
+        """Whether a manual-advance gesture is bound to a KEY: flipping the Manual switch must then
+        re-register the keyboard shortcuts, not only rebind the mouse hook."""
+        h = self._cfg.hotkeys
+        for text in (h.manual_text, h.manual_code, h.manual_code_fresh):
+            try:
+                if parse_binding(text).kind != "mouse":
+                    return True
+            except ValueError:
+                continue
+        return False
+
+    def _mouse_hold_required(self, text: str) -> bool:
+        """`PressHoldMouseHook`'s per-binding hold rule, read live at every release: the manual
+        gestures follow ``[handsfree].manual_hold_text`` / ``manual_hold_code`` /
+        ``manual_hold_code_fresh``; any other shortcut on a mouse button is a click."""
+        h, hf = self._cfg.hotkeys, self._cfg.handsfree
+        for binding, hold in ((h.manual_text, hf.manual_hold_text), (h.manual_code, hf.manual_hold_code),
+                              (h.manual_code_fresh, hf.manual_hold_code_fresh)):
+            try:
+                if normalize_binding(binding) == text:
+                    return bool(hold)
+            except ValueError:
+                continue
+        return False
+
+    def _mouse_swallow(self, text: str) -> bool:
+        """`PressHoldMouseHook`'s per-binding swallow rule, read live at every press: a thumb button
+        (mouse 4 / 5) is kept from the app underneath when ``[hotkeys].swallow_thumb_buttons`` is on
+        (a browser or an editor would otherwise go Back / Forward), a modified click always (it is a
+        hotkey), a bare left / middle / right press never (it must reach the app)."""
+        try:
+            binding = parse_binding(text)
+        except ValueError:
+            return False
+        if binding.key in ("mouse4", "mouse5"):
+            return bool(self._cfg.hotkeys.swallow_thumb_buttons)
+        return bool(binding.modifiers)
 
     def _install_manual_hook(self) -> None:
-        """The press-and-hold gesture hook (``llhooks.PressHoldMouseHook``): installed only while
-        manual advance is on (its per-move callback cost is paid only then), only on the real
-        Windows platform. The hold time and the quick-middle-click option are read live from the
-        config at every press, so a settings change needs nothing here."""
+        """The mouse hook (``llhooks.PressHoldMouseHook``): every ``[hotkeys]`` binding that names a
+        mouse button -- the manual-advance gestures while manual advance is on, any other shortcut
+        bound to a mouse button at all times (2026-10-29). Installed only while something is bound
+        (its per-move callback cost is paid only then), only on the real Windows platform, and
+        rebound in place when the table changes. The hold time, which gestures need the hold and the
+        swallow rule are read live from the config at every press / release."""
         if PressHoldMouseHook is None or not _is_windows_platform():
+            return
+        bindings = self._mouse_bindings()
+        if not bindings:
+            self._uninstall_manual_hook()
             return
         if self._manual_hook is None:
             cfg = self._cfg
             self._manual_hook = PressHoldMouseHook(
-                {
-                    "left": lambda: QTimer.singleShot(0, self, lambda: self._manual_fire("text")),
-                    "middle": lambda: QTimer.singleShot(0, self, lambda: self._manual_fire("code")),
-                },
+                bindings,
                 hold_s=lambda: cfg.handsfree.manual_hold_s,
-                require_hold=lambda button: (cfg.handsfree.manual_hold_text if button == "left"
-                                             else cfg.handsfree.manual_hold_code),
+                require_hold=self._mouse_hold_required,
+                swallow=self._mouse_swallow,
                 schedule=lambda delay_s, check: QTimer.singleShot(int(delay_s * 1000), self, check),
             )
+        else:
+            try:
+                self._manual_hook.rebind(bindings)
+            except Exception:
+                log.exception("the mouse hook could not be rebound")
+                return
         if not self._manual_hook.installed and not self._manual_hook.failed:
             if not self._manual_hook.install():
                 self.show_toast("Manual advance: the mouse hook could not be installed")
@@ -1824,14 +1942,15 @@ class OverlayWindow(QWidget):
                 log.exception("failed to uninstall the manual-advance mouse hook")
 
     def _manual_fire(self, kind: str) -> None:
-        """A press-and-hold fired (deferred off the hook callback): generate now. Never touches
-        the window -- no show / raise / focus -- so the overlay keeps its translucent, background
-        state; the output streams into the Assist view like any other answer."""
+        """A gesture fired (deferred off the hook callback): generate now. Never touches the window
+        -- no show / raise / focus -- so the overlay keeps its translucent, background state; the
+        output streams into the Assist view like any other answer. ``kind`` is "text", "code" or
+        "code_fresh" (Code from scratch: the code on screen ignored)."""
         if not self._manual:
             return
         if self._gesture_blocked_at(QCursor.pos()):
             return   # a long press on the app's own UI (a scrollbar, the title bar) is not the gesture
-        self.show_toast("Manual · Code" if kind == "code" else "Manual · Text")
+        self.show_toast({"code": "Manual \u00b7 Code", "code_fresh": "Manual \u00b7 Code from scratch"}.get(kind, "Manual \u00b7 Text"))
         try:
             self._actions.manual_advance(kind)
         except Exception:
@@ -2485,78 +2604,108 @@ class OverlayWindow(QWidget):
 
     # ---------------------------------------------------------------- hotkeys -----
     def _install_hotkeys(self) -> None:
+        """Register every KEYBOARD shortcut of the ``[hotkeys]`` table (2026-10-29: one grammar for all
+        of them, `exocortex.bindings`): a key with modifiers through ``RegisterHotKey``
+        (``GlobalHotkeys``), a single key as a TAP through one ``llhooks.BareKeyHook``
+        (``_pause_key_hook`` -- the pause key's hook, which now carries every tap binding). Mouse
+        bindings belong to the mouse hook (`_install_manual_hook`). The manual-advance gestures are
+        included only while manual advance is on. An invalid entry, or a binding used twice, is
+        skipped and remembered in ``_binding_problems`` for the toast."""
         if GlobalHotkeys is None or not _is_windows_platform():
             # RegisterHotKey is a real, machine-wide Win32 call: only ever make it on the
             # real "windows" Qt platform, never under the "offscreen" plugin tests use (even
             # on a Windows dev box), so pytest never grabs the user's actual global hotkeys.
             return
-        h = self._cfg.hotkeys
-        bindings = {
-            h.toggle_visible: self.toggle_visible,
-            h.answer_last: self._actions.answer_last,
-            h.ask_focus: self.focus_ask,
-            h.notes: self._actions.generate_notes,
-            h.toggle_auto: lambda: self.auto_btn.setChecked(not self.auto_btn.isChecked()),
-            h.toggle_mic: lambda: self.mic_btn.setChecked(not self.mic_btn.isChecked()),
-            h.click_through: lambda: self.set_click_through(not self._click_through),
-            h.move_left: lambda: self.nudge(-_NUDGE_PX, 0),
-            h.move_right: lambda: self.nudge(_NUDGE_PX, 0),
-            h.move_up: lambda: self.nudge(0, -_NUDGE_PX),
-            h.move_down: lambda: self.nudge(0, _NUDGE_PX),
-            h.select_region: self._open_region_picker,
-            h.suggest_now: lambda: self._actions.suggest_now(),
-            h.toggle_screen: self._on_toggle_screen,
-            h.toggle_completion: lambda: self.completion_btn.setChecked(not self.completion_btn.isChecked()),
-            h.toggle_explanations: lambda: self.explain_btn.setChecked(not self.explain_btn.isChecked()),
-            h.checkpoint: self._on_checkpoint,
-            h.code: self._on_code,
-            h.toggle_handsfree: lambda: self._set_hands_free(not self._hands_free),
-            h.toggle_manual: lambda: self._set_manual(not self._manual),
-            h.insights: lambda: self._on_insights_now(()),
-            h.recap: self._on_recap,
-            h.toggle_dashboard: lambda: self._set_dashboard_mode(not self._dashboard_mode),
-            h.quit: self.close,
-        }
-        # A hotkey left empty is off (see HotkeysConfig): never hand "" to RegisterHotKey, where it
-        # would only come back as a bogus "Hotkey conflict" toast.
-        bindings = {key: callback for key, callback in bindings.items() if str(key or "").strip()}
-        pause_key = str(getattr(h, "toggle_pause", "") or "").strip()
-        if pause_key and is_bare_key is not None and is_bare_key(pause_key):
-            self._install_pause_key(pause_key)
-        elif pause_key:
-            bindings[pause_key] = self._toggle_pause_hotkey
+        combos: dict[str, Callable[[], None]] = {}
+        taps: dict[str, Callable[[], None]] = {}
+        owners: dict[str, str] = {}
+        problems: list[str] = []
+        for name, text, callback, manual_only in self._trigger_table():
+            if manual_only and not self._manual:
+                continue
+            if not (text or "").strip():
+                continue                                   # unbound
+            try:
+                binding = parse_binding(text)
+            except ValueError:
+                problems.append(f"{name}: '{text}' is not a valid shortcut")
+                continue
+            if binding.text in owners:
+                problems.append(f"{describe_binding(binding.text)} is bound to both {owners[binding.text]} and {name}")
+                continue
+            owners[binding.text] = name
+            if binding.kind == "mouse":
+                continue                                   # the mouse hook's
+            (combos if binding.kind == "hotkey" else taps)[binding.text] = callback
+        self._binding_problems = problems
         try:
-            self._hotkeys = GlobalHotkeys(bindings)
+            self._hotkeys = GlobalHotkeys(combos)
         except Exception:
             log.exception("failed to construct GlobalHotkeys")
             self._hotkeys = None
-            return
-        app = QApplication.instance()
-        if app is None:
-            log.warning("no QApplication instance; hotkeys not installed")
-            return
-        try:
-            self._hotkeys.install(app)
-        except Exception:
-            log.exception("failed to install global hotkeys")
+        else:
+            app = QApplication.instance()
+            if app is None:
+                log.warning("no QApplication instance; hotkeys not installed")
+            else:
+                try:
+                    self._hotkeys.install(app)
+                except Exception:
+                    log.exception("failed to install global hotkeys")
+        self._install_tap_keys(taps)
 
-    def _install_pause_key(self, key: str) -> None:
-        """``[hotkeys].toggle_pause`` as a bare key (``llhooks.BareKeyHook``): a TAP of that key
-        -- pressed and released with no other key in between -- toggles Pause / Resume. The right
-        Shift key by default: Shift held for a capital letter is never a tap, and a modifier key
-        is never swallowed. Only on the real Windows platform (like the hotkeys)."""
-        if BareKeyHook is None:
+    def _install_tap_keys(self, taps: dict[str, Callable[[], None]]) -> None:
+        """The single-key TAP bindings (``llhooks.BareKeyHook``, one hook for all of them): the
+        pause / resume key by default (``[hotkeys].toggle_pause`` = ``rshift``: Shift held for a
+        capital letter is never a tap, and a modifier key is never swallowed) and, since 2026-10-29,
+        any other shortcut bound to a single key. Only on the real Windows platform (like the
+        hotkeys); each callback is deferred off the hook with ``QTimer.singleShot``."""
+        if BareKeyHook is None or not taps:
             return
+        deferred = {key: (lambda cb=cb: QTimer.singleShot(0, self, cb)) for key, cb in taps.items()}
         try:
-            hook = BareKeyHook(key, lambda: QTimer.singleShot(0, self._toggle_pause_hotkey))
+            hook = BareKeyHook(deferred)
         except ValueError:
-            log.warning("cannot use %r as the pause / resume key", key)
+            log.warning("cannot hook the tap keys %r", sorted(taps))
             return
         if hook.install():
             self._pause_key_hook = hook
-            log.info("pause / resume: a tap of the %s key", key)
+            log.info("tap keys: %s", ", ".join(sorted(taps)))
         else:
-            log.warning("the pause / resume key %r could not be hooked", key)
+            log.warning("the tap keys %r could not be hooked", sorted(taps))
+
+    def _reinstall_hotkeys(self, *, mouse: bool = True) -> None:
+        """2026-10-29 (Shortcuts tab): ``[hotkeys]`` changed at runtime, or the Manual switch flipped
+        with a gesture bound to a key -- unregister every keyboard shortcut and the tap hook, register
+        the current table, rebind (or drop) the mouse hook, and toast any conflict or invalid entry
+        the way the start-up does."""
+        if self._hotkeys is not None:
+            try:
+                self._hotkeys.uninstall()
+            except Exception:
+                log.exception("failed to uninstall hotkeys")
+            self._hotkeys = None
+        if self._pause_key_hook is not None:
+            try:
+                self._pause_key_hook.uninstall()
+            except Exception:
+                log.exception("failed to uninstall the tap-key hook")
+            self._pause_key_hook = None
+        self._install_hotkeys()
+        if mouse:
+            self._install_manual_hook()
+        problems = self._binding_problem_text()
+        if problems:
+            self.show_toast(problems)
+
+    def _binding_problem_text(self) -> str:
+        """What the start-up / re-install toast says: registrations another app owns ("Hotkey
+        conflict: ..."), then the invalid and doubly-used entries; "" when all is well."""
+        parts: list[str] = []
+        if self._hotkeys is not None and self._hotkeys.failed:
+            parts.append("Hotkey conflict: " + ", ".join(self._hotkeys.failed))
+        parts.extend(self._binding_problems)
+        return "; ".join(parts)
 
     def _toggle_pause_hotkey(self) -> None:
         """The pause / resume hotkey: flips the Pause button (which pauses everything automatic,

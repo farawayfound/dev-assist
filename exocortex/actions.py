@@ -74,10 +74,12 @@ class EngineActions(Protocol):
         notes lane (never blocking a live answer). Returns the transcript characters folded (0
         when there was nothing to fold, or ``[context].compaction`` is off)."""
 
-    def code(self, focus: str = "") -> None:
+    def code(self, focus: str = "", fresh: bool = False) -> None:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now, in the primary language unless the task calls for another.
-        Manual: works while paused. `focus` is an optional extra instruction."""
+        Manual: works while paused. `focus` is an optional extra instruction. `fresh`
+        (2026-10-29): ignore the code already written on screen and give the best solution from
+        scratch, whatever `[assist].consider_given_code` says (the "Code from scratch" gesture)."""
 
     def text(self, focus: str = "") -> None:
         """Walk through the task discussed (transcript since the last checkpoint) and/or shown on
@@ -155,10 +157,12 @@ class EngineActions(Protocol):
         hands-free mode on or off. Publishes a `ManualAdvanceEvent`."""
 
     def manual_advance(self, kind: str) -> None:
-        """The press-and-hold gesture fired: generate now. `kind` is "text" (the left button) or
-        "code" (the middle button / a quick middle-click). With hands-free on, runs that step for
-        the task on screen (its kind's ask, the cumulative context); otherwise a plain
-        `text()` / `code()`. Never brings the overlay to the foreground."""
+        """A manual-advance gesture fired: generate now. `kind` is "text" (the left button held, by
+        default), "code" (a middle click: works with the given code when
+        `[assist].consider_given_code` is on) or "code_fresh" (mouse button 4: Code from scratch,
+        the given code ignored) -- the bindings are `[hotkeys].manual_*`. With hands-free on, runs
+        that step for the task on screen (its kind's ask, the cumulative context); otherwise a plain
+        `text()` / `code()` / `code(fresh=True)`. Never brings the overlay to the foreground."""
 
     # ---- explanations ----
     def set_explanations(self, enabled: bool) -> None:

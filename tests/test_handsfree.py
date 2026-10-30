@@ -127,8 +127,10 @@ class FakeHooks:
         self.text_ids.append(jid)
         return jid
 
-    def code(self, focus: str = "", label: str = "") -> int | None:
-        self.calls.append(("code", focus, label))
+    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
+        # 2026-10-29: a "code_fresh" step calls with fresh=True; recorded as a 4th element so the
+        # older 3-tuple comparisons stay exact for the ordinary steps
+        self.calls.append(("code", focus, label, "fresh") if fresh else ("code", focus, label))
         self.code_calls += 1
         self.code_focus_labels.append((focus, label))
         jid = None if self.defer_code else self._alloc()

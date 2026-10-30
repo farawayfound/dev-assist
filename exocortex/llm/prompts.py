@@ -959,8 +959,76 @@ def _language_rule(language: str) -> str:
     )
 
 
+#: `[assist].consider_given_code` (2026-10-29): what generated code does about code the user has
+#: ALREADY written for the task. True = work with it (complete it, fix only what is wrong); False =
+#: the best solution from scratch (the setting off, or the manual-advance "Code from scratch"
+#: gesture); None = no rule at all -- the prompt exactly as it was before the setting existed, the
+#: builders' default, so every older call site renders byte-for-byte what it did. Like the
+#: language and library rules this is a system-prompt line that depends only on the config (and the
+#: job's fresh flag), so the KV prefix stays stable across turns.
+_GIVEN_CODE_RULES: dict[bool, str] = {
+    True: (
+        "Given code: the user may already have written code for this task -- in the editor on screen "
+        "(<screen>), pasted or described in the conversation, or in <previous>. When there is, WORK WITH "
+        "IT instead of replacing it: keep its language, structure, names and approach, complete what is "
+        "missing and fix only what is wrong, and output the WHOLE resulting code so it can replace what "
+        "is there as-is (never a fragment the user has to merge). Say what you fixed or added in one "
+        "short line after the complexity line. A platform's starter code (a class or function signature "
+        "with an empty body) is filled in, its signature kept. Only when the given code cannot be made to "
+        "work within its own approach, say so in one line and give a new solution; a working but slower "
+        "approach is kept, the better one named in that one line, never substituted."
+    ),
+    False: (
+        "Given code: write the best solution from scratch. Code the user has already written on screen "
+        "is context about the task, not a template -- do not be constrained by its approach or carry "
+        "its mistakes; keep only the entry point the task dictates (the class or function name and the "
+        "parameters of a platform's starter code) so the result drops in."
+    ),
+}
+#: The Text (walkthrough) twin of the rule, for `system_text` -- only the "work with it" case: a
+#: walkthrough has no "from scratch" gesture and never did more than describe the task before.
+_GIVEN_CODE_TEXT_RULE = (
+    "If the screen shows code the user has already started for this task, walk through THAT code: "
+    "what it already gets right, what is missing or wrong, and how to complete or fix it -- not a "
+    "different approach."
+)
+#: What the user turn's ask gains per (kind, consider) -- the final instruction the model weighs
+#: most; "" for None, so the asks render as before when the rule is off.
+_GIVEN_CODE_ASKS: dict[tuple[str, bool], str] = {
+    ("solve", True): (" If the screen already shows code written for the task, complete or fix that code "
+                      "rather than starting over."),
+    ("solve", False): " Write it from scratch: code already on screen is context, not a template.",
+    ("code", True): (" If code for this task is already written on the screen, complete or fix that code "
+                     "rather than starting over."),
+    ("code", False): " Write it from scratch: code already on screen is context, not a template.",
+    ("text", True): " If code for this task is already on screen, walk through completing or fixing that code.",
+}
+
+
+def _given_code_rule(consider: bool | None) -> str:
+    """The system-prompt line for `consider` ("" for None -- no rule, the pre-2026-10-29 prompt)."""
+    return "" if consider is None else _GIVEN_CODE_RULES[bool(consider)]
+
+
+def _given_code_lines(consider: bool | None, kind: str = "code") -> list[str]:
+    """`_given_code_rule` as a list to splat into a builder's `lines` (empty when there is no rule).
+    `kind == "text"` renders the walkthrough's wording, and only for the "work with it" case."""
+    if consider is None:
+        return []
+    if kind == "text":
+        return [_GIVEN_CODE_TEXT_RULE] if consider else []
+    return [_GIVEN_CODE_RULES[bool(consider)]]
+
+
+def _given_code_ask(kind: str, consider: bool | None) -> str:
+    """What the user turn's ask gains for `kind` ("solve" / "code" / "text") -- "" when no rule."""
+    if consider is None:
+        return ""
+    return _GIVEN_CODE_ASKS.get((kind, bool(consider)), "")
+
+
 def system_solve(persona: str, explain: bool = False, comments: str = "normal", language: str = "Python",
-                 libraries: str = "basic", context: str = "", *, tools: str = "") -> str:
+                 libraries: str = "basic", context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
     """System prompt for autonomous mode: SOLVE whatever task is on the user's screen.
 
     This is the hands-off path. Where `system_suggest` proposes talking points, this one is told
@@ -988,6 +1056,7 @@ def system_solve(persona: str, explain: bool = False, comments: str = "normal", 
         _solve_shape(explain, comments, language),
         _language_rule(language),
         _library_rule(libraries),
+        *_given_code_lines(consider_given_code),
         "ONLY when the task genuinely forks into distinct valid directions that would each produce "
         "a different result (for example two different outputs the prompt could be asking for) and "
         "you truly cannot pick, output NOTHING except up to three option lines, each on its own line "
@@ -1008,7 +1077,8 @@ def system_solve(persona: str, explain: bool = False, comments: str = "normal", 
 
 
 def user_solve(transcript_window: str, screen_text: str, focus: str = "", choices: str = "", extra: str = "", *,
-               reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "") -> str:
+               reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "",
+               consider_given_code: bool | None = None) -> str:
     """User turn for `system_solve`: transcript (stable) then screen (volatile) then the ask.
 
     `focus` carries a direction the user picked from a previous `CHOICE_PREFIX` prompt (or a
@@ -1021,10 +1091,10 @@ def user_solve(transcript_window: str, screen_text: str, focus: str = "", choice
     transcript, `lookup` (`lookup_block`) after the screen and before `choices`; all three ""
     renders byte-for-byte what this builder rendered before they existed.
     """
-    ask = focus.strip() or (
+    ask = (focus.strip() or (
         "Solve whatever task, problem, or question is shown on the screen above. "
         "Output the finished solution now."
-    )
+    )) + _given_code_ask("solve", consider_given_code)
     return (
         f"{context_blocks(reference, earlier, map_text)}"
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
@@ -1034,7 +1104,7 @@ def user_solve(transcript_window: str, screen_text: str, focus: str = "", choice
 
 
 def system_code(persona: str, explain: bool = False, comments: str = "normal", language: str = "Python",
-                libraries: str = "basic", context: str = "", *, tools: str = "") -> str:
+                libraries: str = "basic", context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
     """System prompt for kind "code" (the Code button): write the code for the coding task being
     discussed / shown, right now.
 
@@ -1059,6 +1129,7 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
         _solve_shape(explain, comments, language),
         _language_rule(language),
         _library_rule(libraries),
+        *_given_code_lines(consider_given_code),
         "No preamble, no \"Sure\" or \"Here is\", no markdown headers, never mention being an AI, a "
         "model, or a co-pilot. OCR text can be garbled: infer the intent and ignore obvious noise.",
         _REFERENCE_RULE,
@@ -1073,7 +1144,8 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
 
 
 def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
-              reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "") -> str:
+              reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "",
+              consider_given_code: bool | None = None) -> str:
     """User turn for `system_code`: transcript (stable) -> previous code (only when present) ->
     screen (volatile) -> on-demand context (`extra`, only when present) -> the ask.
 
@@ -1087,11 +1159,11 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
     2026-10-06 (context library): `reference` / `earlier` go before <transcript>, `lookup` after
     <screen> (see `context_blocks` / `lookup_block`); all "" is byte-identical to the old output.
     """
-    ask = focus.strip() or (
+    ask = (focus.strip() or (
         "Write the code for the coding task described in the transcript above and/or shown on the "
         "screen. If the transcript asks for a change to the previous code, apply it to that code. "
         "Output the finished code now."
-    )
+    )) + _given_code_ask("code", consider_given_code)
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
         f"{context_blocks(reference, earlier, map_text)}"
@@ -1102,7 +1174,7 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
     )
 
 
-def system_text(persona: str, context: str = "", *, tools: str = "") -> str:
+def system_text(persona: str, context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
     """System prompt for kind "text" (the Text button): a plain-English walkthrough of the task
     being discussed / shown, right now -- the way an engineer talks a problem through out loud
     before writing any code.
@@ -1130,6 +1202,7 @@ def system_text(persona: str, context: str = "", *, tools: str = "") -> str:
         "words -- the data structures, the main loop or recursion, what is tracked and how it is "
         "updated; the edge cases to handle; the time and space complexity. For a non-coding question, "
         "walk through the reasoning to the answer and end with the answer.",
+        *_given_code_lines(consider_given_code, kind="text"),
         "Prose only: short plain-English paragraphs or a compact list of lines starting with \"- \", "
         "6 to 12 lines in total, first person is fine (\"I'd start by ...\"), ready to say out loud. "
         "No code fences and no code -- at most a few tokens of code inline (a variable or function "
@@ -1151,17 +1224,18 @@ def system_text(persona: str, context: str = "", *, tools: str = "") -> str:
 
 
 def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
-              reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "") -> str:
+              reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "",
+              consider_given_code: bool | None = None) -> str:
     """User turn for `system_text`: the same checkpoint-scoped transcript -> previous code (only
     when present) -> screen -> on-demand context -> ask layout as `user_code`, with the ask asking
     for the walkthrough. `focus` is an optional extra instruction; blank falls back to the default
     ask below. 2026-10-06: `reference` / `earlier` / `lookup` as in `user_code`."""
-    ask = focus.strip() or (
+    ask = (focus.strip() or (
         "Walk me through, in plain English, the task or question described in the transcript above "
         "and/or shown on the screen: what is asked, the key insight, the approach step by step, the "
         "edge cases and the complexity. If code was produced earlier, walk through that approach. "
         "Output the walkthrough now."
-    )
+    )) + _given_code_ask("text", consider_given_code)
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
         f"{context_blocks(reference, earlier, map_text)}"

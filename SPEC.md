@@ -3757,6 +3757,109 @@ box, the read tools) -- see "What the first live session changed" above; no real
 connected, no real page was fetched and no edit tool ran live. The tab was driven live only as
 far as the ask box's calls needed it.
 
+### Consider given code, Code from scratch, the Shortcuts tab (added 2026-10-29)
+
+Three additions requested together: (1) **Consider given code** -- the assist works WITH the code the
+user has already written instead of jumping to the optimal solution; (2) a third manual-advance
+gesture, **Code from scratch**, that bypasses the given code; (3) **Settings > Shortcuts** -- every
+shortcut in one list, each with its current binding in words, a **Set** button that listens for the
+next key(s) or mouse button, and a **Default** button. Mouse buttons became first-class bindings for
+every shortcut on the way. Developed on `feat/given-code-shortcuts` alongside two other branches
+(`fix/capability-map-launch-toast`, `feat/audio-device-settings`) in separate worktrees.
+
+- Config (`exocortex/config.py`): `AssistConfig.consider_given_code` (True);
+  `HandsFreeConfig.manual_hold_code_fresh` (False); `HotkeysConfig.manual_text` ("mouse_left"),
+  `manual_code` ("mouse_middle"), `manual_code_fresh` ("mouse4"), `swallow_thumb_buttons` (True).
+  Mirrored in `config.example.toml` and README. Older configs load unchanged (the new keys default).
+- Grammar (`exocortex/bindings.py`, new, Qt-free): one `parse_binding(text) -> Binding(text,
+  modifiers, key, kind)` for every `[hotkeys]` entry -- `"hotkey"` (a key + modifiers,
+  RegisterHotKey), `"tap"` (a single key, incl. a modifier side such as "rshift", through
+  `BareKeyHook`; any shortcut may be one now, not only `toggle_pause`), `"mouse"` (`mouse_left`,
+  `mouse_middle`, `mouse_right`, `mouse4`, `mouse5` with optional modifiers; aliases lmb / mmb / rmb,
+  x1 / x2, xbutton1 / 2, button4 / 5, back / forward); `""` = unbound. `normalize_binding`,
+  `is_valid_binding`, `describe_binding` ("Ctrl+Alt+G", "Right Shift (tap)", "Mouse 4 (thumb, back)";
+  `short=True` for the status line), `key_token_for_vk`, `manual_gesture_summary(cfg)` ("hold left =
+  Text, click middle = Code, click mouse 4 = Code from scratch"). `NAMED_VKS` moved here from
+  `ui/hotkeys.py` (re-exported there as `_NAMED_VKS`). "left" is the arrow key, never a mouse button.
+- Prompts (`exocortex/llm/prompts.py`): `_GIVEN_CODE_RULES[True]` (work WITH the given code: keep its
+  language / structure / names / approach, complete what is missing, fix only what is wrong, output
+  the whole code, fill in starter code with its signature kept, a working-but-slower approach is kept
+  and the better one named in one line) and `[False]` (the best solution from scratch; the code on
+  screen is context, not a template; keep only the entry point the task dictates),
+  `_GIVEN_CODE_TEXT_RULE` (walk through THAT code) and `_GIVEN_CODE_ASKS` (one sentence appended to
+  the user turn's ask). `system_solve` / `system_code` / `system_text` / `user_solve` / `user_code` /
+  `user_text` take `consider_given_code: bool | None = None`; None renders byte-for-byte what they
+  rendered before (tests/test_prompts_reference.py's byte-identity tests still hold), so the rule
+  exists only when the assistant passes True / False. It sits after `_library_rule`, before the
+  output-shape rules, and depends only on the config and the job's fresh flag (a stable KV prefix per
+  config).
+- Assistant (`exocortex/llm/assistant.py`): `_AssistJob.fresh` (kind "code" only); `code(focus,
+  label, fresh=False)`; `_enqueue_side_job(..., fresh=)` labels a fresh job "the task being discussed
+  · from scratch"; `_consider_given_code(job)` = `cfg.assist.consider_given_code` (read live) and not
+  a fresh code job; `_system_for` / `_user_for` pass it to the builders.
+- Engine / actions (`exocortex/app.py`, `exocortex/actions.py`): `EngineActions.code(focus,
+  fresh=False)`; `Engine.code(..., fresh=)` defers under the pending kind "code_fresh" so the replay
+  keeps the flag; `manual_advance(kind)` accepts "code_fresh" -> `handsfree.trigger_step("code_fresh")`
+  with hands-free on and not paused, else `code(fresh=True)`. `apply_settings` needed nothing new:
+  the setting is read live, and the shortcuts are the overlay's.
+- Hands-free (`exocortex/handsfree.py`): `HandsFreeHooks.code(..., fresh=False)`;
+  `trigger_step("code_fresh")`; `_request_step` runs it as a "code" step (phase and awaited kind
+  "code") calling `hooks.code(focus, label, fresh=True)` -- a code task keeps `HANDS_FREE_CODE_FOCUS`;
+  `armed_detail(cfg)` renders the configured gestures for the title bar (`ARMED_DETAIL` is the default
+  rendering).
+- Mouse hook (`exocortex/ui/llhooks.py`): `PressHoldMouseHook` now takes BINDING TEXTS
+  ("mouse_left", "ctrl+mouse4"...), serves every mouse-bound shortcut, reads the modifiers held at the
+  press (`GetAsyncKeyState`) and arms the binding whose button + modifiers match, decodes
+  `WM_XBUTTONDOWN/UP` (HIWORD(mouseData): XBUTTON1 = mouse4, XBUTTON2 = mouse5) and
+  `WM_RBUTTONDOWN/UP`, has a per-binding `swallow` rule (the down AND the matching up are kept from
+  the app; a cancelled swallowed press still swallows its release) and `rebind(bindings)` (in place,
+  forgets a press in flight). `require_hold` / `swallow` take the binding text. An X message naming no
+  button (`UNKNOWN_BUTTON`) still cancels a press in flight. New: `ChordRecorder` (Qt-free: `press` /
+  `release` tokens -> one binding, finished `quiet_s` = 0.5 s after the last press once no modifier is
+  held; a modifier alone = a tap; Esc cancels; `finish_now` without a scheduler) with
+  `CaptureKeyHook` / `CaptureMouseHook` / `CaptureHooks` (WH_KEYBOARD_LL + WH_MOUSE_LL: every named key
+  and every button pressed outside the dialog is fed to the recorder and swallowed while it listens,
+  so no hotkey fires and nothing is typed into the app underneath).
+- Overlay (`exocortex/ui/overlay.py`): `_trigger_table()` -- every `[hotkeys]` entry as (name,
+  binding, callback, manual-only); `_install_hotkeys` registers the hotkeys (`GlobalHotkeys`) and the
+  taps (one `BareKeyHook` in `_pause_key_hook`, which now carries every tap) from it, skipping mouse
+  bindings, invalid texts and a binding used twice (`_binding_problems`, toasted together with the
+  "Hotkey conflict" list by `_binding_problem_text`); `_install_manual_hook` builds / rebinds the one
+  mouse hook from `_mouse_bindings()` (general mouse-bound shortcuts always, the gestures while manual
+  is on; dropped when nothing is bound), with `_mouse_hold_required` (the gestures follow
+  `[handsfree].manual_hold_*`, any other mouse shortcut is a click) and `_mouse_swallow` (thumb buttons
+  when `swallow_thumb_buttons`, modified clicks always, bare left / middle / right never);
+  `_set_manual` rebinds the mouse hook and, when a gesture is bound to a key, re-registers the keyboard
+  side (`_reinstall_hotkeys(mouse=False)`); its toast and `_manual_fire`'s ("Manual · Code from
+  scratch") follow the config; `_on_settings_applied` calls `_reinstall_hotkeys()` for any `hotkeys.*`
+  change (the Shortcuts tab applies live). The Manual switch's tooltip names the third gesture.
+- Settings (`exocortex/ui/settings.py`): `FIELDS["Assist"]` gains `consider_given_code` (after
+  `comments`), `FIELDS["Hands-free"]` `manual_hold_code_fresh` (after `manual_hold_code`), and a new
+  `FIELDS["Shortcuts"]` (before Optimize, which stays last) lists every `HotkeysConfig` field -- the
+  global shortcuts, then the three gestures -- as kind `"binding"` plus the `swallow_thumb_buttons`
+  bool. `_BindingEdit` (the binding in words, **Set** -- checkable -- and **Default**; an invalid text
+  is kept, flagged and never applied: `_apply` drops `_invalid_shortcuts()` from the paths and says so
+  in the note) and `ShortcutsPage` (the sections, the status line -- invalid / used twice / a bare left
+  / middle / right on a global shortcut --, `FIXED_SHORTCUTS` for the in-overlay keys, and the
+  capture: a `ChordRecorder` fed by `CaptureHooks` on the real Windows platform, else by a Qt event
+  filter on keys typed into the dialog; one row at a time; Esc, the Set button, a click on the dialog
+  and `hideEvent` cancel). `SettingsDialog._PAGE_BUILDERS` maps the tabs with custom pages
+  ("Optimize", "Shortcuts") to their builder methods.
+- Docs: README (Using it, Manual advance, a "Consider given code" section, the Hotkeys table and the
+  grammar paragraph, Settings, Configuration), docs/SHORTCUTS.md (the gestures, "Changing a
+  shortcut"), config.example.toml.
+- Tests: `tests/test_bindings.py`, `tests/test_prompts_given_code.py` (the rules, the byte-identical
+  default, the assistant's fresh / live-setting plumbing, a fresh job end to end),
+  `tests/test_shortcuts_capture.py` (the hook's X / right buttons, modifiers, swallow, rebind; the
+  recorder; the capture hooks), `tests/test_settings_shortcuts.py` (the tab: rows in words, apply,
+  Default, invalid, duplicates, the bare-button warning, Set through key events, Esc, one row at a
+  time, hide), additions to `tests/test_manual_advance.py` (code_fresh routing, deferral + replay, the
+  controller step, the config round trip, the Hands-free field) and `tests/test_overlay_manual.py`
+  (the third gesture, the configured toast, a mouse-bound global shortcut with manual off, a
+  key-bound gesture, the tap hook, problem toasts, live re-install). The existing hook tests moved
+  from the old "left" / "middle" keys to "mouse_left" / "mouse_middle"; `tests/test_assistant_text.py`
+  now expects the given-code sentence after a focus text.
+
 ## Coding rules for implementers
 - Windows-only OK, but guard imports so `pytest` runs (e.g., import pyaudiowpatch inside functions or try/except at module import with a clear error at use time).
 - Never call the network except LM Studio (localhost), the model download in `models_dl.py`, and

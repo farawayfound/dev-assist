@@ -287,7 +287,11 @@ vendor. See `exocortex/llm/route.py`.
      no hotkey.
    - **Code** (`Ctrl+Alt+G`, accent-coloured) — write the code for whatever has been discussed or
      is on screen since the last checkpoint, right now. Works even while paused; if the task asks
-     for a change to code it just wrote, it builds on that instead of starting over.
+     for a change to code it just wrote, it builds on that instead of starting over. With
+     **Consider given code** on (Settings › Assist, the default) it also works *with* the code you
+     have already typed in the development window — completing it, or fixing only what is wrong,
+     keeping your structure, names and approach — rather than jumping to the optimal solution from
+     scratch; see "Consider given code" below.
 7. Everything is saved to `~/Documents/ExoCortex/sessions/<timestamp>/` (transcript.md/.jsonl,
    notes.md, answers.md, session.json, llama-server.log).
 
@@ -382,25 +386,33 @@ starts a model call by itself, so the GPU sits idle and no context is spent unti
   notes and automatic explanations. (Completion mode is its own deliberate mode and is not
   gated; every manual action — Answer, Ask, Notes, Text, Code, Suggest, Explain — works as
   always.)
-- **The gesture**, anywhere on screen, in whatever app has focus: **press and hold the left
+- **The gestures**, anywhere on screen, in whatever app has focus: **press and hold the left
   mouse button** for `manual_hold_s` (0.8 s by default, on the Hands-free settings tab) to
   generate **Text**; **click the middle button** (press the scroll wheel) for **Code** — no
-  hold needed there by default. Whether each action requires the press-and-hold is its own
+  hold needed there by default; **click mouse button 4** (the rear thumb button) for **Code
+  from scratch** — the same Code, but the code you have already typed is ignored and the model
+  goes straight to the best solution, whatever *Consider given code* says (the middle button
+  respects that setting). All three buttons can be changed on the **Shortcuts** settings tab
+  (`[hotkeys].manual_text` / `manual_code` / `manual_code_fresh`: any mouse button, with or
+  without modifiers, or a key). Whether each gesture requires the press-and-hold is its own
   checkbox on the Hands-free settings tab (`manual_hold_text`, on — unchecking it makes *every*
-  left click generate, so leave it unless you mean that; `manual_hold_code`, off). Moving the
-  pointer while a button is down — a drag, a text selection, an autoscroll — always cancels,
-  as does pressing another button or rolling the wheel, so clicking-and-dragging never triggers
-  anything. The click still reaches the app underneath (nothing is swallowed), and the overlay
-  never comes to the foreground or takes focus — it keeps its translucent, click-through state
-  and the output just streams into the Assist view as usual.
+  left click generate, so leave it unless you mean that; `manual_hold_code` and
+  `manual_hold_code_fresh`, off). Moving the pointer while a button is down — a drag, a text
+  selection, an autoscroll — always cancels, as does pressing another button or rolling the
+  wheel, so clicking-and-dragging never triggers anything. A left or middle click still reaches
+  the app underneath (nothing is swallowed); the thumb buttons are the exception — a bound thumb
+  press is kept from the app (`[hotkeys].swallow_thumb_buttons`, on), because a browser or an
+  editor would otherwise go *Back* on the very press that asks for code. The overlay never comes
+  to the foreground or takes focus — it keeps its translucent, click-through state and the
+  output just streams into the Assist view as usual.
 - **Touchpads:** a three-finger tap triggers Code once Windows maps it to a middle click
   (Settings › Bluetooth & devices › Touchpad › Three-finger gestures › Taps → "Middle mouse
   button") — a tap can't be held, which is exactly why Code doesn't require the hold by
   default. (Windows delivers that tap as *injected* input, and the hook deliberately accepts
   injected clicks for the same reason.)
 - **With hands-free on** the two combine: the watcher still reads and checkpoints each new task
-  and the title bar shows `hands-free · armed · hold left = Text, middle = Code` — the task is
-  ready, nothing has been spent. The gesture then runs that step for the task on screen (a code
+  and the title bar shows `hands-free · armed · hold left = Text, click middle = Code, click
+  mouse 4 = Code from scratch` — the task is ready, nothing has been spent. The gesture then runs that step for the task on screen (a code
   task keeps the code-task ask, so a quiz slide with a snippet still gets a real answer), and
   deviation-driven regeneration is off — hold the middle button when you want the code redone
   around what you typed. The gesture works over the overlay's own translucent, click-through
@@ -651,6 +663,23 @@ This setting replaces the old `[explain].comments` boolean; an existing `config.
 has `comments` under `[explain]` just logs one ignored-key warning at startup and otherwise keeps
 working (`[assist].comments` defaults to `"normal"`).
 
+### Consider given code
+
+`[assist].consider_given_code` — **Consider given code** on the **Assist** settings tab, on by
+default — decides what solve, **Code** and **Text** do about code you have *already written* for
+the task: in the development window on screen, pasted or described in the conversation, or
+produced earlier for the task. On, the model works *with* it: it keeps your language, structure,
+names and approach, completes what is missing, fixes only what is wrong (saying what it fixed in
+one line), fills in a platform's starter code with its signature kept, and outputs the whole
+resulting code so it can replace what is there as-is. A working but slower approach is kept, the
+better one named in one line; only code that cannot work within its own approach is replaced.
+**Text** then walks through *your* code — what it gets right, what is missing or wrong, how to
+complete it. Off, the model gives the best solution from scratch and treats the code on screen as
+context about the task, not as a template (it keeps only the entry point the task dictates). In
+manual advance the third mouse gesture — **Code from scratch**, mouse button 4 by default —
+ignores the given code whatever this setting says, so the middle button and the thumb button give
+you both behaviours side by side.
+
 ### Hotkeys (global, work while the meeting app has focus)
 
 Every shortcut, including the in-window keys, the mouse gestures and how to get a hidden overlay
@@ -674,16 +703,20 @@ back, is listed in [docs/SHORTCUTS.md](docs/SHORTCUTS.md).
 | `Ctrl+Alt+B` | checkpoint: the coding context (solve / Code / completions) starts fresh |
 | `Ctrl+Alt+G` | Code: write the code for the task discussed / shown, right now |
 | `Ctrl+Alt+H` | hands-free mode on / off (auto read → checkpoint → text → code on screen change) |
-| `Ctrl+Alt+J` | manual advance on / off (generate only on a press-and-hold: left = Text, middle = Code) |
+| `Ctrl+Alt+J` | manual advance on / off (generate only on the mouse gesture: hold left = Text, click middle = Code, click mouse 4 = Code from scratch) |
 | `Ctrl+Alt+D` | dashboard mode on / off (the ▦ button: notes, action items with sub-tasks and prompts, goals, constraints, questions, blind spots as a board) |
 | *(tap)* Right Shift | pause / resume everything automatic (screen reading, auto-answer, auto-solve, hands-free) |
 | `Ctrl+Alt+X` | quit (saves the session) |
 
-All bindings live in `[hotkeys]` of `config.toml`. `toggle_pause` (`rshift` by default) is the
-odd one out: a **tap** of a single key — pressed and released with no other key in between —
-rather than a `Ctrl+Alt+…` combination, so it keeps working while your hands are on the keyboard
-(Shift held for a capital letter is never a tap). `rctrl`, `ralt`, a plain key such as `right`
-(the arrow), or a `ctrl+alt+p`-style combination also work; `""` turns it off.
+All bindings live in `[hotkeys]` of `config.toml` and are edited live on the **Shortcuts**
+settings tab (see Settings below): every entry — the hotkeys above and the three manual-advance
+gestures — with its current binding in words, a **Set** button that listens for the next key
+combination or mouse button, and a **Default** button. One grammar covers them all: `ctrl+alt+g`
+is a hotkey; a single key (`rshift`, `f9`, `right`) is a **tap** — pressed and released with no
+other key in between, which is why `toggle_pause` on Right Shift keeps working while your hands
+are on the keyboard (Shift held for a capital letter is never a tap); a mouse button (`mouse4`,
+`ctrl+mouse_left`; `mouse_left`, `mouse_middle`, `mouse_right`, `mouse4` and `mouse5`, the two
+thumb buttons) is a click anywhere on screen with exactly those modifiers held. `""` unbinds.
 
 ### Models: the library and the Models window
 
@@ -761,14 +794,17 @@ Completion (lines predicted, completion length, quiet time, ghost font/opacity, 
 Explanations, **Hands-free** (what makes a new task — new-line and view-change thresholds, and
 **when code is on screen** — settle time, deviation, cumulative context size, Text/Code on or
 off, accurate OCR, **manual advance** with its press-and-hold time and the quick-middle-click
-option), Assist (including **Focus**, **Use libraries** and **Comments in generated
-code**), Notes, **Dashboard** (the board's tracking, columns and width), **Project** (the
-repository root, the on-demand repository lookups and the Claude Code toolkit catalog), Screen
-(including **OCR device**), Monitor, Window, **Audio** (pick the system-audio and microphone
-devices from a list, **Test** each one, and check the speaker routing — see "Audio devices" below)
-and **Optimize** (where each job runs on this machine, a benchmark, a plan per goal — see
-"Optimize" below) — covering everything in the Configuration section below. The old **Model** tab
-(backend, model, context size, llama.cpp
+option), Assist (including **Focus**, **Use libraries**, **Comments in generated code** and
+**Consider given code**), Notes, **Dashboard** (the board's tracking, columns and width),
+**Project** (the repository root, the on-demand repository lookups and the Claude Code toolkit
+catalog), Screen (including **OCR device**), Monitor, Window, **Audio** (pick the system-audio and
+microphone devices from a list, **Test** each one, and check the speaker routing — see "Audio
+devices" below), **Shortcuts** (every hotkey and manual-advance mouse gesture with its current
+binding in words, a **Set** button that listens for the next key combination or mouse button —
+taken half a second after the last key — and a **Default** button per row, plus the fixed
+in-overlay keys; changes re-register at once, no restart) and **Optimize** (where each job runs on
+this machine, a benchmark, a plan per goal — see "Optimize" below) — covering everything in the
+Configuration section below. The old **Model** tab (backend, model, context size, llama.cpp
 knobs) has moved to **`⋯ › Models…`** (see above) — this dialog no longer touches `[llm]` at all.
 **Apply**/**OK** write the values into the running app (most take effect at once;
 the few that need a restart, such as the OCR engine or capture exclusion, are marked *(restart)*
@@ -1201,6 +1237,7 @@ focus = "auto"               # technical | auto (default, code-biased) | all -- 
 libraries = "basic"          # none | basic | all -- a default: "no libraries" said in the interview wins
 primary_language = "Python" # fallback for solve, Code and completions when the task names none
 comments = "normal"        # none | minimal | normal | detailed
+consider_given_code = true  # work WITH the code already on screen (complete it, fix only what's wrong); false = from scratch
 style = "bullets"           # bullets | short | detailed
 persona = ""                # e.g. "I am a backend engineer interviewing for a platform role."
 
@@ -1241,6 +1278,16 @@ manual = false                # manual advance (Ctrl+Alt+J): generate only on th
 manual_hold_s = 0.8           # press-and-hold time for a button that requires the hold
 manual_hold_text = true       # Text (left button) needs the hold; false = EVERY click generates
 manual_hold_code = false      # Code (middle button) doesn't: a quick press / 3-finger tap fires
+manual_hold_code_fresh = false # Code from scratch (mouse button 4) doesn't either
+
+[hotkeys]
+# Every entry is edited live on Settings > Shortcuts. One grammar: "ctrl+alt+g" = a hotkey; "rshift" /
+# "f9" = a TAP of that key; "mouse4" / "ctrl+mouse_left" = a mouse button (mouse_left, mouse_middle,
+# mouse_right, mouse4 and mouse5 -- the thumb buttons) with exactly those modifiers held; "" = unbound.
+manual_text = "mouse_left"      # manual advance: Text (held)
+manual_code = "mouse_middle"    # manual advance: Code (a click; works with the given code when that option is on)
+manual_code_fresh = "mouse4"    # manual advance: Code from scratch (a click; always ignores the given code)
+swallow_thumb_buttons = true    # a bound thumb button never reaches the app underneath (no browser "Back")
 
 [completion]
 enabled = false             # start in completion mode (slim bar + ghost text)

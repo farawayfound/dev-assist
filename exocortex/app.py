@@ -510,6 +510,8 @@ class Engine(EngineActions):
                 self.assistant.solve(text)
             elif kind == "code":
                 self.assistant.code(text, label=label) if label else self.assistant.code(text)
+            elif kind == "code_fresh":
+                self.assistant.code(text, label=label, fresh=True) if label else self.assistant.code(text, fresh=True)
             elif kind == "text":
                 self.assistant.text(text, label=label) if label else self.assistant.text(text)
             elif kind == "explain":
@@ -925,13 +927,20 @@ class Engine(EngineActions):
                 log.exception("engine: compact() failed")
         return 0
 
-    def code(self, focus: str = "", label: str = "") -> int | None:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
         """Returns the job id, or None when the request was deferred (LLM not ready yet).
-        `label`: what the Assist tab shows as the question instead of `focus` (hands-free)."""
-        if self.assistant is not None and hasattr(self.assistant, "code") and not self._defer("code", focus, label):
+        `label`: what the Assist tab shows as the question instead of `focus` (hands-free).
+        `fresh` (2026-10-29, the "Code from scratch" gesture): the job ignores the code already on
+        screen whatever `[assist].consider_given_code` says; deferred under its own pending kind
+        so the replay keeps the flag."""
+        kind = "code_fresh" if fresh else "code"
+        if self.assistant is not None and hasattr(self.assistant, "code") and not self._defer(kind, focus, label):
+            kwargs: dict[str, object] = {}
             if label:
-                return self.assistant.code(focus, label=label)
-            return self.assistant.code(focus)
+                kwargs["label"] = label
+            if fresh:
+                kwargs["fresh"] = True
+            return self.assistant.code(focus, **kwargs)
         return None
 
     def text(self, focus: str = "", label: str = "") -> int | None:
@@ -1073,15 +1082,19 @@ class Engine(EngineActions):
         log.info("manual advance %s", "on" if enabled else "off")
 
     def manual_advance(self, kind: str = "text") -> None:
-        """The press-and-hold gesture (`EngineActions.manual_advance`): run one generation now.
-        With hands-free on (and not paused) the controller runs the step for the current task --
-        the code-task ask, the armed state, the retry machinery; otherwise the ordinary manual
-        text()/code(), which still gets the hands-free cumulative context while the controller
-        runs (see `Assistant.set_hands_free`). Works while paused, like every manual action."""
-        kind = "code" if kind == "code" else "text"
+        """A manual-advance gesture (`EngineActions.manual_advance`): run one generation now.
+        `kind` is "text", "code" or -- 2026-10-29 -- "code_fresh" (Code from scratch: the given
+        code ignored). With hands-free on (and not paused) the controller runs the step for the
+        current task -- the code-task ask, the armed state, the retry machinery; otherwise the
+        ordinary manual text()/code(), which still gets the hands-free cumulative context while
+        the controller runs (see `Assistant.set_hands_free`). Works while paused, like every
+        manual action."""
+        kind = kind if kind in ("code", "code_fresh") else "text"
         hf = self.handsfree
         if hf is not None and getattr(hf, "enabled", False) and not self._paused:
             hf.trigger_step(kind)
+        elif kind == "code_fresh":
+            self.code(fresh=True)
         elif kind == "code":
             self.code()
         else:

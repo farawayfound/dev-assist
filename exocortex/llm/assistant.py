@@ -798,6 +798,10 @@ class _AssistJob:
     sections: tuple[str, ...] = ()
     auto: bool = False
     started: float = 0.0
+    #: 2026-10-29, kind "code" only: the manual-advance "Code from scratch" gesture -- the prompt
+    #: tells the model to ignore the code already on screen, whatever `[assist].consider_given_code`
+    #: says (`Assistant._consider_given_code`).
+    fresh: bool = False
     #: 2026-10-07 (capabilities): the tool loop's state for this job, resolved ONCE by
     #: `Assistant._job_tools` (None = no tools for it) so the system prompt, the user turn, the
     #: prompt rebuilt by the overflow retry and the loop itself all agree on one budget.
@@ -1217,11 +1221,13 @@ class Assistant:
             return
         self._enqueue_side_job("solve", focus=focus, screen_lines=None)
 
-    def code(self, focus: str = "", label: str = "") -> int:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now (kind "code", the Code button). Returns the job id.
         `label`, when given, is what the Assist tab / history show as the question instead of
-        `focus` (hands-free mode passes a long instruction as `focus`).
+        `focus` (hands-free mode passes a long instruction as `focus`). `fresh` (2026-10-29, the
+        "Code from scratch" gesture) makes the prompt ignore the code already written on screen,
+        whatever `[assist].consider_given_code` says.
 
         Runs on the same side lane as `suggest`/`solve` -- it never cancels a running main-lane
         (auto/manual/ask/screen) job -- but a new "suggest"/"solve"/"code" job cancels a running
@@ -1229,7 +1235,7 @@ class Assistant:
         while paused (see `exocortex.actions.EngineActions.code`). `focus` is an optional extra
         instruction; blank falls back to `prompts.user_code`'s default ask.
         """
-        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label)
+        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label, fresh=fresh)
 
     def text(self, focus: str = "", label: str = "") -> int:
         """Walk through, in plain English, the task discussed (transcript since the last checkpoint)
@@ -1846,7 +1852,7 @@ class Assistant:
 
     def _enqueue_side_job(
         self, kind: AssistKind, *, focus: str, screen_lines: tuple[str, ...] | None,
-        plan_id: int | None = None, label: str = "",
+        plan_id: int | None = None, label: str = "", fresh: bool = False,
     ) -> int:
         """Queue a side-lane ("suggest"/"solve"/"code"), text-lane ("text") or explain-lane
         ("explain") job. Cancels only a running job that the new kind supersedes (`_CANCELS`); a
@@ -1857,10 +1863,13 @@ class Assistant:
             "text": "the task being discussed", "explain": "Explanation",
             "recap": "Recap of the session so far",
         }.get(kind, "Suggestions")
+        if fresh and kind == "code":
+            default_label += " \u00b7 from scratch"
         display_question = label.strip() or focus.strip() or default_label
         job = _AssistJob(
             id=next(self._job_ids), kind=kind, question=display_question,
             cancel=threading.Event(), focus=focus, screen_lines=screen_lines, plan_id=plan_id,
+            fresh=bool(fresh and kind == "code"),
         )
         self._cancel_running_of(_CANCELS.get(kind, ()))
         self._preempt_auto_insights()
@@ -2347,6 +2356,13 @@ class Assistant:
             return job.focus
         return job.question
 
+    def _consider_given_code(self, job: _AssistJob) -> bool:
+        """2026-10-29: whether this job's prompt tells the model to work with the code already on
+        screen (`[assist].consider_given_code`, read live) -- never for a "fresh" code job, the
+        manual-advance "Code from scratch" gesture (the flag means nothing on any other kind)."""
+        fresh = bool(job.fresh) and job.kind == "code"
+        return bool(self._cfg.assist.consider_given_code) and not fresh
+
     def _system_for(self, job: _AssistJob, choices: ChoiceSet | None = None) -> str:
         """The system prompt for `job`. `choices` is accepted for symmetry with the budget but does
         not change it: the multiple-choice rule is worded conditionally ("If a <choices> block is
@@ -2367,10 +2383,11 @@ class Assistant:
             return builder(
                 persona, explain=ex.enabled, comments=level,
                 language=self._cfg.assist.primary_language, libraries=self._cfg.assist.libraries,
-                context=context, **extra,
+                context=context, consider_given_code=self._consider_given_code(job), **extra,
             )
         if job.kind == "text":
-            return prompts.system_text(persona, context, **extra)
+            return prompts.system_text(persona, context, consider_given_code=self._consider_given_code(job),
+                                       **extra)
         if job.kind == "explain":
             return prompts.system_explain(persona, context)
         if job.kind == "suggest":
@@ -2492,11 +2509,13 @@ class Assistant:
         if job.kind == "ask":
             return prompts.user_ask(window, q, screen_text, block, extra=extra, **ctx)
         if job.kind == "solve":
-            return prompts.user_solve(window, screen_text, job.focus, block, extra=extra, **ctx)
+            return prompts.user_solve(window, screen_text, job.focus, block, extra=extra,
+                                      consider_given_code=self._consider_given_code(job), **ctx)
         if job.kind in ("code", "text"):
             prev = self._previous_code_text() if previous is None else previous
             builder = prompts.user_code if job.kind == "code" else prompts.user_text
-            return builder(window, screen_text, prev, job.focus, extra=extra, **ctx)
+            return builder(window, screen_text, prev, job.focus, extra=extra,
+                           consider_given_code=self._consider_given_code(job), **ctx)
         if job.kind == "explain":
             with self._plan_lock:
                 plan = self._plan

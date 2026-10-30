@@ -94,11 +94,12 @@ def test_text_default_question_and_with_focus(bus: EventBus, transcript: Transcr
         events = drain_until(sub, lambda e: isinstance(e, AssistDoneEvent))
         st2 = next(e for e in events if isinstance(e, AssistStartedEvent))
         assert st2.question == "explain the DP"
-        # the user turn (inside the rendered ChatML prompt) ends exactly with the focus text,
-        # right before the closing <|im_end|> tag -- user_text() falls back to `focus` verbatim
-        # as its whole "ask" when one is given.
+        # the user turn (inside the rendered ChatML prompt) ends with the focus text -- user_text()
+        # takes `focus` verbatim as the ask when one is given -- followed only by the one-sentence
+        # given-code reminder ([assist].consider_given_code, on by default; 2026-10-29), right
+        # before the closing <|im_end|> tag.
         prompt = client.calls[-1]["prompt"]
-        assert f"explain the DP{prompts.IM_END}" in prompt
+        assert f"explain the DP{prompts._given_code_ask('text', True)}{prompts.IM_END}" in prompt
     finally:
         a.stop()
 

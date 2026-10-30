@@ -183,6 +183,13 @@ flag_blind_spots = true     # background: unhandled edge cases, missing tests, r
 insight_interval_s = 120    # a background refresh at most this often (0 = on demand only: Ctrl+Alt+W) ...
 insight_min_new_words = 60  # ... once this much new speech arrived -- or the code on screen changed a lot
 insight_max_items = 4       # bullets per section
+# 2026-10-29: work WITH the code already written for the task (in the editor on screen, in the
+# conversation, or produced earlier): keep its language, structure, names and approach, complete
+# what is missing, fix only what is wrong, fill in a platform's starter code -- instead of jumping
+# to the optimal solution from scratch. false = the best solution from scratch (the code on screen
+# is context, not a template). The manual-advance "Code from scratch" gesture ([hotkeys].
+# manual_code_fresh) ignores the given code whatever this says.
+consider_given_code = true
 
 [notes]
 auto_interval_s = 180
@@ -308,6 +315,7 @@ manual_hold_s = 0.8         # press-and-hold time for a button that requires the
 manual_hold_text = true     # Text needs the hold (left clicks happen constantly; false = EVERY click generates)
 manual_hold_code = false    # Code does not: a quick middle press -- or a touchpad three-finger tap mapped to
                             # "Middle mouse button" in Windows touchpad settings -- triggers it right away
+manual_hold_code_fresh = false  # 2026-10-29: Code from scratch (mouse button 4 by default) does not either
 
 [context]
 # 2026-10-06: reference documents + the dynamic context window (the Models window's "Context" tab).
@@ -531,11 +539,23 @@ checkpoint = "ctrl+alt+b"
 toggle_pause = "rshift"     # pause / resume: a TAP of the right Shift key (or rctrl / ralt / a key such as "right", or a "ctrl+alt+p" combination; "" = off)
 code = "ctrl+alt+g"
 toggle_handsfree = "ctrl+alt+h"
-toggle_manual = "ctrl+alt+j"   # manual advance (generate only on a press-and-hold: left = Text, middle = Code)
+toggle_manual = "ctrl+alt+j"   # manual advance (generate only on the mouse gesture: left = Text, middle = Code, mouse 4 = Code from scratch)
 insights = "ctrl+alt+w"        # refresh suggested questions + blind spots / follow-ups now
 recap = "ctrl+alt+y"           # recap the session so far
 toggle_dashboard = "ctrl+alt+d"   # dashboard mode on / off (the ▦ title-bar button)
 quit = "ctrl+alt+x"
+# 2026-10-29 (Settings > Shortcuts): every entry above and below follows one grammar -- "ctrl+alt+g" is a
+# hotkey; a single key ("rshift", "f9", "right") is a TAP of that key (pressed and released with no other
+# key in between); a mouse button ("mouse4", "ctrl+mouse_left"; mouse_left, mouse_middle, mouse_right,
+# mouse4 and mouse5 -- the two thumb buttons) is a click anywhere on screen with exactly those modifiers
+# held; "" = unbound. The manual-advance gestures, active only while the Manual switch is on (whether a
+# mouse gesture needs the press-and-hold is [handsfree].manual_hold_*):
+manual_text = "mouse_left"          # Text
+manual_code = "mouse_middle"        # Code -- works with the given code when [assist].consider_given_code is on
+manual_code_fresh = "mouse4"        # Code from scratch -- always ignores the given code
+swallow_thumb_buttons = true        # a thumb button (mouse4 / mouse5) bound to anything is kept from the app
+                                    # underneath (a browser or an editor would otherwise go Back / Forward);
+                                    # a modified click is kept too, a bare left / middle / right press never
 
 [paths]
 models_dir = ""

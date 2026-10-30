@@ -93,6 +93,7 @@ from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Protocol
 
+from exocortex.bindings import manual_gesture_summary
 from exocortex.bus import (
     AssistDoneEvent,
     AssistErrorEvent,
@@ -153,9 +154,16 @@ HANDS_FREE_CODE_FOCUS = (
 )
 #: What the Assist tab / history show as the question for that step.
 HANDS_FREE_CODE_LABEL = "the coding task on screen"
-#: Status detail while a task is armed in manual advance (the title-bar subtitle). Worded for
-#: the default hold settings (Text: hold the left button; Code: a plain middle press is enough).
-ARMED_DETAIL = "hold left = Text, click middle = Code"
+#: Status detail while a task is armed in manual advance (the title-bar subtitle), for the DEFAULT
+#: gestures and hold settings; :func:`armed_detail` renders the configured ones (2026-10-29).
+ARMED_DETAIL = manual_gesture_summary(Config())
+
+
+def armed_detail(cfg: Config) -> str:
+    """The armed detail for ``cfg``'s gestures -- "hold left = Text, click middle = Code, click
+    mouse 4 = Code from scratch" with the defaults -- following ``[hotkeys].manual_*`` and the
+    ``[handsfree].manual_hold_*`` switches; :data:`ARMED_DETAIL` when every gesture is unbound."""
+    return manual_gesture_summary(cfg) or ARMED_DETAIL
 
 _CODE_LINE_RE = re.compile(
     r"[{}();=<>\[\]]|^\s*(?:def|class|return|import|from|for|while|if|elif|else|try|except|finally|"
@@ -212,8 +220,9 @@ class HandsFreeHooks(Protocol):
         checkpoint; returns its job id (None when the engine deferred it: LLM not ready).
         ``focus`` is an extra instruction (blank: the default ask), ``label`` what the UI shows."""
 
-    def code(self, focus: str = "", label: str = "") -> int | None:
-        """Start a "code" job for the same task; returns its job id (None when deferred)."""
+    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
+        """Start a "code" job for the same task; returns its job id (None when deferred). ``fresh``
+        (2026-10-29): the "Code from scratch" gesture -- the job ignores the code on screen."""
 
     def recent_code(self) -> str:
         """The code the app itself produced since the current checkpoint ("" when none)."""
@@ -739,10 +748,11 @@ class HandsFreeController:
         self._post(("reset",))
 
     def trigger_step(self, kind: str) -> None:
-        """Manual advance (the press-and-hold gesture): run one ``"text"`` / ``"code"`` step for
-        the current task right now, whatever the armed steps were. Any thread; ignored while
-        paused (the engine falls back to a plain text/code then) or off."""
-        self._post(("manual", "code" if kind == "code" else "text"))
+        """Manual advance (the mouse gesture): run one ``"text"`` / ``"code"`` / ``"code_fresh"``
+        (2026-10-29: Code from scratch, the given code ignored) step for the current task right
+        now, whatever the armed steps were. Any thread; ignored while paused (the engine falls
+        back to a plain text/code then) or off."""
+        self._post(("manual", kind if kind in ("code", "code_fresh") else "text"))
 
     def resume_auto(self) -> None:
         """Manual advance was switched OFF: if a task is armed and nothing is running, run its
@@ -1028,7 +1038,7 @@ class HandsFreeController:
         or back to armed, in manual advance with a task still waiting for the gesture."""
         if self._manual() and self._armed:
             self._watch = "armed"
-            self._watch_detail = ARMED_DETAIL
+            self._watch_detail = armed_detail(self._cfg)
         else:
             self._watch = "watching"
             self._watch_detail = detail
@@ -1100,13 +1110,18 @@ class HandsFreeController:
             self._phase = None
             self._watch_detail = ""
             if self._manual() and self._armed:
-                self._set_watch("armed", ARMED_DETAIL)
+                self._set_watch("armed", armed_detail(self._cfg))
             else:
                 self._set_watch("watching")
             return
         self._request_step(self._steps.pop(0))
 
     def _request_step(self, kind: str, detail: str = "") -> None:
+        # 2026-10-29: "code_fresh" (the Code-from-scratch gesture) is a "code" step whose job ignores
+        # the code on screen; the phase and the awaited kind stay "code" (the events carry that kind).
+        fresh = kind == "code_fresh"
+        if fresh:
+            kind = "code"
         self._phase = kind
         self._awaiting_kind = kind
         self._awaiting_job_id = None
@@ -1118,6 +1133,8 @@ class HandsFreeController:
         try:
             if kind == "text":
                 job_id = self._hooks.text(focus, label) if focus else self._hooks.text()
+            elif fresh:
+                job_id = self._hooks.code(focus, label, fresh=True)
             else:
                 job_id = self._hooks.code(focus, label) if focus else self._hooks.code()
         except Exception:  # noqa: BLE001

@@ -512,6 +512,91 @@ class ScreenConfig:
 
 
 @dataclass
+class ContextConfig:
+    """Context injection + the dynamic context window (added 2026-10-06, the Models window's
+    "Context" tab -- see SPEC.md "Context library + dynamic context window").
+
+    Two things live here. (1) **Reference documents** the user uploads (a README, a design or
+    architecture doc, notes for a presentation) and how each one reaches the model: ``"inject"``
+    puts the document's text into every prompt (a stable block, prefix-cached), ``"reference"``
+    keeps it out of the prompt and instead pre-processes it into a short model-written *digest*
+    (a catalogue line that tells the model the document exists and what it covers) plus a local
+    keyword index, so only the passages that match the question at hand are pulled in -- and
+    only when they match. Either way the material ranks BELOW the live transcript in the prompt's
+    own instructions: the most recent speech matters most, the documents are for reference.
+    (2) **The context window itself**: every prompt is sized to the server's real per-request
+    context (llama-server's ``/props``, else ``[llm].ctx_size`` whole: with ``parallel = 2`` the
+    server runs a unified KV pool that both slots share, so ``lane_share`` splits it between an
+    answer and the notes lane),
+    the transcript window keeps a stable prefix (it advances in steps instead of sliding one line
+    at a time, so llama.cpp's KV prefix cache keeps hitting in a long meeting), what falls out of
+    the window is compacted into a short running summary, and the characters-per-token estimate is
+    calibrated live from the server's own prompt-token counts.
+    """
+    # Where uploaded documents and their manifest live. "" -> <models_dir>/context (persists
+    # across sessions, like the model library; a session never deletes a document).
+    dir: str = ""
+    # Mode a newly added document gets: "reference" (digest + on-demand passages) or "inject"
+    # (its text in every prompt). Each document's mode can be changed afterwards in the tab.
+    default_mode: str = "reference"
+    # Which jobs see the reference material: "all" (every answer, solve, code, text, suggestion
+    # and completion), "questions" (spoken / typed / on-screen questions only: auto, manual, ask,
+    # screen), or "none" (the library is kept but nothing is injected).
+    include_in: str = "all"
+    # Token budgets (approximate; see chars_per_token). The stable <reference> block (injected
+    # documents in full, plus one catalogue line per reference-mode document)...
+    reference_tokens: int = 1200
+    # ...and the volatile <lookup> block (the passages pulled from reference-mode documents for
+    # this one question). Both are the FIRST things trimmed when the server's context is short.
+    lookup_tokens: int = 600
+    lookup_top_k: int = 3              # at most this many passages per answer
+    lookup_min_score: float = 3.0      # BM25 score a passage needs to be pulled in at all (a single
+                                       # matched term needs twice that: one rare word is not relevance)
+    chunk_chars: int = 1200            # a document is indexed in passages of about this size (split on headings / paragraphs)
+    max_doc_chars: int = 200000        # a longer document is cut here when it is added (with a warning)
+    # Pre-process each reference-mode document with the model into a 2-4 line digest (what it is,
+    # what it covers) -- the "catalogue line" the prompt carries so the model knows the document
+    # exists. Runs on the notes lane (never delays an answer). Off: the catalogue shows the file
+    # name and its first heading only.
+    digest: bool = True
+    digest_tokens: int = 120
+    # ---- the window itself ----
+    # "auto": size every prompt to the server's real per-request context (llama-server /props, else
+    # [llm].ctx_size, shared between the lanes per lane_share): transcript + reference + screen + the
+    # answer budget must fit,
+    # trimmed in priority order (lookup, reference, summary, screen, then the OLDEST transcript --
+    # the newest speech and the question are never trimmed). "fixed": the pre-2026-10-06 behaviour
+    # ([llm].context_tokens worth of transcript, no fitting) plus the reference blocks at their
+    # configured sizes.
+    budget_mode: str = "auto"
+    reserve_tokens: int = 256          # safety margin kept free under the server's context
+    # llama-server runs with [llm].parallel = 2 slots over ONE unified KV pool of ctx_size tokens
+    # (measured 2026-10-06: /props reports n_ctx = 4096 per slot for a 4096-token server, and the
+    # two slots share those 4096 cells), so an answer and a notes-lane job (notes, a compaction
+    # summary, a document digest) running at the same time must fit the pool TOGETHER. This share
+    # of the pool is what the notes lane may use; answers get the rest. Ignored with parallel = 1.
+    lane_share: float = 0.3
+    transcript_min_tokens: int = 600   # the newest speech always keeps at least this much, whatever else has to go
+    # When the transcript window overflows its budget, drop at least this share of the window at
+    # once (whole lines, oldest first) instead of sliding one line at a time -- the prompt prefix
+    # then stays byte-identical for the next many turns, which is what lets llama.cpp reuse its KV
+    # cache (a window that slides every turn is re-evaluated in full every turn). 0 = slide.
+    trim_step: float = 0.25
+    # What happens to the transcript that fell out of the window: "summary" = the model folds it
+    # into a short running summary (<earlier> block, at most summary_tokens; one small job on the
+    # notes lane per trim, never on the answer lane) so the earlier part of the meeting is still
+    # known; "off" = it is simply gone (the pre-2026-10-06 behaviour).
+    compaction: str = "summary"
+    summary_tokens: int = 250
+    # Characters per token used for every budget estimate until the server's own prompt-token
+    # counts (llama-server timings.prompt_n / OpenAI usage.prompt_tokens / Ollama prompt_eval_count)
+    # have calibrated it -- 3.6 is conservative for English prose with timestamps and code mixed in
+    # (the old approx_tokens assumed 4.0). auto_calibrate = false pins this value.
+    chars_per_token: float = 3.6
+    auto_calibrate: bool = True
+
+
+@dataclass
 class UIConfig:
     opacity: float = 0.93
     width: int = 460
@@ -706,6 +791,7 @@ class Config:
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     explain: ExplainConfig = field(default_factory=ExplainConfig)
     handsfree: HandsFreeConfig = field(default_factory=HandsFreeConfig)
+    context: ContextConfig = field(default_factory=ContextConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -721,6 +807,13 @@ class Config:
         if self.paths.sessions_dir:
             return Path(self.paths.sessions_dir).expanduser()
         return Path.home() / "Documents" / "ExoCortex" / "sessions"
+
+    def context_dir(self) -> Path:
+        """Where uploaded reference documents and their manifest live (``[context].dir``, empty =
+        ``<models_dir>/context``) -- persists across sessions like the model library."""
+        if self.context.dir:
+            return Path(self.context.dir).expanduser()
+        return self.models_dir() / "context"
 
 
 def project_root() -> Path:

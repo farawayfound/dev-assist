@@ -234,5 +234,43 @@ class EngineActions(Protocol):
         """Compute (and save) the profile `exocortex.llm.library.auto_profile` recommends for
         `key` on this machine; returns it."""
 
+
+    # ---- context library + the context window (2026-10-06: the Models window's "Context" tab) ----
+    # Every method returns at once; the library reports back through ContextLibraryEvent, the
+    # window through ContextUsageEvent (one per assist job).
+    def context_documents(self) -> list[dict[str, object]]:
+        """Every uploaded reference document, as plain dicts: id, name, kind ("markdown" | "text"
+        | "code" | "html" | "docx" | "pptx" | "pdf"), chars, tokens (estimate), enabled (bool),
+        mode ("inject" | "reference"), digest (the model-written catalogue text, "" until ready),
+        digest_state ("pending" | "ready" | "failed" | "n/a"), source_path, added_at (ISO).
+        Synchronous but cheap (the in-memory manifest)."""
+
+    def add_context_document(self, path: str, *, mode: str | None = None) -> None:
+        """Copy the file at `path` into the context library (text extracted on the way in: .md /
+        .txt / code / .html / .docx / .pptx / .pdf), enabled, in `mode` (None = [context].default_mode).
+        A reference-mode document gets its digest generated on the notes lane when
+        [context].digest is on. Publishes ContextLibraryEvent (or one with a failure reason)."""
+
+    def add_context_text(self, name: str, text: str, *, mode: str | None = None) -> None:
+        """Same as `add_context_document` for pasted text (stored as a markdown document `name`)."""
+
+    def remove_context_document(self, doc_id: str) -> None:
+        """Delete a document (and its stored copy) from the library. Publishes ContextLibraryEvent."""
+
+    def set_context_document(self, doc_id: str, *, enabled: bool | None = None, mode: str | None = None) -> None:
+        """Toggle a document on/off and/or switch its mode ("inject" | "reference"); a None leaves
+        that attribute alone. Switching to "reference" queues a digest when none exists yet.
+        Publishes ContextLibraryEvent."""
+
+    def refresh_context_digest(self, doc_id: str) -> None:
+        """Re-generate the model-written digest of one document (reference mode) now."""
+
+    def context_usage(self) -> dict[str, object]:
+        """The context window as it stands: the last assist job's ContextUsageEvent fields (empty
+        values before any job ran) plus "slot_tokens" (the server's per-request context the budget
+        is sized to), "chars_per_token" (the calibrated estimate), "earlier_summary" (the running
+        summary of the transcript that fell out of the window, "" when none) and
+        "documents" (how many documents are enabled)."""
+
     def quit(self) -> None:
         """Save the session and shut everything down."""

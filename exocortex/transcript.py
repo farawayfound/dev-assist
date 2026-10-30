@@ -101,6 +101,23 @@ class Transcript:
             lines = [_format_line(s) for s in segs]
         return _trim_to_whole_lines(lines, max_chars)
 
+    def lines(self, *, since_id: int | None = None, until_id: int | None = None) -> list[tuple[int, str]]:
+        """(segment id, "[mm:ss] Label: text") for every segment passing the same filters as
+        `window_text` (id <= until_id, id > since_id), oldest first, NOT trimmed.
+
+        2026-10-06 (context window): the anchored transcript window in `exocortex.context` needs
+        the line boundaries and the ids to remember where its start is; `window_text` only hands
+        back the already-joined, already-trimmed text, so it cannot say which segment a trim
+        ended on. `window_text` itself is deliberately left as it was (other callers and tests
+        rely on its one-line-at-a-time front trim).
+        """
+        with self._lock:
+            return [
+                (s.id, _format_line(s))
+                for s in self._segments
+                if (until_id is None or s.id <= until_id) and (since_id is None or s.id > since_id)
+            ]
+
     def text_since(self, since_id: int | None) -> str:
         """Same line format as `window_text`, for segments with id > since_id (all if None)."""
         segs = self.segments(since_id)

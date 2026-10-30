@@ -25,6 +25,7 @@ from exocortex.bus import (
     AssistStartedEvent,
     CheckpointEvent,
     ComponentStatusEvent,
+    ContextLibraryEvent,
     DashboardModeEvent,
     DashboardUpdatedEvent,
     Event,
@@ -45,6 +46,7 @@ from exocortex.bus import (
     drain,
 )
 from exocortex.config import Config, load_config, project_root, save_config
+from exocortex.context import ContextManager, ContextStore
 from exocortex.llm.client import make_client
 from exocortex.llm.route import resolve_route
 from exocortex.transcript import Transcript
@@ -143,6 +145,12 @@ class Engine(EngineActions):
         # an explicit callable (tests only) always wins.
         self._route_resolver = route_resolver
         self.transcript = Transcript()
+        # 2026-10-06 (context library): the on-disk reference documents and the ONE object the
+        # Assistant sizes every prompt with. Built here (not in start()) so the Models window's
+        # Context tab works before the LLM is up and a document added early is already in the
+        # manifest when the first answer is built. Constructing the store never touches the disk.
+        self.context_store = ContextStore(cfg.context_dir())
+        self.context = ContextManager(cfg, self.context_store, self.transcript)
         self._t0 = time.monotonic()
         self._next_id = 0
         self._id_lock = threading.Lock()
@@ -224,7 +232,7 @@ class Engine(EngineActions):
             self.bus.publish(ModelLibraryEvent(reason="empty-library"))
 
         self.client = make_client(cfg.llm, self.route.backend, base_url=self.route.base_url or None)
-        self.assistant = Assistant(cfg, self.bus, self.client, self.transcript, self.clock)
+        self.assistant = Assistant(cfg, self.bus, self.client, self.transcript, self.clock, context=self.context)
         self.recorder = SessionRecorder(cfg, self.bus, self.transcript, self.assistant)
         folder = self.recorder.start()
         log.info("session folder: %s", folder)
@@ -727,6 +735,13 @@ class Engine(EngineActions):
             self.clusterer.reset()
         if self.assistant is not None and hasattr(self.assistant, "reset"):
             self.assistant.reset()
+        # 2026-10-06: the anchored transcript window and the running summary belong to the old
+        # meeting; the uploaded documents persist across sessions (Assistant.reset does this too
+        # -- the engine repeats it so a headless / not-yet-started assistant cannot skip it).
+        try:
+            self.context.reset_session()
+        except Exception:  # noqa: BLE001
+            log.exception("context window reset failed")
         if self.completer is not None:
             self.completer.reset()
         if self.handsfree is not None:
@@ -1063,6 +1078,12 @@ class Engine(EngineActions):
         if "dashboard.enabled" in changed:
             self.set_dashboard_mode(bool(changed["dashboard.enabled"]))   # publishes the sync event
         # every other [dashboard] value is read live by the service on its next tick / refresh
+        if "context.dir" in changed:
+            # 2026-10-06: the library's manifest is opened once, at construction -- a new folder
+            # takes effect at the next launch (the Context tab marks the field restart=True).
+            log.info("[context].dir changed to %r; the document library moves at the next launch",
+                     changed["context.dir"])
+        # every other context.* value is read live by the ContextManager on its next build()
         self.save_config()
         log.info("settings applied: %s", ", ".join(sorted(changed)))
 
@@ -1439,6 +1460,130 @@ class Engine(EngineActions):
             except Exception:  # noqa: BLE001
                 log.exception("list_models failed")
         return list(self._models_cache)
+
+    # ---- context library (2026-10-06: the Models window's "Context" tab) ---------------------
+    def _context_digest_wanted(self) -> bool:
+        return bool(self.cfg.context.digest)
+
+    def _context_error(self, what: str, exc: BaseException) -> None:
+        """A library operation failed: tell the Context tab (the event) and the toast (the status)
+        -- never raise into the UI thread."""
+        message = str(exc) or type(exc).__name__
+        log.warning("context: %s failed: %s", what, message)
+        self.bus.publish(ContextLibraryEvent(reason=f"error: {message}"))
+        self._status("app", "error", f"context: {what} failed: {message}")
+
+    def _queue_digest(self, doc_id: str) -> None:
+        """Ask the Assistant (notes lane) to write the digest of `doc_id`. Before the assistant
+        exists nothing is lost: its `start()` drains `store.pending_digests()` itself."""
+        assistant = self.assistant
+        if assistant is None or not hasattr(assistant, "digest_document"):
+            return
+        try:
+            assistant.digest_document(doc_id)
+        except Exception:  # noqa: BLE001
+            log.exception("could not queue the digest of document %s", doc_id)
+
+    def context_documents(self) -> list[dict[str, object]]:
+        try:
+            tokens_for_len = self.context.estimator.tokens_for_len
+            rows: list[dict[str, object]] = []
+            for doc in self.context_store.documents():
+                row = doc.to_dict()
+                row["tokens"] = tokens_for_len(doc.chars)
+                rows.append(row)
+            return rows
+        except Exception:  # noqa: BLE001
+            log.exception("could not list the context documents")
+            return []
+
+    def add_context_document(self, path: str, *, mode: str | None = None) -> None:
+        name = str(path)
+        try:
+            # a path pasted from Explorer's "Copy as path" arrives quoted
+            file = Path(str(path).strip().strip('"').strip("'")).expanduser()
+            name = file.name or name
+            c = self.cfg.context
+            doc = self.context_store.add_file(
+                file, mode=mode or c.default_mode, max_chars=c.max_doc_chars,
+                digest_wanted=self._context_digest_wanted(),
+            )
+        except Exception as e:  # noqa: BLE001 - ContextError, OSError, a parser blowing up on a bad file
+            self._context_error(f"adding {name}", e)
+            return
+        self.bus.publish(ContextLibraryEvent(reason="added", doc_id=doc.id))
+        if doc.digest_state == "pending":
+            self._queue_digest(doc.id)
+
+    def add_context_text(self, name: str, text: str, *, mode: str | None = None) -> None:
+        label = (name or "").strip() or "Untitled"
+        try:
+            c = self.cfg.context
+            doc = self.context_store.add_text(
+                label, text, mode=mode or c.default_mode, max_chars=c.max_doc_chars,
+                digest_wanted=self._context_digest_wanted(),
+            )
+        except Exception as e:  # noqa: BLE001
+            self._context_error(f"adding {label}", e)
+            return
+        self.bus.publish(ContextLibraryEvent(reason="added", doc_id=doc.id))
+        if doc.digest_state == "pending":
+            self._queue_digest(doc.id)
+
+    def remove_context_document(self, doc_id: str) -> None:
+        try:
+            removed = self.context_store.remove(doc_id)
+        except Exception as e:  # noqa: BLE001
+            self._context_error("removing a document", e)
+            return
+        if not removed:
+            self._context_error("removing a document", ValueError("no such document"))
+            return
+        self.bus.publish(ContextLibraryEvent(reason="removed", doc_id=doc_id))
+
+    def set_context_document(self, doc_id: str, *, enabled: bool | None = None, mode: str | None = None) -> None:
+        try:
+            if self.context_store.get(doc_id) is None:
+                raise ValueError("no such document")
+            if mode is not None and mode not in ("inject", "reference"):
+                raise ValueError(f"unknown mode {mode!r} (expected 'inject' or 'reference')")
+            if enabled is not None:
+                self.context_store.set_enabled(doc_id, bool(enabled))
+            if mode is not None:
+                self.context_store.set_mode(doc_id, mode, digest_wanted=self._context_digest_wanted())
+            doc = self.context_store.get(doc_id)
+        except Exception as e:  # noqa: BLE001
+            self._context_error("updating a document", e)
+            return
+        self.bus.publish(ContextLibraryEvent(reason="updated", doc_id=doc_id))
+        # Switching TO reference with no digest yet leaves the document "pending" (the catalogue
+        # shows its first line meanwhile) and queues the model-written digest.
+        if mode == "reference" and doc is not None and doc.digest_state == "pending":
+            self._queue_digest(doc_id)
+
+    def refresh_context_digest(self, doc_id: str) -> None:
+        try:
+            doc = self.context_store.get(doc_id)
+            if doc is None:
+                raise ValueError("no such document")
+            if doc.mode != "reference":
+                # An injected document goes into the prompt in full: it has no catalogue line.
+                self._status("app", "info", f"context: {doc.name} is injected in full and has no digest")
+                self.bus.publish(ContextLibraryEvent(reason="digest-skipped", doc_id=doc_id))
+                return
+            self.context_store.mark_digest_pending(doc_id)
+        except Exception as e:  # noqa: BLE001
+            self._context_error("refreshing a digest", e)
+            return
+        self.bus.publish(ContextLibraryEvent(reason="digest-queued", doc_id=doc_id))
+        self._queue_digest(doc_id)
+
+    def context_usage(self) -> dict[str, object]:
+        try:
+            return self.context.usage_snapshot()
+        except Exception:  # noqa: BLE001
+            log.exception("could not read the context usage")
+            return {}
 
     def quit(self) -> None:
         if self._on_quit:

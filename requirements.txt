@@ -30,3 +30,4 @@ winrt-Windows.Storage.Streams==3.2.1
 pytest>=8
 comtypes>=1.4          # UI Automation / MSAA (caret tracking for completion mode)
 openvino==2026.4.0     # RapidOCR on the Intel iGPU / NPU (exocortex/screen/ocr.py); optional at runtime
+pypdf>=5            # PDF text extraction for uploaded reference documents (exocortex/context.py); pure Python

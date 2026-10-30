@@ -687,7 +687,7 @@ rather than a `Ctrl+Alt+…` combination, so it keeps working while your hands a
 ### Models: the library and the Models window
 
 **`⋯ › Models…`** (or `Context ▾ › Models…` in the slim bar) opens a tabbed model manager —
-**Library**, **Discover**, **Tuning**, **Server**, **Hardware** — that replaces LM Studio's own UI
+**Library**, **Discover**, **Tuning**, **Server**, **Context**, **Hardware** — that replaces LM Studio's own UI
 for everything this app needs: what model is loaded, what else is on disk, and how each one is
 tuned. Opened automatically, on **Discover**, the first time the library holds nothing at all
 (the app publishes an "empty-library" event and the overlay reacts to it).
@@ -777,6 +777,83 @@ else. While a menu or a drop-down is open the overlay leaves the window stacking
 list stays up until you pick something or click away.
 
 ![settings](docs/screenshots/settings.png)
+
+### Context: reference documents and the context window
+
+**`⋯ › Models… › Context`** (also `⋯ › Context documents…`, or `Context ▾ › Context documents…` in
+the slim bar) is where you hand the model background material and where you watch, and tune, how
+every prompt is filled. Added 2026-10-06 for presentation Q&A: load the README, the design and
+architecture docs for the thing you are presenting, and the answers to the audience's questions
+draw on them.
+
+![models: context](docs/screenshots/models_context.png)
+
+- **Documents.** **Add files…** (`.md`, `.txt`, `.rst`, code, `.html`, `.docx`, `.pptx`, `.pdf`;
+  the text is extracted on the way in and a copy is kept under `models/context/`, so the original
+  can move) or **Add text…** (paste). Each document has an **On** switch and a **Mode**:
+  - **inject** puts the document's text into every prompt, in a stable `<reference>` block at the
+    very start of the user turn, so llama.cpp's prefix cache keeps it evaluated once. Best for a
+    short README or a one-page architecture summary that every answer should know.
+  - **reference** (the default) keeps the document *out* of the prompt. It is pre-processed once,
+    on the notes lane (never delaying an answer): the model writes a 2-4 line **digest** of what the
+    document is and covers, and the app indexes the document's passages locally (BM25, no model
+    call). Every prompt then carries only the digest in a one-line catalogue ("Reference documents
+    available: …"), and the passages that actually match the question at hand (and, with a lower
+    weight, the most recent speech) are pulled into a `<lookup>` block for that one answer, only
+    when they match. Best for long design docs, where only the relevant section should ever
+    cost prompt tokens.
+  **Re-digest** regenerates a digest; **Remove** deletes the copy. Documents persist across
+  sessions (a new session never touches them) and can be switched on, off or between modes at any
+  moment; the next answer sees the change.
+- **How the documents are weighted.** The model is told, in every system prompt, that the
+  `<transcript>` is what actually happened and that its *last* lines, the most recent speech,
+  matter most; that an `<earlier>` block is a summary of this same meeting's earlier part; and that
+  `<reference>` and `<lookup>` are background material for reference only: to be used for facts,
+  names, numbers and details when the conversation calls for them, never to override or redirect
+  what was just said, never to be answered about unprompted. The prompt's own order says the same
+  thing: documents first (stable, far from the question), transcript next, screen text, then the
+  passages pulled for this question, then the question itself.
+- **The window.** Every prompt is now sized to the server's *real* per-request context
+  (llama-server's `/props`, else `[llm].ctx_size`): the system prompt, the documents, the
+  transcript, the screen text and the answer budget must all fit, and what does not fit is trimmed
+  in a fixed order: the per-question passages first, then the injected documents, then the earlier
+  summary, then the screen text, then the *oldest* transcript lines. The newest speech
+  (`transcript_min_tokens`) and the question are never trimmed. Before this, the prompt was never
+  sized at all: on a laptop whose auto-tuned profile pins the context to 4096 tokens, a long
+  meeting's prompt (2500 tokens of transcript + a 500-token system prompt + screen text + the
+  answer) simply exceeded it. Measured 2026-10-06: llama-server answers such a request with HTTP
+  400 (`exceeds the available context size`), and one that fits but leaves no room for the answer
+  with a *silently truncated* answer: the "quality degrades in long sessions" effect.
+- **A prefix that stays put.** The transcript window used to slide one line at a time once the
+  meeting outgrew it, and from then on every single answer re-evaluated the whole prompt
+  (measured: 2129 prompt tokens, 0 cached, 1.3 s before the first token on a GPU model; ~14 s on
+  the CPU-bound ternary model, every turn: the "slower and slower" effect). Now the window
+  *anchors*: it only advances when it has to, and then by at least `trim_step` (25 %) at once, so
+  the next many turns reuse the cache again (measured: 96 prompt tokens, 2030 cached, 0.19 s).
+  What falls out of the window is not lost: the model folds it into a short running `<earlier>`
+  summary (`compaction = "summary"`, on the notes lane, bounded to `summary_tokens`), installed
+  into the prompt only when the anchor next moves, which is the one moment the prefix changes
+  anyway. Summaries and document digests are background work: they step aside for a live answer
+  (measured: one streaming beside an answer had pushed its first token from 0.3 s to 4.9 s) and
+  pick up again when the answer is done.
+- **It calibrates itself.** Every budget starts from `chars_per_token` (3.6) and is corrected
+  from the server's own prompt-token counts after every answer; a request the server still
+  rejects as too long shrinks the estimate and is retried once. The panel at the top of the tab
+  shows the live picture: the server's context per request, what the last answer used (transcript
+  / reference / lookup / earlier / screen), what the server counted and how much of it was cached,
+  and whether anything had to be trimmed.
+- **Settings** (the form at the bottom of the tab, all live except the library folder, which
+  moves at the next launch; `[context]` in `config.toml`):
+  the default mode for new documents, which jobs see the documents (`all`, spoken/typed/on-screen
+  `questions` only, or `none`), the token budgets of the reference and lookup blocks, how many
+  passages and how good a match they need, the digest on/off, `budget_mode` (`auto`, or `fixed`
+  for no fitting: the transcript gets `context_tokens` as before, while the window still anchors
+  and the documents still apply), the reserve, the transcript floor, `trim_step`,
+  the compaction mode and summary size, the starting `chars_per_token` and whether it
+  auto-calibrates, and `lane_share`: with `[llm].parallel = 2` the two server slots share one KV
+  pool, so this share of it is kept for the notes lane (notes, summaries, digests) and answers get
+  the rest. The old `[llm].context_tokens` still caps the transcript; `auto` sizing only ever
+  lowers it.
 
 ## Configuration
 
@@ -897,6 +974,20 @@ typed_fraction = 0.9        # share of the solution's code lines seen on screen 
 loopback_keepalive = true   # keeps WASAPI loopback flowing while nothing is playing
 echo_suppression = true
 
+[context]
+# 2026-10-06: reference documents + the dynamic context window (Models > Context). Defaults shown;
+# config.example.toml documents every key.
+default_mode = "reference"  # inject (the text in every prompt) | reference (digest + matching passages only)
+include_in = "all"          # all | questions (spoken / typed / on-screen questions only) | none
+reference_tokens = 1200     # the stable <reference> block (injected documents + the catalogue)
+lookup_tokens = 600         # the per-question <lookup> passages (trimmed first when space is short)
+budget_mode = "auto"        # auto = size every prompt to the server's real per-request context | fixed = the old behaviour
+transcript_min_tokens = 600 # the newest speech always keeps at least this much
+trim_step = 0.25            # advance the transcript window in steps (prefix cache), 0 = slide like before
+compaction = "summary"      # fold what fell out of the window into a running <earlier> summary | off
+lane_share = 0.3            # with parallel = 2 the slots share one KV pool: this share is kept for the notes lane
+chars_per_token = 3.6       # starting estimate, calibrated live from the server's own counts
+
 [ui]
 hide_from_capture = true
 hide_when_exposed = true   # see the capture note under "Limitations & honesty notes"
@@ -1006,7 +1097,10 @@ llama-server tests.
   speaker). Two remote voices that sound alike may merge.
 - WASAPI loopback stops delivering audio while nothing plays; the keep-alive tone (−80 dBFS, inaudible)
   works around it. Some exclusive-mode audio apps can starve loopback capture entirely.
-- Long prompts are CPU-bound with the ternary model; keep `context_tokens` moderate (default 2500).
+- Long prompts are CPU-bound with the ternary model; keep `context_tokens` moderate (default 2500). Since
+  2026-10-06 every prompt is also sized to the server's real per-request context and the transcript window
+  keeps a stable prefix (see "Context: reference documents and the context window"), so a long meeting no
+  longer overflows the context or re-evaluates the whole prompt on every answer.
 - **OpenVINO's GPU plugin crashes on AMD hardware.** Measured on a Radeon 8060S (RDNA 3.5,
   gfx1151): compiling RapidOCR's models through OpenVINO's `GPU` device hard-crashes the
   interpreter (`STATUS_STACK_BUFFER_OVERRUN`) inside the plugin's kernel compiler — it emits

@@ -59,6 +59,8 @@ from exocortex.bus import (
     CompletionEvent,
     CompletionModeEvent,
     ComponentStatusEvent,
+    ContextLibraryEvent,
+    ContextUsageEvent,
     DashboardModeEvent,
     DashboardUpdatedEvent,
     Event,
@@ -958,6 +960,8 @@ class OverlayWindow(QWidget):
         menu.addSeparator()
         menu.addAction("Settings…").triggered.connect(self.open_settings)
         menu.addAction("Models…").triggered.connect(lambda: self.open_models())
+        # 2026-10-06: the reference-document library lives on the Models window's Context tab.
+        menu.addAction("Context documents…").triggered.connect(lambda: self.open_models("Context"))
 
     # ---------------------------------------------------------------- settings ---------
     def open_settings(self, tab: str | None = None) -> None:
@@ -980,7 +984,7 @@ class OverlayWindow(QWidget):
 
     def open_models(self, tab: str | None = None) -> None:
         """Show the (non-modal) Models window, reusing it if it is already open. ``tab`` jumps
-        straight to one of its tabs (Library / Discover / Tuning / Server / Hardware)."""
+        straight to one of its tabs (Library / Discover / Tuning / Server / Context / Hardware)."""
         if ModelsDialog is None:
             self.show_toast("Models window unavailable")
             return
@@ -1905,6 +1909,8 @@ class OverlayWindow(QWidget):
         settings_action.triggered.connect(self.open_settings)
         models_action = self._menu.addAction("Models…")
         models_action.triggered.connect(lambda: self.open_models())
+        context_action = self._menu.addAction("Context documents…")   # 2026-10-06: the Context tab
+        context_action.triggered.connect(lambda: self.open_models("Context"))
         self._menu.addSeparator()
 
         rename_menu = self._menu.addMenu("Rename speakers...")
@@ -2660,7 +2666,11 @@ class OverlayWindow(QWidget):
                 self._set_manual(ev.enabled, notify_engine=False)
         elif isinstance(ev, ModelLibraryEvent):
             self._on_model_library_event(ev)
-        elif isinstance(ev, (ModelPullEvent, ModelSearchEvent, ModelInfoEvent)):
+        elif isinstance(ev, (ModelPullEvent, ModelSearchEvent, ModelInfoEvent,
+                             ContextLibraryEvent, ContextUsageEvent)):
+            # 2026-10-06: the Context tab re-reads the library on ContextLibraryEvent and renders
+            # the usage panel from ContextUsageEvent; like the model events, they only matter
+            # while the Models window exists.
             self._forward_to_models_dialog(ev)
         else:
             log.debug("overlay: unhandled event type %s", type(ev).__name__)

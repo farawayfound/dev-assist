@@ -13,7 +13,13 @@ prompt builder here is written to keep the *stable* parts first and the *volatil
 llama.cpp's KV prefix cache can reuse work across turns:
 
     1. system prompt        -- identical for every turn of a given (persona, style) pair
+    1b. <reference>/<earlier> (2026-10-06) -- the uploaded context library and the running summary
+                               of transcript that fell out of the window; they change only when the
+                               library changes / the window's anchor advances, so they sit in front
+                               of the transcript
     2. transcript window    -- only ever grows by appending new lines at the end
+    2b. <lookup> (2026-10-06) -- passages retrieved for THIS question; volatile, so it goes after
+                               the screen block
     3. the short instruction + the question itself -- changes every turn, so it goes last
 
 Within `render_chatml`, this means: system message first (most stable), user message built as
@@ -78,6 +84,7 @@ def system_assist(persona: str, style: str, context: str = "") -> str:
         "and your own knowledge don't give you a real answer, say \"I'd need to check\" rather "
         "than guessing or making something up.",
         _SCREEN_RULE,
+        _REFERENCE_RULE,
         _FOCUS_RULE,
         _CHOICE_RULE,
     ]
@@ -104,6 +111,24 @@ _FOCUS_RULE = (
     "(\"Have you seen this in an interview before?\"), feedback or rating prompts, sign-up / "
     "premium / cookie banners, navigation, social prompts and small talk. Never answer those, "
     "never mention them."
+)
+
+#: 2026-10-06 (context library): how the model ranks what it is given. ONE constant, reused
+#: verbatim by every system builder (assist, ask, suggest, solve, code, text), and gated by its
+#: wording ("If a <reference> block is present ...") exactly like `_CHOICE_RULE`, so the system
+#: prompt is byte-identical across turns for a fixed config whether or not a document is loaded --
+#: a system prompt that toggled per turn would defeat the KV prefix cache. The ranking: the
+#: <transcript> is what actually happened (its LAST lines, the most recent speech, matter most);
+#: <earlier> is a summary of this meeting's older part; <reference> and <lookup> are background
+#: material the user uploaded, for reference only.
+_REFERENCE_RULE = (
+    "Ranking of what you are given: the <transcript> is what actually happened in this meeting, and "
+    "its LAST lines (the most recent speech) matter most. If an <earlier> block is present, it is a "
+    "summary of the earlier part of this same meeting, older than the transcript. If a <reference> "
+    "or <lookup> block is present, it is background material the user uploaded, for reference only: "
+    "use it to fill in facts, names, numbers and details when the conversation calls for them, but "
+    "never let it override or redirect what was just said, never answer about it unprompted, and "
+    "never mention that it was provided."
 )
 
 #: Exact reply the model gives when there is nothing technical to do; callers drop such answers.
@@ -170,6 +195,32 @@ def _extra_block(extra: str) -> str:
     return f"{text}\n\n" if text else ""
 
 
+def context_blocks(reference: str = "", earlier: str = "") -> str:
+    """2026-10-06 (context library): the STABLE context blocks that sit in front of <transcript>.
+
+    `reference` is the rendered library text (injected documents in full plus the catalogue of
+    reference-mode ones; changes only when the library changes), `earlier` the running summary of
+    transcript that fell out of the window (changes only when the window's anchor advances -- the
+    same moment the prefix changes anyway). Each is stripped and left out entirely when blank, so
+    "" for both returns "" and the user turn is byte-identical to one built without a library.
+    Order: <reference> first (most stable), then <earlier>.
+    """
+    parts: list[str] = []
+    for tag, text in (("reference", reference), ("earlier", earlier)):
+        body = (text or "").strip()
+        if body:
+            parts.append(f"<{tag}>\n{body}\n</{tag}>\n\n")
+    return "".join(parts)
+
+
+def lookup_block(lookup: str = "") -> str:
+    """2026-10-06 (context library): the VOLATILE <lookup> block -- passages retrieved from the
+    reference-mode documents for THIS question -- placed after the screen block, so nothing
+    stable ever follows something that changes per turn. "" when blank."""
+    body = (lookup or "").strip()
+    return f"<lookup>\n{body}\n</lookup>\n\n" if body else ""
+
+
 def system_ask(persona: str, context: str = "") -> str:
     """System prompt for a question the USER typed directly to the co-pilot (the ask box).
 
@@ -189,6 +240,7 @@ def system_ask(persona: str, context: str = "") -> str:
         "and your own knowledge don't give you a real answer, say \"I'd need to check\" rather "
         "than guessing or making something up.",
         _SCREEN_RULE,
+        _REFERENCE_RULE,
         _CHOICE_RULE,
         "Answer in 2 to 5 tight bullet points or, if a single short sentence fully answers it, "
         "just that sentence.",
@@ -212,6 +264,7 @@ def system_suggest(persona: str, context: str = "") -> str:
         "\"Complete: \" followed only by the text that should be typed next.",
         "If nothing useful can be added, output exactly \"- (nothing to add)\". No preamble, no "
         "headers, never mention being an AI or a co-pilot. OCR text can be garbled: ignore noise.",
+        _REFERENCE_RULE,
         _FOCUS_RULE,
     ]
     lines.extend(_context_lines(context))
@@ -473,6 +526,7 @@ def system_solve(persona: str, explain: bool = False, comments: str = "normal", 
         "use this to avoid solving something you can solve.",
         "No preamble, no \"Sure\" or \"Here is\", no markdown headers, never mention being an AI, a "
         "model, or a co-pilot. OCR text can be garbled: infer the intent and ignore obvious noise.",
+        _REFERENCE_RULE,
         _FOCUS_RULE,
         _CHOICE_RULE_SOLVE,
         f"If the screen shows no technical task to solve, output exactly \"{SKIP_MARKER}\" and nothing else.",
@@ -483,23 +537,29 @@ def system_solve(persona: str, explain: bool = False, comments: str = "normal", 
     return "\n".join(lines)
 
 
-def user_solve(transcript_window: str, screen_text: str, focus: str = "", choices: str = "", extra: str = "") -> str:
+def user_solve(transcript_window: str, screen_text: str, focus: str = "", choices: str = "", extra: str = "", *,
+               reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_solve`: transcript (stable) then screen (volatile) then the ask.
 
     `focus` carries a direction the user picked from a previous `CHOICE_PREFIX` prompt (or a
     manual instruction); blank means "solve whatever is on screen". `choices` is the rendered
     <choices> block (`exocortex.llm.choices.choices_block`) when the screen shows a
     multiple-choice question, else ""; it sits after the screen text, right before the ask.
-    `extra` (on-demand context: `_extra_block`) goes between the screen and the choices.
+    `extra` (on-demand context: `_extra_block`) goes after the lookup block, right before the choices.
+
+    2026-10-06 (context library): `reference` / `earlier` (`context_blocks`) go BEFORE the
+    transcript, `lookup` (`lookup_block`) after the screen and before `choices`; all three ""
+    renders byte-for-byte what this builder rendered before they existed.
     """
     ask = focus.strip() or (
         "Solve whatever task, problem, or question is shown on the screen above. "
         "Output the finished solution now."
     )
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{_extra_block(extra)}{choices}{ask}"
+        f"{lookup_block(lookup)}{_extra_block(extra)}{choices}{ask}"
     )
 
 
@@ -531,6 +591,7 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
         _library_rule(libraries),
         "No preamble, no \"Sure\" or \"Here is\", no markdown headers, never mention being an AI, a "
         "model, or a co-pilot. OCR text can be garbled: infer the intent and ignore obvious noise.",
+        _REFERENCE_RULE,
         _FOCUS_RULE,
         f"If there is genuinely no coding task to write, output exactly \"{SKIP_MARKER}\" and nothing else.",
     ]
@@ -540,7 +601,8 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
     return "\n".join(lines)
 
 
-def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "") -> str:
+def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
+              reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_code`: transcript (stable) -> previous code (only when present) ->
     screen (volatile) -> on-demand context (`extra`, only when present) -> the ask.
 
@@ -550,6 +612,9 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
     that answer is a plan -- see `exocortex.plan.split_plan`), and is left out of the prompt
     entirely when blank, which is most turns for a brand new task. `focus` is an optional extra
     instruction; blank falls back to the default ask below.
+
+    2026-10-06 (context library): `reference` / `earlier` go before <transcript>, `lookup` after
+    <screen> (see `context_blocks` / `lookup_block`); all "" is byte-identical to the old output.
     """
     ask = focus.strip() or (
         "Write the code for the coding task described in the transcript above and/or shown on the "
@@ -558,10 +623,11 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
     )
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{_extra_block(extra)}{ask}"
+        f"{lookup_block(lookup)}{_extra_block(extra)}{ask}"
     )
 
 
@@ -602,6 +668,7 @@ def system_text(persona: str, context: str = "") -> str:
         "make the most reasonable assumption and say so in at most one short line.",
         "No preamble, no \"Sure\" or \"Here is\", no markdown headers, never mention being an AI, a "
         "model, or a co-pilot. OCR text can be garbled: infer the intent and ignore obvious noise.",
+        _REFERENCE_RULE,
         _FOCUS_RULE,
         f"If there is genuinely no task or question to walk through, output exactly \"{SKIP_MARKER}\" and nothing else.",
     ]
@@ -611,11 +678,12 @@ def system_text(persona: str, context: str = "") -> str:
     return "\n".join(lines)
 
 
-def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "") -> str:
+def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
+              reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_text`: the same checkpoint-scoped transcript -> previous code (only
     when present) -> screen -> on-demand context -> ask layout as `user_code`, with the ask asking
     for the walkthrough. `focus` is an optional extra instruction; blank falls back to the default
-    ask below."""
+    ask below. 2026-10-06: `reference` / `earlier` / `lookup` as in `user_code`."""
     ask = focus.strip() or (
         "Walk me through, in plain English, the task or question described in the transcript above "
         "and/or shown on the screen: what is asked, the key insight, the approach step by step, the "
@@ -624,10 +692,11 @@ def user_text(transcript_window: str, screen_text: str, previous: str = "", focu
     )
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{_extra_block(extra)}{ask}"
+        f"{lookup_block(lookup)}{_extra_block(extra)}{ask}"
     )
 
 
@@ -725,7 +794,10 @@ def system_complete(
         "Use the <context> (the meeting transcript, prior answers, notes, what is on screen) to make "
         "the continuation specific and correct: reuse the real names, numbers, decisions and code "
         "it contains. <field> describes where the user is typing (its label/placeholder and the "
-        "text after the cursor); the continuation must fit before that text.",
+        "text after the cursor); the continuation must fit before that text. Any <reference> or "
+        "<earlier> block inside the <context> is background material (uploaded documents, a summary "
+        "of the earlier meeting) that ranks below the meeting transcript: use it for facts and details "
+        "only when the typed text calls for them, never to redirect what is being typed.",
         "If the typed text already ends at a natural end and nothing useful can be added, output "
         "nothing.",
         "The <context> may contain website chrome, polls, surveys or ads that OCR picked up; they "
@@ -851,13 +923,18 @@ def _strip_echo(prefix: str, text: str) -> str:
     return text
 
 
-def user_suggest(transcript_window: str, screen_text: str, focus: str = "") -> str:
-    """User turn for `system_suggest`: transcript (stable) then screen (volatile) then the ask."""
+def user_suggest(transcript_window: str, screen_text: str, focus: str = "", *,
+                 reference: str = "", earlier: str = "", lookup: str = "") -> str:
+    """User turn for `system_suggest`: transcript (stable) then screen (volatile) then the ask.
+
+    2026-10-06 (context library): `reference` / `earlier` before <transcript>, `lookup` after
+    <screen>; all "" is byte-identical to the old output."""
     ask = focus.strip() or "What should I say or do next? Keep it to the most useful 1-3 points."
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{ask}"
+        f"{lookup_block(lookup)}{ask}"
     )
 
 
@@ -1000,19 +1077,21 @@ _INSIGHT_ASK_NAMES: dict[str, str] = {
 
 
 def user_insights(
-    transcript_window: str, screen_text: str, previous: str = "", sections: object = INSIGHT_SECTIONS,
+    transcript_window: str, screen_text: str, previous: str = "", sections: object = INSIGHT_SECTIONS, *,
+    reference: str = "", earlier: str = "", lookup: str = "",
 ) -> str:
     """User turn for `system_insights`: transcript (stable) -> the current list (only when there is
     one: `render_insights` of the sections being refreshed) -> screen (volatile) -> the ask -- the
-    same layout as `user_code`."""
+    same layout as `user_code`, including its `reference` / `earlier` / `lookup` placement."""
     secs = normalize_sections(sections) or INSIGHT_SECTIONS
     ask = f"Update {' and '.join(_INSIGHT_ASK_NAMES[s] for s in secs)} now, as instructed."
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if (previous or "").strip() else ""
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{previous_block}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
-        f"{ask}"
+        f"{lookup_block(lookup)}{ask}"
     )
 
 
@@ -1129,17 +1208,21 @@ def system_recap(persona: str = "", context: str = "") -> str:
     return "\n".join(lines)
 
 
-def user_recap(transcript_window: str, notes: str = "", screen_text: str = "", focus: str = "", extra: str = "") -> str:
+def user_recap(transcript_window: str, notes: str = "", screen_text: str = "", focus: str = "", extra: str = "", *,
+               reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_recap`: transcript (stable) -> running notes (only when there are
     any) -> screen (volatile, only when there is any) -> on-demand context (only when there is
-    any) -> the ask. `focus` is an optional extra instruction; blank falls back to the default ask."""
+    any) -> the ask. `focus` is an optional extra instruction; blank falls back to the default ask.
+    `reference` / `earlier` / `lookup` as in `user_code` (the earlier summary is what a recap of
+    a long session knows about the part that left the transcript window)."""
     ask = focus.strip() or "Recap the session now, as instructed."
     notes_block = f"<notes>\n{notes.strip()}\n</notes>\n\n" if (notes or "").strip() else ""
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window.strip() or '(no speech yet)'}\n</transcript>\n\n"
         f"{notes_block}"
         f"{_screen_block(screen_text)}"
-        f"{_extra_block(extra)}{ask}"
+        f"{lookup_block(lookup)}{_extra_block(extra)}{ask}"
     )
 
 
@@ -1250,7 +1333,8 @@ def _notes_body(*, tracked: bool = False) -> str:
     )
 
 
-def user_assist(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "") -> str:
+def user_assist(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "", *,
+                reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_assist`: transcript context, optional screen text, then the question.
 
     STABLE-PREFIX ORDER: `transcript_window` only ever grows by appending new lines at its end, so
@@ -1260,42 +1344,147 @@ def user_assist(transcript_window: str, question: str, screen_text: str = "", ch
     The <screen> block changes often, so it goes AFTER the transcript and before the question;
     `extra` (on-demand context, `_extra_block`) and `choices` (the rendered <choices> block of a
     multiple-choice question, else "") follow it.
+
+    2026-10-06 (context library): `reference` / `earlier` (`context_blocks`) come BEFORE the
+    transcript -- they only change when the library changes / the window's anchor advances, so
+    they keep the prefix stable -- and `lookup` (`lookup_block`, passages retrieved for this very
+    question) comes after the screen block, before `extra` and `choices`. All three "" is
+    byte-identical to the old output.
     """
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window}\n</transcript>\n\n"
-        f"{_screen_block(screen_text)}{_extra_block(extra)}{choices}"
+        f"{_screen_block(screen_text)}{lookup_block(lookup)}{_extra_block(extra)}{choices}"
         "The other participant just asked the question below. Answer it as instructed in the "
         "system prompt.\n"
         f"<question>\n{question}\n</question>"
     )
 
 
-def user_ask(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "") -> str:
+def user_ask(transcript_window: str, question: str, screen_text: str = "", choices: str = "", extra: str = "", *,
+             reference: str = "", earlier: str = "", lookup: str = "") -> str:
     """User turn for `system_ask`: transcript context, optional screen text, then the question.
 
-    Same stable-prefix ordering as `user_assist` -- see module docstring.
+    Same stable-prefix ordering as `user_assist` -- see module docstring, including the
+    2026-10-06 `reference` / `earlier` / `lookup` placement.
     """
     return (
+        f"{context_blocks(reference, earlier)}"
         f"<transcript>\n{transcript_window}\n</transcript>\n\n"
-        f"{_screen_block(screen_text)}{_extra_block(extra)}{choices}"
+        f"{_screen_block(screen_text)}{lookup_block(lookup)}{_extra_block(extra)}{choices}"
         "Answer the question below, using the transcript above (and the screen text, if any) for "
         "context where it's relevant.\n"
         f"<question>\n{question}\n</question>"
     )
 
 
-def user_notes(previous_notes: str, new_transcript: str) -> str:
-    """User turn for `system_notes`: previous notes (stable-ish) then the new transcript to merge."""
+def user_notes(previous_notes: str, new_transcript: str, max_words: int | None = None) -> str:
+    """User turn for `system_notes`: previous notes (stable-ish) then the new transcript to merge.
+
+    2026-10-06 (context window): `max_words`, when given, adds a one-sentence length limit for the
+    WHOLE document -- the Assistant passes it when the server's context leaves the notes lane less
+    room than `[llm].notes_max_tokens` would need (a 4096-token profile shared with a live answer),
+    so the notes stay a complete five-heading document, just a compact one. None (the default)
+    renders exactly what this builder rendered before the parameter existed.
+    """
     prev = previous_notes.strip() or "(none yet -- this is the first notes pass)"
+    limit = f" Keep the whole document under {max(1, int(max_words))} words." if max_words else ""
     return (
         f"<previous_notes>\n{prev}\n</previous_notes>\n\n"
         f"<new_transcript>\n{new_transcript}\n</new_transcript>\n\n"
         "Update the notes: keep everything from <previous_notes> that is still true, merge in "
         "whatever <new_transcript> adds, and follow the heading and formatting rules from the "
-        "system prompt exactly."
+        f"system prompt exactly.{limit}"
     )
+
+
+_THINK_SPAN_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+
+
+def strip_think(text: str) -> str:
+    """`text` without the model's reasoning residue (2026-10-06, measured live on gemma-4-E4B-it
+    under the no-think prefix: the model still writes a draft, then a lone ``</think>``, then the
+    answer -- and a digest / summary stored verbatim would carry that tag into every later
+    prompt). ``<think>...</think>`` spans go; with a lone ``</think>`` the text AFTER the last one
+    is the answer, unless that is blank (the model put the whole answer before the tag), in which
+    case the text before it is kept. Whitespace-trimmed; "" stays ""."""
+    if not text:
+        return ""
+    out = _THINK_SPAN_RE.sub("", text)
+    if "</think>" in out:
+        head, _, tail = out.rpartition("</think>")
+        out = tail if tail.strip() else head
+    return out.replace("<think>", "").strip()
 
 
 def approx_tokens(text: str) -> int:
     """Rough token estimate (~4 chars/token) used for trimming transcript windows to a budget."""
     return len(text) // 4 + 1
+
+
+#: 2026-10-06 (context library): rough words per token, used to turn a token budget
+#: (`[context].summary_tokens`) into the word limit the compaction prompt states.
+SUMMARY_WORDS_PER_TOKEN = 0.75
+
+
+def words_for_tokens(tokens: int) -> int:
+    """A token budget as the word limit to put in a prompt (`SUMMARY_WORDS_PER_TOKEN`), >= 1."""
+    return max(1, int(tokens * SUMMARY_WORDS_PER_TOKEN))
+
+
+def system_compact() -> str:
+    """System prompt for folding transcript that fell out of the window into one running summary.
+
+    2026-10-06 (context library): the summary becomes the <earlier> block of later prompts, so it
+    must keep what a later answer could need (names, numbers, decisions, open questions) and
+    must never invent. The word limit is stated in the user turn (`user_compact`), keeping this
+    prompt constant.
+    """
+    return (
+        "You maintain a running summary of the EARLIER part of a live meeting, for a co-pilot that "
+        "can no longer see that part of the transcript. You are given the previous summary (if any) "
+        "and the newly dropped stretch of transcript. Fold the new stretch into the summary: keep "
+        "every still-relevant fact from the previous summary, add what the new stretch contributes, "
+        "and drop only what is clearly superseded or corrected.\n"
+        "Keep names, numbers, dates, decisions, commitments and open questions exactly as spoken; "
+        "say who said what when it matters. Write plain prose or short lines starting with \"- \". "
+        "Never invent anything that is not in the material, never address the reader, never comment "
+        "on the summary or on your own process, and respect the word limit given in the request.\n"
+        "Output only the summary itself, nothing before or after it."
+    )
+
+
+def user_compact(previous_summary: str, dropped_transcript: str, max_words: int) -> str:
+    """User turn for `system_compact`: previous summary (stable), the dropped lines, the limit."""
+    prev = (previous_summary or "").strip() or "(none yet -- this is the first summary)"
+    return (
+        f"<previous_summary>\n{prev}\n</previous_summary>\n\n"
+        f"<dropped_transcript>\n{(dropped_transcript or '').strip()}\n</dropped_transcript>\n\n"
+        "Update the summary: fold <dropped_transcript> into <previous_summary> as instructed. "
+        f"Write at most {max(1, int(max_words))} words in total. Output only the summary."
+    )
+
+
+def system_digest() -> str:
+    """System prompt for the one-off digest of an uploaded document (reference mode).
+
+    2026-10-06 (context library): the digest is what the co-pilot sees in the reference catalogue
+    instead of the document, so it has to say what the document is and what it covers well enough
+    for a reader to know when to consult it.
+    """
+    return (
+        "You write the catalogue entry for a document the user uploaded. Read the excerpt and say, "
+        "in 2 to 4 short lines of plain text, what the document is (its kind and purpose) and what "
+        "it covers: the main topics, systems or components, and key names. Be specific, so that a "
+        "reader who has not seen it knows when it would help to consult it. No preamble, no markdown "
+        "headers, never quote long passages, never invent anything the excerpt does not show.\n"
+        "Output only the entry itself, nothing before or after it."
+    )
+
+
+def user_digest(name: str, excerpt: str) -> str:
+    """User turn for `system_digest`: the document's name and the leading excerpt of its text."""
+    return (
+        f"<document name=\"{(name or '').strip() or 'untitled'}\">\n{(excerpt or '').strip()}\n</document>\n\n"
+        "Write the 2 to 4 line catalogue entry for this document as instructed."
+    )

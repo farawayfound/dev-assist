@@ -335,8 +335,17 @@ def _check_llm_llamacpp(r: _Report, cfg: Config) -> None:
         vendor = "none"
 
     try:
+        # The runtime settings the app itself starts llama-server with -- [llm].llama_source /
+        # llama_upstream_build / runtime_dir, as in exocortex.llm.route and hardware.py's probe --
+        # and still offline (no `ensure`: nothing is downloaded). Without them this section named,
+        # and ran --list-devices against, an LM Studio pack the app never starts once llama_source
+        # is "upstream", reporting a working setup as a GPU-less one.
+        find_kwargs: dict = {"vendor": vendor, "backend": cfg.llm.llama_backend, "source": cfg.llm.llama_source,
+                             "upstream_build": cfg.llm.llama_upstream_build}
+        if cfg.llm.runtime_dir:
+            find_kwargs["upstream_root"] = Path(cfg.llm.runtime_dir).expanduser()
         try:
-            b = llm_server.find_server_binary(cfg.llm.llama_server_path, vendor=vendor, backend=cfg.llm.llama_backend)
+            b = llm_server.find_server_binary(cfg.llm.llama_server_path, **find_kwargs)
         except TypeError:
             b = llm_server.find_server_binary(cfg.llm.llama_server_path)
         framework = getattr(b, "framework", None) or b.flavor

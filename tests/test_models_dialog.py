@@ -142,9 +142,9 @@ def _row(key: str, **overrides: object) -> dict[str, object]:
 
 
 # ============================================================================================ tabs
-def test_five_tabs_in_order(dialog: ModelsDialog) -> None:
-    assert ModelsDialog.TABS == ("Library", "Discover", "Tuning", "Server", "Hardware")
-    assert dialog.tabs.count() == 5
+def test_six_tabs_in_order(dialog: ModelsDialog) -> None:
+    assert ModelsDialog.TABS == ("Library", "Discover", "Tuning", "Server", "Context", "Hardware")
+    assert dialog.tabs.count() == 6
     for i, name in enumerate(ModelsDialog.TABS):
         assert dialog.tabs.tabText(i) == name
     for name in ModelsDialog.TABS:

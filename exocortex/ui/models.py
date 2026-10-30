@@ -1,5 +1,5 @@
 """Models dialog: the app's own GGUF library, Hugging Face discovery, per-model tuning, the
-global LLM server settings and a read-only hardware report.
+global LLM server settings, the context library and a read-only hardware report.
 
 Opened from the overlay's ``...`` menu ("Models...", right after "Settings...") and the slim
 bar's Context menu, replacing the old Settings dialog's "Model" tab and the "Choose model"
@@ -12,10 +12,20 @@ listens for ``ModelPullEvent`` / ``ModelLibraryEvent`` / ``ModelSearchEvent`` / 
 / ``ComponentStatusEvent("llm", ...)`` through :meth:`ModelsDialog.on_event`, which the overlay
 forwards. Every ``actions`` call is wrapped in try/except: a slow network, a missing backend or a
 test double whose methods return ``None`` must never crash this dialog.
+
+2026-10-06 (context library): a sixth tab, "Context", sits between Server and Hardware. It lists
+the reference documents the user uploaded (``actions.context_documents()``) with buttons to add
+files / pasted text, remove, enable or disable, switch a document between ``inject`` (its text in
+every prompt) and ``reference`` (digest + on-demand passages), re-generate a digest and open the
+library folder; a read-only panel shows how the last answer's prompt filled the server's context
+window (``actions.context_usage()`` on open, every ``ContextUsageEvent`` afterwards); and a
+``FieldForm`` over the whole ``[context]`` section applies like the Server tab does (``applied``
+carries only the changed ``context.*`` keys). ``ContextLibraryEvent`` re-reads the document list.
 """
 from __future__ import annotations
 
 import logging
+import math
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -27,11 +37,14 @@ from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDialog,
+    QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QProgressBar,
     QPushButton,
     QScrollArea,
@@ -44,6 +57,8 @@ from PySide6.QtWidgets import (
 
 from exocortex.bus import (
     ComponentStatusEvent,
+    ContextLibraryEvent,
+    ContextUsageEvent,
     ModelInfoEvent,
     ModelLibraryEvent,
     ModelPullEvent,
@@ -284,6 +299,93 @@ def _hardware_summary(report: dict[str, object]) -> str:
     return f"Models up to ~{budget / 1024:.0f} GB fit (0.75 x {int(vram_total)} MiB); policy: {policy}"
 
 
+def _as_int(value: object) -> int | None:
+    """``int(value)`` for a real number, ``None`` for anything else (None, "", junk, bool)."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return int(float(value))  # type: ignore[arg-type]
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _usage_dict(usage: object) -> dict[str, object]:
+    """Normalise whatever the usage panel is handed (a ``ContextUsageEvent``, the dict
+    ``actions.context_usage()`` returns, ``None`` before any job) into a plain dict.
+
+    An event's ``documents`` is the number of documents that contributed to THAT prompt, while the
+    snapshot's ``documents`` is how many are enabled (its contributing count is ``documents_used``);
+    the event is therefore normalised to the snapshot's ``documents_used`` spelling.
+    """
+    if isinstance(usage, dict):
+        return dict(usage)
+    if isinstance(usage, ContextUsageEvent):
+        out: dict[str, object] = {
+            name: getattr(usage, name)
+            for name in ("job_id", "kind", "slot_tokens", "budget_tokens", "used_tokens",
+                         "transcript_tokens", "reference_tokens", "lookup_tokens", "earlier_tokens",
+                         "screen_tokens", "system_tokens", "prompt_tokens", "cached_tokens",
+                         "trimmed", "anchor_moved", "chars_per_token")
+        }
+        out["documents_used"] = usage.documents
+        out["has_usage"] = True
+        return out
+    return {}
+
+
+def _format_usage(usage: object) -> str:
+    """The one-paragraph "how full was the context window" text of the Context tab.
+
+    Tolerant by design: ``None`` / ``{}`` (no answer yet) and dicts missing any key still render
+    something sensible instead of raising -- the panel is shown on open, before any job ran.
+    """
+    d = _usage_dict(usage)
+    sep = " \u00b7 "
+    parts: list[str] = []
+    slot = _as_int(d.get("slot_tokens"))
+    parts.append(f"Server context per request: {slot} tokens" if slot else "Server context per request: unknown")
+
+    kind = d.get("kind")
+    used = _as_int(d.get("used_tokens"))
+    answered = bool(d.get("has_usage", bool(kind) or bool(used))) and bool(kind or used)
+    if not answered:
+        parts.append("no answer yet")
+        docs = _as_int(d.get("documents"))
+        if docs is not None:
+            parts.append(f"{docs} enabled document{'s' if docs != 1 else ''}")
+    else:
+        head = f"last answer ({kind})" if kind else "last answer"
+        budget = _as_int(d.get("budget_tokens"))
+        if used is not None and budget:
+            head += f": used {used} of {budget} tokens"
+        elif used is not None:
+            head += f": used {used} tokens"
+        blocks = [
+            f"{label} {_as_int(d.get(key)) or 0}"
+            for label, key in (("transcript", "transcript_tokens"), ("reference", "reference_tokens"),
+                               ("lookup", "lookup_tokens"), ("earlier", "earlier_tokens"),
+                               ("screen", "screen_tokens"), ("system", "system_tokens"))
+        ]
+        parts.append(head + ": " + sep.join(blocks))
+        prompt = _as_int(d.get("prompt_tokens"))
+        if prompt is not None:
+            cached = _as_int(d.get("cached_tokens"))
+            parts.append(f"server counted {prompt}" + (f" ({cached} cached)" if cached is not None else ""))
+        parts.append("trimmed" if d.get("trimmed") else "ok")
+        if d.get("anchor_moved"):
+            parts.append("window advanced")
+        docs = _as_int(d.get("documents_used"))
+        if docs is not None:
+            parts.append(f"{docs} document{'s' if docs != 1 else ''}")
+    try:
+        cpt = float(d.get("chars_per_token") or 0.0)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        cpt = 0.0
+    if cpt > 0:
+        parts.append(f"{cpt:.2f} chars/token")
+    return sep.join(parts)
+
+
 def _status_color(state: str) -> str:
     if state in ("ready", "done"):
         return COLORS["ok"]
@@ -298,14 +400,14 @@ _PULL_ACTIVE_STATES = ("queued", "downloading", "verifying")
 
 
 class ModelsDialog(QDialog):
-    """Tabbed model manager: Library / Discover / Tuning / Server / Hardware.
+    """Tabbed model manager: Library / Discover / Tuning / Server / Context / Hardware.
 
     ``applied`` carries Server-tab changes as ``{"section.key": new_value}``, the same shape as
     ``SettingsDialog.applied``; the overlay routes it to ``actions.apply_settings`` exactly like
     the settings dialog does.
     """
 
-    TABS: tuple[str, ...] = ("Library", "Discover", "Tuning", "Server", "Hardware")
+    TABS: tuple[str, ...] = ("Library", "Discover", "Tuning", "Server", "Context", "Hardware")
     applied = Signal(dict)
 
     _LIBRARY_COLUMNS: tuple[str, ...] = ("Model", "Quant", "Size", "Source", "Context", "Status")
@@ -370,6 +472,75 @@ class ModelsDialog(QDialog):
         Field("llm", "vram_guard_free_mb", "GPU guard: free VRAM floor (MB)", "int", 0, 16000, 100),
     )
 
+    #: The ``[context]`` section (Context tab; 2026-10-06). One ``FieldForm`` over ``cfg.context``;
+    #: the help texts are the comments of ``exocortex.config.ContextConfig``, condensed.
+    _CONTEXT_FIELDS: tuple[Field, ...] = (
+        Field("context", "dir", "Library folder (empty = <models>/context)", "text", restart=True,
+              help="Where uploaded documents and their manifest live. Empty = the context folder "
+                   "next to the model library; documents persist across sessions."),
+        Field("context", "default_mode", "Mode of a new document", "choice", choices=("inject", "reference"),
+              help='"reference" = digest + passages pulled in only when the question matches; '
+                   '"inject" = the whole text in every prompt. Each document can be switched afterwards.'),
+        Field("context", "include_in", "Documents reach", "choice", choices=("all", "questions", "none"),
+              help='"all" = every answer, solve, code, text, suggestion and completion; "questions" = '
+                   'spoken / typed / on-screen questions only; "none" = keep the library, inject nothing.'),
+        Field("context", "reference_tokens", "Reference block (tokens)", "int", 0, 8000, 50,
+              help="Budget of the stable <reference> block: injected documents in full plus one "
+                   "catalogue line per reference-mode document. Trimmed first when the server's context is short."),
+        Field("context", "lookup_tokens", "Lookup block (tokens)", "int", 0, 4000, 50,
+              help="Budget of the volatile <lookup> block: passages pulled from reference-mode "
+                   "documents for this one question. Trimmed first when the server's context is short."),
+        Field("context", "lookup_top_k", "Passages per answer", "int", 0, 10, 1,
+              help="At most this many passages are pulled in per answer."),
+        Field("context", "lookup_min_score", "Passage match threshold", "float", 0.0, 20.0, 0.5,
+              help="BM25 score a passage needs to be pulled in at all; higher = only strong matches."),
+        Field("context", "chunk_chars", "Passage size (chars)", "int", 200, 6000, 100,
+              help="A document is indexed in passages of about this size (split on headings / paragraphs)."),
+        Field("context", "max_doc_chars", "Longest document (chars)", "int", 1000, 2000000, 1000,
+              help="A longer document is cut here when it is added (with a warning in the log)."),
+        Field("context", "digest", "Write a digest for reference documents", "bool",
+              help="Pre-process each reference-mode document with the model into a 2-4 line digest "
+                   "(what it is, what it covers) on the notes lane. Off: the catalogue shows the file "
+                   "name and its first heading only."),
+        Field("context", "digest_tokens", "Digest length (tokens)", "int", 32, 400, 8),
+        Field("context", "budget_mode", "Prompt sizing", "choice", choices=("auto", "fixed"),
+              help='"auto" = fit every prompt into the server\'s real per-request context, trimming '
+                   'lookup, reference, summary, screen, then the oldest transcript; "fixed" = the '
+                   'no fitting: the transcript gets [llm] transcript tokens as before (the window '
+                   'still anchors, the documents still apply).'),
+        Field("context", "reserve_tokens", "Safety margin (tokens)", "int", 0, 2048, 32,
+              help="Kept free under the server's context."),
+        Field("context", "lane_share", "Notes-lane share of the server context", "float", 0.1, 0.6, 0.05,
+              help="llama-server's parallel slots share ONE KV pool, so an answer and a notes-lane job "
+                   "(notes, summary, digest) running together must fit it together. This share is "
+                   "the notes lane's; answers get the rest. Ignored with one slot."),
+        Field("context", "transcript_min_tokens", "Newest speech keeps at least (tokens)", "int", 0, 4000, 50,
+              help="The newest speech always keeps at least this much, whatever else has to go."),
+        Field("context", "trim_step", "Window advance step", "float", 0.0, 0.9, 0.05,
+              help="When the transcript window overflows, drop at least this share of it at once "
+                   "(whole lines, oldest first) instead of sliding one line at a time, so the "
+                   "prompt prefix stays identical and llama.cpp's cache keeps hitting. 0 = slide."),
+        Field("context", "compaction", "Earlier transcript", "choice", choices=("summary", "off"),
+              help='"summary" = the model folds what fell out of the window into a short running '
+                   'summary (one small notes-lane job per trim); "off" = it is simply gone.'),
+        Field("context", "summary_tokens", "Summary length (tokens)", "int", 50, 1000, 10),
+        Field("context", "chars_per_token", "Characters per token", "float", 2.0, 6.0, 0.1,
+              help="Used for every budget estimate until the server's own prompt-token counts have "
+                   "calibrated it; 3.6 is conservative for prose with timestamps and code mixed in."),
+        Field("context", "auto_calibrate", "Calibrate from the server's counts", "bool",
+              help="Off pins characters per token to the value above."),
+    )
+
+    #: Document-table columns of the Context tab.
+    _CONTEXT_COLUMNS: tuple[str, ...] = ("Name", "Kind", "Tokens", "Mode", "On", "Digest")
+
+    #: File-picker filter of "Add files..." (the formats ``exocortex.context.extract_text`` reads).
+    _CONTEXT_FILE_FILTER: str = (
+        "Documents (*.md *.markdown *.txt *.rst *.pdf *.docx *.pptx *.html *.htm *.log *.csv *.json "
+        "*.toml *.yaml *.yml *.ini *.cfg *.py *.js *.ts *.tsx *.jsx *.java *.go *.rs *.c *.cc *.cpp "
+        "*.h *.hpp *.cs *.sql *.sh *.ps1 *.bat *.rb *.php *.kt *.swift *.m);;All files (*)"
+    )
+
     def __init__(self, cfg: Config, actions: "EngineActions", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
@@ -383,6 +554,7 @@ class ModelsDialog(QDialog):
         self._tuning_key: str | None = None
         self._any_loaded = False
         self._llm_busy = False  # review round two, 2026-09-27 (D4): explicit, not a getattr default
+        self._context_rows: list[dict[str, object]] = []  # 2026-10-06: the Context tab's documents
 
         self.setWindowTitle("Models")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
@@ -400,6 +572,7 @@ class ModelsDialog(QDialog):
         self.tabs.addTab(self._build_discover_tab(), "Discover")
         self.tabs.addTab(self._build_tuning_tab(), "Tuning")
         self.tabs.addTab(self._build_server_tab(), "Server")
+        self.tabs.addTab(self._build_context_tab(), "Context")
         self.tabs.addTab(self._build_hardware_tab(), "Hardware")
 
         self.load()
@@ -411,13 +584,19 @@ class ModelsDialog(QDialog):
         self._refresh_hardware()
         self._server_form.load()
         self.server_note.setText("")
+        self._context_form.load()
+        self.context_note.setText("")
+        self.context_status.setText("")
+        self._refresh_context()
+        self._render_usage(self._fetch_context_usage())
 
     def show_tab(self, name: str) -> None:
         if name in self.TABS:
             self.tabs.setCurrentIndex(self.TABS.index(name))
 
     def on_event(self, ev: object) -> None:
-        """Forwarded by the overlay: the five model events, plus ComponentStatusEvent("llm")."""
+        """Forwarded by the overlay: the five model events, ComponentStatusEvent("llm") and (2026-10-06)
+        the two context events."""
         try:
             if isinstance(ev, ModelPullEvent):
                 self._on_model_pull_event(ev)
@@ -433,6 +612,10 @@ class ModelsDialog(QDialog):
                 self._on_model_search_event(ev)
             elif isinstance(ev, ModelInfoEvent):
                 self._on_model_info_event(ev)
+            elif isinstance(ev, ContextLibraryEvent):
+                self._on_context_library_event(ev)
+            elif isinstance(ev, ContextUsageEvent):
+                self._render_usage(ev, snapshot=self._fetch_context_usage())
             elif isinstance(ev, ComponentStatusEvent) and ev.component == "llm":
                 self._set_library_status(ev.detail or ev.state, ev.state)
                 # review round two, 2026-09-27 (D4): busy is driven by "loading" / "ready" /
@@ -1123,6 +1306,341 @@ class ModelsDialog(QDialog):
             self.server_note.setText("")
         if changed:
             log.info("model server settings changed: %s", ", ".join(f"{k}={v!r}" for k, v in changed.items()))
+            self.applied.emit(changed)
+
+    # ================================================================================== Context
+    def _build_context_tab(self) -> QWidget:
+        """Documents table, action buttons, usage panel and the ``[context]`` form (2026-10-06)."""
+        w = QWidget(self)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+
+        self.context_table = QTableWidget(0, len(self._CONTEXT_COLUMNS), w)
+        self.context_table.setHorizontalHeaderLabels(list(self._CONTEXT_COLUMNS))
+        self.context_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.context_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.context_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.context_table.setMinimumHeight(110)
+        self.context_table.itemSelectionChanged.connect(self._update_context_buttons)
+        outer.addWidget(self.context_table, 3)
+
+        btn_row = QHBoxLayout()
+        self.context_add_files_btn = QPushButton("Add files\u2026", w)
+        self.context_add_files_btn.clicked.connect(self._on_context_add_files)
+        self.context_add_text_btn = QPushButton("Add text\u2026", w)
+        self.context_add_text_btn.clicked.connect(self._on_context_add_text)
+        self.context_remove_btn = QPushButton("Remove", w)
+        self.context_remove_btn.clicked.connect(self._on_context_remove)
+        self.context_toggle_btn = QPushButton("Enable/Disable", w)
+        self.context_toggle_btn.clicked.connect(self._on_context_toggle)
+        self.context_mode_btn = QPushButton("Mode: inject/reference", w)
+        self.context_mode_btn.clicked.connect(self._on_context_mode)
+        self.context_redigest_btn = QPushButton("Re-digest", w)
+        self.context_redigest_btn.clicked.connect(self._on_context_redigest)
+        self.context_open_folder_btn = QPushButton("Open folder", w)
+        self.context_open_folder_btn.clicked.connect(self._on_context_open_folder)
+        for b in (self.context_add_files_btn, self.context_add_text_btn, self.context_remove_btn,
+                  self.context_toggle_btn, self.context_mode_btn, self.context_redigest_btn,
+                  self.context_open_folder_btn):
+            btn_row.addWidget(b)
+        btn_row.addStretch(1)
+        outer.addLayout(btn_row)
+
+        self.context_status = QLabel("", w)
+        self.context_status.setWordWrap(True)
+        outer.addWidget(self.context_status)
+
+        self.context_usage_label = QLabel("", w)
+        self.context_usage_label.setWordWrap(True)
+        self.context_usage_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.context_usage_label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        outer.addWidget(self.context_usage_label)
+
+        self._context_form = FieldForm(self._CONTEXT_FIELDS, self._cfg, w)
+        outer.addWidget(self._context_form.widget, 4)
+
+        self.context_note = QLabel("", w)
+        self.context_note.setWordWrap(True)
+        outer.addWidget(self.context_note)
+
+        apply_row = QHBoxLayout()
+        self.context_restore_btn = QPushButton("Restore defaults", w)
+        # A plain lambda for the same reason as the Server tab's (see _build_server_tab).
+        self.context_restore_btn.clicked.connect(lambda: self._context_form.restore_defaults())
+        self.context_apply_btn = QPushButton("Apply", w)
+        self.context_apply_btn.setObjectName("primary")
+        self.context_apply_btn.clicked.connect(self._on_context_apply)
+        apply_row.addWidget(self.context_restore_btn)
+        apply_row.addStretch(1)
+        apply_row.addWidget(self.context_apply_btn)
+        outer.addLayout(apply_row)
+        return w
+
+    # ---- documents table
+    def _refresh_context(self) -> None:
+        """Re-read ``actions.context_documents()`` into the table, keeping the selected row by id."""
+        selected = self._selected_context_row()
+        selected_id = selected.get("id") if selected else None
+        try:
+            result = self._actions.context_documents()
+        except Exception:  # noqa: BLE001
+            log.exception("actions.context_documents() failed")
+            self._set_context_status("failed to read the context library", "error")
+            result = None
+        rows = [dict(r) for r in result if isinstance(r, dict)] if result else []
+        self._context_rows = rows
+
+        self.context_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self._set_context_row(i, r)
+        self.context_table.resizeColumnsToContents()
+        self.context_table.horizontalHeader().setStretchLastSection(True)
+        if selected_id is not None:
+            for i, r in enumerate(rows):
+                if r.get("id") == selected_id:
+                    self.context_table.setCurrentCell(i, 0)
+                    break
+        self._update_context_buttons()
+
+    def _set_context_row(self, i: int, r: dict[str, object]) -> None:
+        """One document row. "On" is plain text ("on" / "off": the toggle is the button); the
+        digest text itself is the row's tool tip, its state ("pending" / "ready" / ...) the column."""
+        tokens = _as_int(r.get("tokens"))
+        if tokens is None:
+            chars = _as_int(r.get("chars")) or 0
+            cpt = self._cfg.context.chars_per_token or 3.6
+            tokens = math.ceil(chars / cpt) if chars > 0 else 0
+        enabled = bool(r.get("enabled", True))
+        values = (
+            str(r.get("name") or r.get("id") or ""),
+            str(r.get("kind") or ""),
+            str(tokens),
+            str(r.get("mode") or ""),
+            "on" if enabled else "off",
+            str(r.get("digest_state") or ""),
+        )
+        digest = str(r.get("digest") or "")
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            if digest:
+                item.setToolTip(digest)
+            if not enabled:
+                item.setForeground(QColor(COLORS["text_dim"]))
+            elif col == len(values) - 1 and value == "failed":
+                item.setForeground(QColor(COLORS["err"]))
+            self.context_table.setItem(i, col, item)
+
+    def _selected_context_row(self) -> dict[str, object] | None:
+        idx = self.context_table.currentRow()
+        if 0 <= idx < len(self._context_rows):
+            return self._context_rows[idx]
+        return None
+
+    def _update_context_buttons(self) -> None:
+        row = self._selected_context_row()
+        has_row = row is not None
+        enabled = bool(row.get("enabled", True)) if row else True
+        mode = str(row.get("mode") or "") if row else ""
+        self.context_remove_btn.setEnabled(has_row)
+        self.context_toggle_btn.setEnabled(has_row)
+        self.context_toggle_btn.setText("Disable" if enabled else "Enable")
+        self.context_mode_btn.setEnabled(has_row)
+        self.context_mode_btn.setText(
+            "Mode: switch to inject" if mode == "reference"
+            else "Mode: switch to reference" if mode == "inject"
+            else "Mode: inject/reference"
+        )
+        self.context_redigest_btn.setEnabled(has_row and mode == "reference")
+
+    def _set_context_status(self, text: str, state: str = "") -> None:
+        self.context_status.setText(text)
+        self.context_status.setStyleSheet(f"color: {_status_color(state)};")
+
+    def _on_context_library_event(self, ev: ContextLibraryEvent) -> None:
+        """A document changed (added / removed / toggled / digest ready): re-read the list. A
+        failure reason ("error: ...") from the engine is shown under the buttons."""
+        self._refresh_context()
+        reason = ev.reason or ""
+        if reason.startswith("error"):
+            self._set_context_status(reason, "error")
+        elif reason.startswith("digest failed"):
+            doc = next((d for d in self._context_rows if str(d.get("id")) == ev.doc_id), None)
+            name = str(doc.get("name") or ev.doc_id) if doc else ev.doc_id
+            self._set_context_status(f"digest of {name} failed -- the model is unavailable or answered nothing; "
+                                     "Re-digest retries", "error")
+        # Any other reason leaves the status line alone: an "added" that follows a failed add
+        # must not wipe the failure the user has not read yet (review, 2026-10-06); the user's
+        # next action resets it. The usage panel's enabled-document count moves with the library.
+        self._render_usage(self._fetch_context_usage())
+
+    # ---- document actions
+    def _pick_context_files(self) -> list[str]:
+        """The "Add files..." picker; factored out so tests replace it on the instance."""
+        try:
+            paths, _flt = QFileDialog.getOpenFileNames(
+                self, "Add reference documents", "", self._CONTEXT_FILE_FILTER)
+        except Exception:  # noqa: BLE001
+            log.exception("file picker failed")
+            return []
+        return [str(p) for p in paths]
+
+    def _prompt_context_text(self) -> tuple[str, str] | None:
+        """The "Add text..." dialog: a name and the pasted text. ``None`` when cancelled or empty;
+        factored out so tests replace it on the instance."""
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Add text to the context library")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Name", dlg))
+        name_edit = QLineEdit(dlg)
+        name_edit.setPlaceholderText("Pasted text")
+        layout.addWidget(name_edit)
+        layout.addWidget(QLabel("Text (markdown is fine)", dlg))
+        text_edit = QPlainTextEdit(dlg)
+        text_edit.setMinimumSize(420, 220)
+        layout.addWidget(text_edit, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        text = text_edit.toPlainText()
+        if not text.strip():
+            return None
+        return (name_edit.text().strip() or "Pasted text", text)
+
+    def _context_action_begins(self) -> None:
+        """Every user action on the tab starts with a clean status line: the failure it may
+        have been showing has now been seen (review, 2026-10-06)."""
+        self._set_context_status("", "")
+
+    def _on_context_add_files(self) -> None:
+        self._context_action_begins()
+        try:
+            paths = list(self._pick_context_files() or [])
+        except Exception:  # noqa: BLE001
+            log.exception("_pick_context_files failed")
+            paths = []
+        for path in paths:
+            try:
+                self._actions.add_context_document(str(path), mode=None)
+            except Exception:  # noqa: BLE001
+                log.exception("actions.add_context_document(%r) failed", path)
+                self._set_context_status(f"failed to add {Path(str(path)).name}", "error")
+
+    def _on_context_add_text(self) -> None:
+        self._context_action_begins()
+        try:
+            picked = self._prompt_context_text()
+        except Exception:  # noqa: BLE001
+            log.exception("_prompt_context_text failed")
+            picked = None
+        if not picked:
+            return
+        name, text = picked
+        try:
+            self._actions.add_context_text(name, text, mode=None)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.add_context_text(%r) failed", name)
+            self._set_context_status(f"failed to add {name}", "error")
+
+    def _on_context_remove(self) -> None:
+        self._context_action_begins()
+        row = self._selected_context_row()
+        if not row:
+            return
+        doc_id = str(row.get("id") or "")
+        name = row.get("name") or doc_id
+        answer = QMessageBox.question(
+            self, "Remove document", f"Remove '{name}' from the context library? This cannot be undone.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self._actions.remove_context_document(doc_id)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.remove_context_document(%r) failed", doc_id)
+            self._set_context_status(f"failed to remove {name}", "error")
+
+    def _on_context_toggle(self) -> None:
+        self._context_action_begins()
+        row = self._selected_context_row()
+        if not row:
+            return
+        doc_id = str(row.get("id") or "")
+        try:
+            self._actions.set_context_document(doc_id, enabled=not bool(row.get("enabled", True)))
+        except Exception:  # noqa: BLE001
+            log.exception("actions.set_context_document(%r, enabled=...) failed", doc_id)
+            self._set_context_status("failed to change the document", "error")
+
+    def _on_context_mode(self) -> None:
+        self._context_action_begins()
+        row = self._selected_context_row()
+        if not row:
+            return
+        doc_id = str(row.get("id") or "")
+        new_mode = "inject" if str(row.get("mode") or "") == "reference" else "reference"
+        try:
+            self._actions.set_context_document(doc_id, mode=new_mode)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.set_context_document(%r, mode=%r) failed", doc_id, new_mode)
+            self._set_context_status("failed to change the document", "error")
+
+    def _on_context_redigest(self) -> None:
+        self._context_action_begins()
+        row = self._selected_context_row()
+        if not row:
+            return
+        doc_id = str(row.get("id") or "")
+        try:
+            self._actions.refresh_context_digest(doc_id)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.refresh_context_digest(%r) failed", doc_id)
+            self._set_context_status("failed to queue the digest", "error")
+
+    def _on_context_open_folder(self) -> None:
+        try:
+            folder = Path(self._cfg.context_dir())
+            if not folder.is_dir():
+                self._set_context_status("the context folder does not exist yet (add a document first)", "info")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception:  # noqa: BLE001
+            log.exception("open the context folder failed")
+
+    # ---- usage panel
+    def _fetch_context_usage(self) -> dict[str, object] | None:
+        try:
+            return self._actions.context_usage()
+        except Exception:  # noqa: BLE001
+            log.exception("actions.context_usage() failed")
+            return None
+
+    def _render_usage(self, usage: object, *, snapshot: object = None) -> None:
+        """Fill the usage panel from a ``ContextUsageEvent`` or ``actions.context_usage()``'s dict
+        (``None`` / ``{}`` before any job renders as "no answer yet"). `snapshot` (the engine's
+        dict, when the panel is fed an event) supplies what an event does not carry: the running
+        earlier-summary tool tip."""
+        self.context_usage_label.setText(_format_usage(usage))
+        summary = _usage_dict(usage).get("earlier_summary") or _usage_dict(snapshot).get("earlier_summary")
+        self.context_usage_label.setToolTip(f"Earlier in this meeting (summary):\n{summary}" if summary else "")
+
+    # ---- settings
+    def _on_context_apply(self) -> None:
+        changed = self._context_form.apply()
+        restart = [f.label for f in self._CONTEXT_FIELDS if f.restart and f.path in changed]
+        if restart:
+            self.context_note.setText("Takes effect at the next launch: " + ", ".join(restart))
+        elif changed:
+            self.context_note.setText("Applied.")
+        else:
+            self.context_note.setText("")
+        if changed:
+            log.info("context settings changed: %s", ", ".join(f"{k}={v!r}" for k, v in changed.items()))
             self.applied.emit(changed)
 
     # ================================================================================= Hardware

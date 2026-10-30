@@ -72,6 +72,8 @@ has rewritten itself is still recognised as one of ours (`exocortex/instance.py`
 | **Upstream CUDA runtime, live check on the RTX 5080 Laptop dev box (2026-09-27, portable-install)** | `driver_version` 592.82 (`>= 580`, so `cuda_kind_for_driver` resolves `"cuda13"`), `LMSTUDIO_HOME` pointed at an empty folder so no LM Studio pack existed for any flavor at all. `find_server_binary()` under the default `source="auto"` fetched `llama-b11200-bin-win-cuda-13.4-x64.zip` + `cudart-llama-bin-win-cuda-13.4-x64.zip` (423.5 MB in 24.5 s for the cudart zip alone, both verified by exact size + sha256) into `.tools/llama.cpp/b11200/cuda13/`, returning flavor `"nvidia-cuda12"` (the ladder's first-rung NAME; the actual installed KIND is `cuda13`, per `_upstream_kind_for`), source `"upstream"`, framework `"cuda"`. A full `LlamaServerManager(LLMConfig()).start()` on it (Qwen2.5-0.5B-Instruct Q4_K_M): **ready 40.0 s after `start()`, including both downloads**, `fallbacks == []`, `/health` 200, a 24-token `/v1/completions` in 0.22 s -- 318 tok/s prompt-eval / 473 tok/s generation. This is the "no LM Studio, no Ollama, first launch on an NVIDIA laptop" scenario end to end: the upstream CUDA fetch (two zips, cudart included), a genuinely cold two-zip download inside `start()`'s own timeout budget, and a working GPU completion, with no LM Studio pack present at all. |
 | **Hugging Face pull + auto-profile, live on the same box (2026-09-27, portable-install)** | `pull_model("Qwen/Qwen2.5-0.5B-Instruct-GGUF", "Q4_K_M", cfg)`: 491 MB pulled in 34 s, sha256 matched the Hub's own LFS hash for every shard, `auto_profile` chose `ctx_size=32768` (the model's trained context fits the budget whole) / `kv_cache_type="q8_0"` / `flash_attn=True`; a re-pull of the same file after completion skipped it (exact size match, no request made) in 1.4 s. Scanning 13 LM Studio models with `with_meta=True` (full GGUF header parse, every file) took 1.5 s. `hf_search("qwen", limit=25)` 0.4 s; `hf_repo_info` (listing the repo's shards/quants) 0.4 s. |
 
+| **Context window + KV prefix cache, live on the RTX 5070 Laptop (2026-10-06, context library)** | gemma-4-E4B-it Q4_K_M under the upstream b11200 cuda12 build, the auto-tuned profile (`ctx_size=4096`, `gpu_layers=39`, `threads=6`), `[llm].parallel = 2` -> `--kv-unified`. `/props` -> `default_generation_settings.n_ctx = 4096`, `total_slots = 2`; `/slots` -> both slots 4096; log `n_slots = 2, n_ctx_slot = 4096, kv_unified = 'true'` and `cache_reuse is not supported by this context, it will be disabled`: **with `--kv-unified` the per-request context is the FULL ctx_size (not ctx_size / parallel) and the two slots share that one pool.** `/tokenize`: `system_assist("", "bullets")` = 2249 chars / 521 tokens (4.32 chars/token); a 40-line timestamped transcript ~3.7 chars/token. Same prompt twice: prompt_n 1 / cache_n 2090 / 36 ms. ANCHORED window +1 line: prompt_n 96 / cache_n 2030 / 189 ms / TTFT 0.19 s. SLIDING window (drop 1 line, append 1): prompt_n 2129 / cache_n 0 / 1272 ms / TTFT 1.30 s, and again on the next turn (2128 / 0 / 1264 ms; the slot picker logs `f_sim_best = 0.26`). Anchored jump of 10 lines: one full re-eval (1799 / 0 / 1140 ms), then +1 line again 95 / 1742 / 195 ms. A notes job on the other slot in between (1113 tokens, slot 0) left the assist slot's cache intact (next: 133 / 1741). Oversize prompt (15828 tokens): HTTP 400 `{"error":{"code":400,"message":"request (15828 tokens) exceeds the available context size (4096 tokens), try increasing it","type":"exceed_context_size_error"}}`. Near-full prompt (4034 tokens with the cache) + max_tokens 400: HTTP 200, 62 tokens generated, log `stop processing: n_tokens = 4095, truncated = 1` -- the answer silently cut short. Generation ~38-40 tok/s, prompt eval ~1600-2500 tok/s on this GPU model. |
+
 ## Package layout
 
 ```
@@ -91,7 +93,9 @@ exocortex/
                                      run.bat/run.vbs call on every launch (added 2026-09-27, portable-install)
   models_dl.py                     ensure_models(cfg) -> downloads silero/speaker ONNX if missing;
                                      ensure_sherpa_model() -> downloads/extracts a sherpa-onnx ASR bundle (added 2026-09-26)
-  transcript.py                    Transcript store
+  transcript.py                    Transcript store (+ lines() with segment ids, 2026-10-06)
+  context.py                       Context library + the dynamic context window (2026-10-06): ContextStore,
+                                   ContextIndex (BM25), TokenEstimator, TranscriptWindow (anchored), ContextManager
   session.py                       SessionRecorder (autosave/export)
   stealth.py                       [stealth]: PEB caption + priority class; session-folder stamping + pruning (added 2026-09-24)
   audio/capture.py                 AudioCapture (WASAPI loopback + mic → 16 kHz mono float32 frames)
@@ -118,7 +122,8 @@ exocortex/
                                      (added 2026-09-25)
   llm/client.py                    LMStudioClient (httpx, streaming, cancel); OllamaClient (Ollama's native API,
                                      added 2026-09-25); make_client(cfg, backend)
-  llm/prompts.py                   ChatML rendering + prompt builders
+  llm/prompts.py                   ChatML rendering + prompt builders (+ <reference>/<earlier>/<lookup> blocks,
+                                   compaction + digest prompts, 2026-10-06)
   llm/questions.py                 is_question / extract_question heuristics; focus_level / is_task_line / is_relevant
   llm/choices.py                   multiple-choice: option-set detection, <choices> prompt block, answer verdict line
   llm/assistant.py                 Assistant (auto/manual answers, ask, notes)
@@ -129,7 +134,7 @@ exocortex/
   ui/theme.py                      QSS + colors
   ui/widgets.py                    TranscriptView, AssistView, NotesView, StatusBar, AskBox
   ui/overlay.py                    OverlayWindow
-  ui/models.py                     ModelsDialog: Library / Discover / Tuning / Server / Hardware tabs
+  ui/models.py                     ModelsDialog: Library / Discover / Tuning / Server / Context / Hardware tabs
                                      (added 2026-09-27, portable-install)
   doctor.py                        environment diagnostics: GPU (vendor-neutral), audio, models, screen/OCR,
                                      completion, LLM backend (route-aware), overlay; `python -m exocortex --doctor`
@@ -2647,6 +2652,254 @@ scenario; `exocortex --doctor` warns when `[llm].dropped_legacy_url` is set):** 
 8. The busy gate follows operation start / completion and double-click honours it.
 9. The legacy-URL migration warns loudly and records the dropped address.
 10. The README "fit" wording.
+
+### Context library + dynamic context window (added 2026-10-06)
+
+WHY (owner's report, 2026-10-06): "it works okay but in very long sessions it starts degrading in
+both quality and speed of generation, especially in auto mode" -- and there was no way to hand the
+model background material (a README, the design and architecture docs of the thing being
+presented) for a presentation's Q&A. Both problems turned out to have the same root: nothing
+sized the prompt to the server's real context, and the transcript block slid line by line once it
+outgrew its budget. Measured live the same day on the owner's RTX 5070 laptop (gemma-4-E4B-it
+Q4_K_M, the auto-tuned profile pinning `ctx_size = 4096`, `[llm].parallel = 2` -> `--kv-unified`;
+full numbers in "Verified facts"):
+
+- llama-server's `/props` reports `default_generation_settings.n_ctx = 4096` and `/slots` shows
+  both slots at 4096: with `--kv-unified` the per-REQUEST context is the FULL `--ctx-size`, NOT
+  `ctx_size / parallel`, and the two slots share that ONE pool of cells.
+- A prompt bigger than that -> HTTP 400 `exceed_context_size_error` ("request (15828 tokens)
+  exceeds the available context size (4096 tokens), try increasing it"); the app turned that into
+  an `AssistErrorEvent`, so in a long meeting every auto-answer failed. A prompt that fits but
+  leaves no room for the answer -> HTTP 200 with the answer silently cut short (`truncated = 1` in
+  the server log): the "quality degrades" symptom. With the shipped defaults (`context_tokens` 2500
+  ~ 10000 chars of transcript, 2500 chars of screen, a 521-token system prompt, 220-700 answer
+  tokens) a saturated window on a 4096-token profile hits one or the other on every turn.
+- A SLIDING window (drop one line at the front, append one) -> `prompt_n 2129 / cache_n 0`,
+  1.27 s of prompt evaluation, every turn; the slot picker logs `f_sim_best = 0.26` (only the
+  system prompt still matched). An ANCHORED window (+1 line) -> `prompt_n 96 / cache_n 2030`,
+  0.19 s. An anchored jump of 10 lines costs one full re-evaluation, then appends are cheap again.
+  On the CPU-bound ternary `maple-preview` (~150 tok/s prompt eval) the sliding case is ~14 s per
+  answer: the "speed degrades" symptom. A notes job on the other slot in between does not evict
+  the assist slot's cache (slots are picked by longest common prefix).
+
+**Module contracts (one owner per module, read-only across the others -- five agents landed this
+section in the same working tree at once, like the 2026-09-27 section):**
+
+- **`exocortex/config.py` (extended).** `ContextConfig` (`cfg.context`, `[context]`): `dir` (""
+  = `<models_dir>/context`), `default_mode` ("inject" | "reference"), `include_in` ("all" |
+  "questions" | "none"), `reference_tokens` 1200, `lookup_tokens` 600, `lookup_top_k` 3,
+  `lookup_min_score` 1.0, `chunk_chars` 1200, `max_doc_chars` 200000, `digest` true,
+  `digest_tokens` 120, `budget_mode` ("auto" | "fixed"), `reserve_tokens` 256, `lane_share` 0.3,
+  `transcript_min_tokens` 600, `trim_step` 0.25, `compaction` ("summary" | "off"),
+  `summary_tokens` 250, `chars_per_token` 3.6, `auto_calibrate` true. `Config.context_dir()`.
+  Every value is read live by the manager on every call (settings apply at once); only `dir`
+  needs a restart.
+- **`exocortex/bus.py` (extended).** `ContextLibraryEvent(reason, doc_id)` (the library changed:
+  re-read `context_documents()`) and `ContextUsageEvent(job_id, kind, slot_tokens, budget_tokens,
+  used_tokens, transcript_tokens, reference_tokens, lookup_tokens, earlier_tokens, screen_tokens,
+  system_tokens, prompt_tokens, cached_tokens, trimmed, anchor_moved, chars_per_token, documents)`
+  -- two per assist job: one as soon as the prompt is built (estimates; `prompt_tokens` /
+  `cached_tokens` None), one after the stream with the server's own counts.
+- **`exocortex/actions.py` (extended).** `context_documents() -> list[dict]`,
+  `add_context_document(path, *, mode=None)`, `add_context_text(name, text, *, mode=None)`,
+  `remove_context_document(doc_id)`, `set_context_document(doc_id, *, enabled=None, mode=None)`,
+  `refresh_context_digest(doc_id)`, `context_usage() -> dict`. Every one returns at once and
+  reports through the two events; the add/remove/set methods never raise into the UI (a failure is
+  a `ContextLibraryEvent(reason="error: ...")` plus an "app" error status).
+- **`exocortex/context.py` (new; Qt-free, LLM-free, stdlib + `pypdf`).**
+  - `extract_text(path, *, max_chars) -> (text, kind)`: markdown / text / code (stored fenced,
+    language = the extension) / html (`html.parser`, headings and list items kept as markdown) /
+    docx and pptx (`zipfile` + `xml.etree`: paragraphs, headings, tables, one `## Slide N` per
+    slide) / pdf (`pypdf`, one `## Page N` per page; a clear `ContextError` naming `pip install
+    pypdf` when it is missing); anything else is accepted as text when it decodes as UTF-8 with
+    < 5 % replacement characters. Normalised line endings, cut at `max_chars` on a line boundary.
+  - `chunk_text(text, *, max_chars, doc_id, doc_name) -> list[Chunk]`: split on markdown headings
+    and blank-line paragraphs (fenced code never split), packed up to `max_chars`, a longer
+    paragraph split on lines then sentences; `Chunk.title` is the heading path ("Architecture >
+    Threads"); a headings-only document yields one chunk of every heading.
+  - `ContextStore(directory | None)`: thread-safe; `manifest.json` (`{"version": 1, "documents":
+    [...]}`, atomic write; a corrupt manifest is renamed `.corrupt` and the store starts empty,
+    never raises) plus the extracted text under `docs/<id>.md|.txt`. A document's `id` is the
+    first 12 hex chars of the sha256 of its TEXT, so re-adding the same text replaces the entry
+    (name / source updated, enabled / mode / digest kept; a copy stored under another extension is
+    deleted). `add_file`, `add_text`, `remove`, `set_enabled`, `set_mode` (-> "reference" with no
+    digest yet marks it "pending"), `set_digest`, `mark_digest_pending`, `pending_digests`,
+    `enabled(mode)`, `text(id)`, `reload`, `version` (bumped on every change).
+  - `ContextIndex(store, *, chunk_chars)`: BM25 (k1 1.5, b 0.75) over the chunks of the ENABLED
+    reference-mode documents, rebuilt lazily on `store.version`; tokeniser = casefold, split on
+    non-alphanumerics, a small stop list, crude suffix stemming. `search(query_terms, *, top_k,
+    min_score)` returns at most one chunk per document (unless fewer documents match than
+    `top_k`), ties broken by document order then chunk index. `query_terms(question,
+    recent_transcript, screen_text)` weights the question's terms 1.0, the most recent
+    transcript lines' 0.5, the screen's 0.25 -- the retrieval side of "the most recent speech
+    matters most". Note: BM25's idf is low in a one-passage library, so a single short document
+    may not reach `lookup_min_score` unless several terms match; inject mode (or a lower floor)
+    covers that case.
+  - `TokenEstimator(chars_per_token, *, auto)`: `tokens(text)`, `chars(tokens)`; `observe(
+    prompt_chars, prompt_tokens)` moves the estimate by an EMA (alpha 0.3, clamped 2.0-6.0) when
+    both are >= 50; `note_overflow()` shrinks it by 15 % (floored at 2.0).
+  - `TranscriptWindow(transcript)`: the ANCHORED window per SCOPE (the checkpoint `since_id`;
+    None = the whole meeting). `render(*, since_id, until_id, max_chars, trim_step)`: while the
+    lines after the anchor fit, they are returned whole and the anchor stays; on overflow whole
+    lines are dropped from the front until the rest fits in `max_chars * (1 - trim_step)` (at
+    least one, never the newest; the newest line alone over the budget shows its tail, as
+    `window_text` does), the anchor moves to the last dropped line and the dropped text joins the
+    scope's pending compaction buffer (bounded to 4x `max_chars`, newest kept). `trim_step <= 0`
+    slides like before. `earlier_summary` (the ACTIVE summary, what the prompt carries) /
+    `set_summary` (immediate) / `stage_summary` (held until the NEXT anchor move, when `render`
+    promotes it -- the one moment the prefix changes anyway; measured on the second live run,
+    installing a finished summary at once re-evaluated the whole prompt on two extra turns) /
+    `staged_summary`, `claim_compaction(scope, max_chars=None)` (folds into the staged text when
+    there is one; with `max_chars` only the OLDEST lines that fit are claimed and the rest stays
+    pending), `restore_compaction` (prepends: a failed job hands the text back), `has_pending`,
+    `reset` (new session), `forget_scope`. A transcript cleared under a live scope restarts that
+    scope. The manager budgets the larger of the active and staged summaries and uses whichever
+    the window holds after `render`.
+  - `ContextManager(cfg, store | None, transcript)`: the ONE object the Assistant talks to.
+    `set_slot_tokens(n)` / `slot_tokens` (fallback `cfg.llm.ctx_size`, never divided by
+    `parallel` -- see the measurement above). `job_limit(lane)`: with one slot `slot -
+    reserve_tokens` for either lane; with two slots over the unified pool the "answer" lane gets
+    `int(slot * (1 - lane_share)) - reserve_tokens` and the "notes" lane `max(512, int(slot *
+    lane_share))`, so an answer and a notes-lane job (notes, a compaction, a digest) fit the pool
+    TOGETHER. `available_chars(lane, *, max_tokens, system_text, other_text)`: the room one more
+    block has in such a prompt. `wants_reference(kind)`: `include_in` against the job kind
+    ("questions" = auto / manual / ask / screen). `build(*, kind, question, screen_text,
+    since_id, until_id, max_tokens, system_text, fixed_chars) -> ContextBundle(transcript,
+    reference, lookup, earlier, screen, usage, compact_scope, compact_wanted, documents_used)`:
+    never raises (a failure falls back to the newest 1200 chars of transcript with
+    `usage.trimmed`). Auto budget: `avail = job_limit("answer") - max_tokens - tokens(system) -
+    tokens(fixed)`; the <reference> block is rendered within `reference_tokens` (the catalogue
+    first -- one line per reference-mode document: its digest, else its first heading -- then
+    each injected document gets an equal share of the rest, short ones' leftover redistributed
+    once, a document that would get under 40 chars left out), the <lookup> passages are fitted
+    greedily into `lookup_tokens`, the <earlier> summary is capped at twice `summary_tokens`;
+    the transcript gets `min([llm].context_tokens, avail - screen - reference - lookup -
+    earlier)`. The <reference> block is the user turn's PREFIX, so its budget is computed from
+    STABLE quantities only -- `min(reference_tokens, avail - floor - earlier - room for the
+    largest screen this job may carry ([screen].max_text_chars))` -- and documents are CUT to it,
+    never dropped because one turn's screen was long (review 2026-10-06: the block used to flip in
+    and out with the screen length, re-evaluating the whole prompt). Only when even that cannot
+    leave the floor (a tiny slot) do the others give back IN THIS ORDER: lookup passages (worst
+    first), the earlier summary, the screen text (down to 25 % of it), and last the reference
+    block (injected documents last-first, then catalogue lines); if the floor still cannot be met
+    the transcript takes what is left (its newest line always
+    survives, and at least 240 chars unless `context_tokens` itself is smaller). When the
+    server's slot, not `context_tokens`, is what limits the window, `trim_step` is shrunk so a
+    step-trim never leaves less than the floor on screen. Fixed budget (`budget_mode = "fixed"`):
+    the pre-2026-10-06 `context_tokens * 4` chars of transcript, the reference / lookup blocks at
+    their configured sizes, no fitting -- still anchored. `compact_wanted` is set when the anchor
+    moved (or earlier dropped text is still pending) and `compaction = "summary"`; with
+    compaction off the dropped text is discarded so nothing piles up. `observe_prompt(chars,
+    tokens)` / `note_overflow()` feed the estimator; `record_usage` / `usage_snapshot()` back the
+    Context tab's panel. `reset_session()` forgets anchors, summaries and pending text; the
+    documents stay.
+- **`exocortex/transcript.py` (extended).** `lines(*, since_id=None, until_id=None) ->
+  list[tuple[int, str]]`: the same "[mm:ss] Label: text" lines as `window_text`, with their
+  segment ids. `window_text` is untouched (the two fallbacks still use it; the notes job reads
+  `head_text`).
+- **`exocortex/llm/prompts.py` (extended).** The user turn is now
+  `<reference>` (stable: injected documents in full + the catalogue) -> `<earlier>` (the running
+  summary; changes only when the anchor moves, the one moment the prefix changes anyway) ->
+  `<transcript>` -> `<previous>` (code / text) -> `<screen>` -> `<lookup>` (volatile: the passages
+  for THIS question) -> `<choices>` -> the ask / `<question>`. `context_blocks(reference,
+  earlier)` and `lookup_block(lookup)` render the blocks and omit them when blank, so every user
+  builder (`user_assist` / `user_ask` / `user_suggest` / `user_solve` / `user_code` /
+  `user_text`, all with keyword-only `reference` / `earlier` / `lookup`) is byte-identical to its
+  pre-change output with the defaults (pinned by a hand-written byte-for-byte test per builder in
+  tests/test_prompts_reference.py). ONE
+  constant, `_REFERENCE_RULE`, sits in every system builder (assist, ask, suggest, solve, code,
+  text; `system_complete` carries the same idea in its <context> sentence), gated by its wording
+  like `_CHOICE_RULE`, so the system prompt never changes between turns: the <transcript> is what
+  happened and its LAST lines matter most; <earlier> is this meeting's older part; <reference> /
+  <lookup> are background material for reference only -- facts, names, numbers and details when
+  the conversation calls for them, never overriding or redirecting what was just said, never
+  answered about unprompted, never mentioned as provided. `system_compact()` / `user_compact(
+  previous_summary, dropped_transcript, max_words)` fold dropped transcript into the running
+  summary; `system_digest()` / `user_digest(name, excerpt)` write a reference document's 2-4 line
+  catalogue entry; `words_for_tokens(tokens)` (0.75 words per token) turns a token budget into the
+  word limit those prompts state.
+- **`exocortex/llm/client.py` (extended).** `StreamStats.prompt_tokens` / `cached_tokens`
+  (defaulted, at the end): llama-server's final chunk carries `timings.prompt_n` (what it had to
+  EVALUATE) and `timings.cache_n` (what it reused), so `prompt_tokens = prompt_n + cache_n` (the
+  whole prompt -- reporting `prompt_n` alone would make a warm-cache turn look like a 40-token
+  prompt and wreck the calibration built on it); OpenAI `usage.prompt_tokens` (+
+  `prompt_tokens_details.cached_tokens`), LM Studio `stats`, Ollama `prompt_eval_count`.
+  `LMStudioClient.context_window()`: `GET /props` -> `default_generation_settings.n_ctx`, else LM
+  Studio's `/api/v0/models` entry (`loaded_context_length` / `max_context_length`); None on any
+  failure, never raises. `OllamaClient.context_window()` = `cfg.ctx_size` (what every request's
+  `num_ctx` says).
+- **`exocortex/llm/assistant.py` (extended).** `Assistant(cfg, bus, client, transcript, clock,
+  context=None)` (None -> an in-memory `ContextManager`, so every older caller and test is
+  unchanged). `_run_assist_job` builds the SYSTEM prompt first, then `context.build(...)` with
+  the job's own answer budget, and hands `transcript` / `reference` / `earlier` / `lookup` to the
+  user builders (`_complete_prompt_parts` puts ("reference", ...) and ("earlier", ...) first and
+  ("lookup", ...) last inside <context>); publishes the estimate `ContextUsageEvent` at once and
+  the server-counted one after the stream, calibrating the estimator from the exact text sent.
+  An `LLMError` that reads as a context overflow (`exceed` / `context size` / `too many` /
+  `n_ctx`) shrinks the estimate (`note_overflow`) and rebuilds + streams ONCE more before being
+  reported. The health check reads `client.context_window()` into `set_slot_tokens`. Two new
+  notes-lane slots, served by the notes worker after `_notes_slot` (notes stay first):
+  `_compact_slot` (a `_CompactJob(scope)` claims `available_chars("notes", ...)` worth of the
+  oldest pending text, runs `system_compact` / `user_compact` with `summary_tokens + 32` tokens,
+  STAGES the summary (`stage_summary`: it enters the prompt at the next anchor move) -- restores
+  the text on failure -- and re-queues itself while more is pending) and `_digest_slot` (`digest_document(doc_id)`: the first `min(6000,
+  available_chars(...))` chars of the document through `system_digest` / `user_digest`, then
+  `store.set_digest(..., "ready" | "failed")` and a `ContextLibraryEvent(reason="digest")`; the
+  worker chains the next `pending_digests()` id; `start()` / `set_model()` kick the chain). Both
+  background jobs YIELD to a live answer (`_lane_cancel`: they first wait up to 20 s for the
+  answer lane to go idle, then stream with `_lane_yield` -- set while an assist job runs -- as
+  their cancel token; a yielded job hands its text back and re-queues itself with `attempts + 1`,
+  and after two yields runs to completion with only the stop event, so a stream of inline
+  completions cannot starve the lane; measured on the second live run, a compaction streaming
+  beside an answer took the answer's first token from 0.3 s to 4.9 s). The
+  notes job sizes its WHOLE prompt to the notes lane (`_notes_budget`): the new-transcript chunk
+  keeps the old `context_tokens * 4` cap while the lane has room for it beside the previous notes
+  and the full `notes_max_tokens` answer; when the full answer would leave under 400 tokens of
+  chunk, the answer budget and the previous notes shrink together to an equal share of what is
+  left after a 400-token chunk (never under 200 tokens; `user_notes(..., max_words)` tells the
+  model the new length, so the five-heading document stays complete, just compact; a longer
+  previous document is cut on a line boundary once). On the owner's 4096-token profile the
+  lane is ~1228 tokens: the configured 900-token document could not fit even once beside the
+  old 2500-token chunk (upstream finding 3's bounded chunk still overflowed the slot), so the
+  notes there are a 200-token document (the floor) fed ~1400 chars per pass; on the default 8192
+  context the first pass keeps the 900-token answer and a ~1100-token chunk, and once the notes
+  document has grown to ~3000 chars the answer eases to ~800 tokens with the chunk at the 400-token
+  minimum. `reset()` -> `context.reset_session()`.
+- **`exocortex/app.py` / `exocortex/ui/overlay.py` (extended).** `Engine` owns
+  `context_store = ContextStore(cfg.context_dir())` and `context = ContextManager(cfg,
+  context_store, transcript)`, hands `context=` to the Assistant, implements the seven actions
+  (adds are synchronous -- a local file read; a pending digest is queued on the Assistant when it
+  exists), `new_session()` resets the window and keeps the documents. The overlay forwards the
+  two events to the Models window like the model events and both menus (the `...` menu and the
+  slim bar's Context menu) gain "Context documents..." -> `open_models("Context")`.
+- **`exocortex/ui/models.py` (extended).** `TABS = ("Library", "Discover", "Tuning", "Server",
+  "Context", "Hardware")`. The Context tab: the documents table (Name / Kind / Tokens / Mode / On
+  / Digest; the digest text as the row's tool tip), Add files... (`QFileDialog`, factored as
+  `_pick_context_files` so tests monkeypatch it) / Add text... (`_prompt_context_text`) / Remove
+  (confirmed) / Enable-Disable / Mode / Re-digest / Open folder, the usage panel (from
+  `actions.context_usage()` on open and from every `ContextUsageEvent`), and a `FieldForm` over
+  every `[context]` field (`dir` restart-marked) whose Apply emits `applied` with the changed
+  `context.*` keys like the Server tab.
+
+**Coding rules this section adds:** nothing in `exocortex/context.py` may import Qt or call the
+model; every document's stored copy is the EXTRACTED TEXT (never the original file), under the
+context directory only; the system prompt of a job kind must stay byte-identical across turns for
+a fixed config (a document being loaded or not may only change the USER turn); the <reference>
+and <earlier> blocks must stay in front of the transcript and <lookup> behind the screen block (a
+volatile block ahead of a stable one defeats the prefix cache, which is the whole point); and a
+notes-lane prompt is sized with `available_chars("notes", ...)`, never with `context_tokens * 4`
+alone.
+
+**Tests:** `tests/test_context_store.py`, `test_context_index.py`, `test_context_window.py`,
+`test_context_manager.py` (the module: parsing of every kind with generated .docx / .pptx / .pdf
+fixtures, manifest round-trip and corruption, chunking, BM25, the estimator, prefix stability
+across turns, trim steps, the pending buffer, scopes, the budget planner's trim order and floors,
+fixed mode = the old `window_text`), `test_prompts_reference.py` (byte-identical system prompts,
+block order per builder, byte-identical-when-empty), `test_client_context.py` (the token
+counts of every backend, `/props`), `test_assistant_context.py`, `test_app_context.py`,
+`test_overlay_context.py`, `test_models_dialog_context.py`. Full suite after this section (an
+adversarial review of 16 findings, 5 of them confirmed and fixed, and three live runs on the
+owner's machine later): **2868 passed, 24 deselected (live)** on 2026-10-06.
 
 ## Coding rules for implementers
 - Windows-only OK, but guard imports so `pytest` runs (e.g., import pyaudiowpatch inside functions or try/except at module import with a clear error at use time).

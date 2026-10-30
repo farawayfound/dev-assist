@@ -18,7 +18,8 @@ cd /d "%~dp0"
 :: EXO_SETUP_DRYRUN=1 makes every pip/uv/download/setup step print the command instead of running
 :: it (used by tests\test_run_script.py so they do not need network access or take minutes).
 :: EXO_SETUP_QUIET=1 (run.vbs sets it for its hidden catch-up runs) skips the interactive
-:: "pull a model" prompt; the app then offers its Models window instead.
+:: "pull a model" prompt; the app then offers its Models window instead. It also keeps a broken
+:: .venv rather than rebuilding it (see :create_venv).
 :: -----------------------------------------------------------------------------------------
 
 if /I "%~1"=="--doctor" goto :run_doctor
@@ -164,19 +165,74 @@ if errorlevel 1 (
 exit /b 0
 
 :: ---------------------------------------------------------------------------------------------
-:: :create_venv -- a no-op when .venv\Scripts\python.exe already exists (created once, never
-:: recreated). Otherwise: prefer the newest system Python (py -3.12, then 3.13, then 3.11 --
-:: 3.12 first because that is what this app is verified on), then a bare "python" if its version
-:: is in range, and only if none of those exist, bootstrap a private Python with uv (:above).
+:: :create_venv -- a no-op when .venv\Scripts\python.exe already exists AND still starts (created
+:: once, recreated only when broken -- below). Otherwise: prefer the newest system Python (py -3.12,
+:: then 3.13, then 3.11 -- 3.12 first because that is what this app is verified on), then a bare
+:: "python" if its version is in range, and only if none of those exist, bootstrap a private Python
+:: with uv (:above).
 :: Flat sequential checks with GOTO, no nested "if ( ... )" blocks, on purpose -- see the note
 :: above :bootstrap_uv_python. Every py/python invocation goes through CALL: "py"/"python" is
 :: usually python.exe, but a version manager (pyenv-win and friends) can shim it as a .bat/.cmd,
 :: and running a batch file without CALL from inside another batch file hands control to it and
 :: never returns -- CALL is correct either way and costs nothing extra for a real .exe.
+::
+:: "Still starts": a venv holds no interpreter of its own -- its python.exe only launches the one
+:: named by "home" in .venv\pyvenv.cfg. Delete that one (uv's %APPDATA%\uv\python wiped by a
+:: cleanup tool or `uv python uninstall`, a python.org Python uninstalled) and python.exe is still
+:: on disk but every call fails ("uv trampoline failed to spawn Python child process"), so every
+:: launch died behind a console that closed at once. A venv this script built with uv gets its
+:: Python back from the cached uv.exe (~20 MB, every installed package kept); any other is rebuilt
+:: from scratch -- but only once its base interpreter is provably gone, never just because
+:: something else (an antivirus block) stopped it from starting this once. -E: a stray PYTHONHOME
+:: or PYTHONPATH in the environment is not the venv's fault and must not get it deleted.
+:: A hidden run (EXO_SETUP_QUIET=1, run.vbs) only ever tries the uv repair, never the rebuild: a
+:: rebuild that then failed (offline) would leave no .venv at all, and run.vbs takes a missing
+:: .venv for a fresh install -- the one case it shows a console for. It fails instead and leaves the
+:: venv as it was: no app and no window, until run.bat itself is run.
 :: ---------------------------------------------------------------------------------------------
 :create_venv
-if exist ".venv\Scripts\python.exe" exit /b 0
+if not exist ".venv\Scripts\python.exe" goto :create_venv_new
+".venv\Scripts\python.exe" -E -c "import sys" >nul 2>nul
+if not errorlevel 1 exit /b 0
 
+echo [ExoCortex] The virtual environment's Python no longer starts; repairing it...
+if not exist ".venv\pyvenv.cfg" goto :create_venv_rebuild
+findstr /B /C:"uv = " ".venv\pyvenv.cfg" >nul 2>nul
+if errorlevel 1 goto :create_venv_check_home
+if not exist ".tools\uv\uv.exe" goto :create_venv_check_home
+if "%EXO_SETUP_DRYRUN%"=="1" goto :create_venv_uv_dryrun
+echo [ExoCortex] Reinstalling the uv-managed Python 3.12 it was built on...
+".tools\uv\uv.exe" python install 3.12
+".venv\Scripts\python.exe" -E -c "import sys" >nul 2>nul
+if errorlevel 1 goto :create_venv_check_home
+echo [ExoCortex] Repaired; every installed package was kept.
+exit /b 0
+:create_venv_uv_dryrun
+echo [dryrun] .tools\uv\uv.exe python install 3.12
+
+:create_venv_check_home
+set "VENV_HOME="
+for /f "usebackq tokens=1,* delims==" %%a in (".venv\pyvenv.cfg") do if /I "%%a"=="home " set "VENV_HOME=%%b"
+if not defined VENV_HOME goto :create_venv_rebuild
+if not exist "%VENV_HOME:~1%\python.exe" goto :create_venv_rebuild
+echo [ExoCortex] ERROR: .venv\Scripts\python.exe does not start, yet the Python it was built from is
+echo [ExoCortex] still installed. Run .venv\Scripts\python.exe by hand to see why ^(an antivirus
+echo [ExoCortex] block?^), or delete the .venv folder to have it rebuilt.
+exit /b 1
+
+:create_venv_rebuild
+if "%EXO_SETUP_QUIET%"=="1" goto :create_venv_keep
+echo [ExoCortex] The Python it was built from is gone; rebuilding the virtual environment...
+rmdir /s /q ".venv" >nul 2>nul
+if not exist ".venv" goto :create_venv_new
+echo [ExoCortex] ERROR: could not delete the broken .venv folder ^(is ExoCortex still running?^).
+echo [ExoCortex] Close it, delete .venv by hand, and run this again.
+exit /b 1
+:create_venv_keep
+echo [ExoCortex] ERROR: the Python .venv was built from is gone; run run.bat to rebuild it.
+exit /b 1
+
+:create_venv_new
 echo [ExoCortex] Creating virtual environment...
 
 where py >nul 2>nul

@@ -385,6 +385,50 @@ class ModelInfoEvent(Event):
     error: str = ""
 
 
+# ---- context library + the context window (2026-10-06) ------------------------------------
+# The Models window's "Context" tab (exocortex/ui/models.py) drives the engine through
+# EngineActions' context_documents / add_context_document / add_context_text /
+# remove_context_document / set_context_document / refresh_context_digest and hears back through
+# these two events. Plain data only, like the model-manager events above.
+@dataclass(frozen=True)
+class ContextLibraryEvent(Event):
+    """The reference-document library changed (a document was added / removed / toggled / had its
+    mode changed, or its digest was generated): re-read `context_documents()`. `reason` is for
+    logs / a toast; `doc_id` names the document when one is concerned ("" otherwise)."""
+    reason: str = ""
+    doc_id: str = ""
+
+
+@dataclass(frozen=True)
+class ContextUsageEvent(Event):
+    """How the context window was filled for one assist job (published by the Assistant right
+    after the job's prompt was built, and once more when the server reported its own counts).
+    Every `*_tokens` field is the app's own estimate (`[context].chars_per_token`) except
+    `prompt_tokens` / `cached_tokens`, which are what the server reported for this request
+    (llama-server `timings.prompt_n` / `cache_n`; None when the backend does not say).
+    `slot_tokens` is the per-request context the budget was sized to; `budget_tokens` what was
+    left for the user turn after the system prompt, the answer budget and the reserve.
+    `trimmed` says something had to be cut to fit; `anchor_moved` that the transcript window's
+    start advanced (a compaction may follow); `chars_per_token` is the calibrated estimate."""
+    job_id: int
+    kind: AssistKind
+    slot_tokens: int = 0
+    budget_tokens: int = 0
+    used_tokens: int = 0
+    transcript_tokens: int = 0
+    reference_tokens: int = 0
+    lookup_tokens: int = 0
+    earlier_tokens: int = 0
+    screen_tokens: int = 0
+    system_tokens: int = 0
+    prompt_tokens: int | None = None
+    cached_tokens: int | None = None
+    trimmed: bool = False
+    anchor_moved: bool = False
+    chars_per_token: float = 0.0
+    documents: int = 0          # reference documents that contributed something to this prompt
+
+
 class EventBus:
     """Fan-out bus: each subscriber owns a queue; publish copies the reference to all."""
 

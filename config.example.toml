@@ -304,6 +304,48 @@ manual_hold_text = true     # Text needs the hold (left clicks happen constantly
 manual_hold_code = false    # Code does not: a quick middle press -- or a touchpad three-finger tap mapped to
                             # "Middle mouse button" in Windows touchpad settings -- triggers it right away
 
+[context]
+# 2026-10-06: reference documents + the dynamic context window (the Models window's "Context" tab).
+# Where uploaded documents and their manifest live; "" = <models_dir>/context (kept across sessions).
+dir = ""
+default_mode = "reference"   # what a newly added document gets: "inject" (its text in every prompt) |
+                             # "reference" (a model-written digest in every prompt, and only the passages
+                             # that match the question pulled in -- pre-processed once, on the notes lane)
+include_in = "all"           # which jobs see the documents: all | questions (spoken/typed/on-screen only) | none
+reference_tokens = 1200      # budget of the stable <reference> block (injected documents + the catalogue)
+lookup_tokens = 600          # budget of the per-question <lookup> passages (trimmed first when space is short)
+lookup_top_k = 3             # at most this many passages per answer
+lookup_min_score = 3.0       # BM25 score a passage needs to be pulled in at all (a passage matching a
+                             # single query term needs twice that: one rare word is not relevance)
+chunk_chars = 1200           # passage size the documents are indexed in (split on headings / paragraphs)
+max_doc_chars = 200000       # a longer document is cut here when added
+digest = true                # pre-process reference-mode documents into a 2-4 line digest with the model
+digest_tokens = 120
+# The window itself. "auto": every prompt is sized to the server's REAL per-request context (llama-server
+# /props, else the whole ctx_size: with parallel = 2 the server runs one unified KV pool that both slots
+# share, split between an answer and the notes lane by lane_share) -- transcript + reference + screen + the
+# answer budget must fit, trimmed
+# in priority order (lookup, reference, summary, screen, then the OLDEST transcript; the newest speech and
+# the question are never trimmed). "fixed": the pre-2026-10-06 behaviour ([llm].context_tokens of
+# transcript, no fitting; the window still anchors and the documents still apply). A profile that pins
+# ctx_size = 4096 with parallel = 2 gives an answer ~2600 tokens of pool (the rest is the notes lane's):
+# without "auto", a long meeting's prompt overflows that and answers fail or get cut short.
+budget_mode = "auto"
+reserve_tokens = 256         # safety margin kept free under the server's context
+lane_share = 0.3             # with parallel = 2 the two slots share ONE KV pool: this share is kept for the
+                             # notes lane (notes, compaction, digests) so an answer and a notes job fit together
+transcript_min_tokens = 600  # the newest speech always keeps at least this much
+# When the transcript window overflows, drop at least this share of it at once (whole lines, oldest first)
+# instead of sliding one line per turn: the prompt prefix then stays byte-identical for many turns and
+# llama.cpp's KV prefix cache keeps hitting (a window that slides every turn is re-evaluated in full every
+# turn -- the "slower and slower in a long session" effect). 0 = slide like before.
+trim_step = 0.25
+compaction = "summary"       # what happens to transcript that fell out of the window: "summary" = folded into a
+                             # short running <earlier> summary by the model (notes lane, never the answer lane) | "off"
+summary_tokens = 250
+chars_per_token = 3.6        # starting estimate for every budget; calibrated live from the server's own counts
+auto_calibrate = true
+
 [ui]
 opacity = 0.93
 width = 460

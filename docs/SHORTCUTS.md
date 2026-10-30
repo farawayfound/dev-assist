@@ -97,7 +97,7 @@ These work only in the place listed, not globally.
 | Live tab | Double-click a speaker name | Rename the speaker |
 | Title bar or slim bar | Drag | Move the overlay |
 | Window edges or bottom-right corner | Drag | Resize the overlay |
-| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots, recap and the dashboard now; the automatic switches; role; session context; Assist settings…), **View ▸** (switch the view; the current view's display options — the board's columns, the OCR readout, the history pane, partial speech; **Screen source ▸** off / active window / a monitor / a region; **Screen: pause/resume**; **Repository ▸** auto-detected from Claude Code or a chosen folder), **Dashboard mode**, Export session, New session, Settings…, Models…, Rename speakers, Quit |
+| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots, recap and the dashboard now; the automatic switches; role; session context; Assist settings…), **View ▸** (switch the view; the current view's display options — the board's columns, the OCR readout, the history pane, partial speech; the **Overlay strips** — Tabs, Controls, Status, Monitor; **Screen source ▸** off / active window / a monitor / a region; **Screen: pause/resume**; **Repository ▸** auto-detected from Claude Code or a chosen folder), **Dashboard mode**, Export session, New session, Settings…, Models…, Context documents…, Compact context now, Rename speakers, Quit |
 | Notes tab | **Questions** / **Blind spots** / **Recap** buttons | Refresh one insight section now, or recap the session |
 | Dashboard mode | **✓** / **✕** / **↺** / **⧉** / **＋** on a card, or right-click a card | Mark an item answered, done or met (with an optional note), dismiss it (a constraint: lift it), reopen it, copy a prompt, add a sub-task under a task; the menu also has **Edit…** and, on a task, **Add an acceptance criterion…** / **Add a prompt…** |
 | Dashboard mode | **+** / **↻** in a column header, **Refresh all** | Add an item by hand (a goal asks which task it is for); refresh that column, or everything (the items and the notes) |
@@ -108,9 +108,39 @@ These work only in the place listed, not globally.
 | Manual advance on, anywhere on screen | **Click** the **middle** button (press the scroll wheel) — or **three-finger-tap** a touchpad whose tap is mapped to "Middle mouse button" in Windows touchpad settings | Generate **Code** for the current task. No hold needed by default; whether Text / Code require the press-and-hold is set on the Hands-free settings tab (`manual_hold_text` / `manual_hold_code`) |
 
 These have a button or menu entry but no hotkey: **Read**, **Revert**, **Reset**, **Text**,
-switching tabs, the Notes tab's **Questions** / **Blind spots** buttons (`Ctrl+Alt+W` refreshes
-both), and the **⋯** menu's Assist switches, role and session context, Export session, New
-session, Settings…, Models… and Rename speakers.
+**Compact** (fold the context window into a running summary now, like `/compact`; also in the
+**⋯** menu as "Compact context now"), switching tabs, the Notes tab's **Questions** / **Blind
+spots** buttons (`Ctrl+Alt+W` refreshes both), and the **⋯** menu's Assist switches, role and
+session context, Export session, New session, Settings…, Models… and Rename speakers.
+
+## View menu — show or hide parts of the panel
+
+Besides switching the view, the **⋯** menu's **View** submenu toggles which strips of the full
+overlay are shown (under **Overlay strips**); each choice is saved to `[ui]` in `config.toml`. The
+title bar (drag, toggles, menu, Hide) is always present, so the panel can never be made
+unreachable.
+
+| Entry | Hides | `[ui]` key |
+| --- | --- | --- |
+| **Tabs** | The top strip: the Live / Assist / Notes / Screen tabs and the Manual / Hands-free switches. The content stack keeps whatever tab was last selected | `show_tabs` |
+| **Controls** | The bottom button row (Read, Revert, Reset, Pause, Checkpoint, Compact, Text, Code) | `show_controls` |
+| **Status** | The bottom status strip (audio levels, ASR / LLM state, capture and screen status) | `show_status` |
+| **Monitor** | *Adds* a section at the bottom that visually monitors the local model's performance (time-to-first-token, tokens/second), the context window and its contents (how the per-request budget is filled by source, plus the running summary and document count), and resource use. Off by default | `show_monitor` |
+
+The View choices apply to the full overlay: completion mode's slim bar owns its own layout, the
+hands-free view shows only its output, the title bar and the Manual / Hands-free switches, and in
+dashboard mode the board takes the tab strip's place while Controls, Status and Monitor still
+apply.
+
+### Configuring the Monitor
+
+**Settings → Monitor** chooses which readouts the Monitor section shows (`[monitor]` in
+`config.toml`): LLM performance, the context window and its contents, and the utilisation of the
+**CPU**, **system RAM**, the dedicated **GPU** (with VRAM in use), the integrated **iGPU**, and
+the **NPU**. The GPU / iGPU / NPU rows hide automatically when the machine has no such device, or
+when Windows does not expose its performance counter (the NPU counter is only present on recent
+Windows builds). GPU, iGPU and NPU utilisation and system RAM come from Windows performance
+counters; dedicated-GPU VRAM uses the GPU driver (NVML on NVIDIA).
 
 ## Changing a hotkey
 

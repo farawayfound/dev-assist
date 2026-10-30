@@ -607,6 +607,29 @@ class UIConfig:
     start_hidden: bool = False
     click_through: bool = False
     always_on_top: bool = True
+    # View: which pieces of the full overlay's chrome are shown (the "View" menu, 2026-10-07).
+    # Each hides only that strip; the title bar (drag, toggles, menu) is always present so the
+    # panel can never be made unreachable. Hidden in completion mode (the slim bar owns the
+    # layout) and overridden by the hands-free view, which shows only its output and switches.
+    show_tabs: bool = True             # the top strip: Live/Assist/Notes/Screen + Manual/Hands-free (keeps the current tab's content when hidden)
+    show_controls: bool = True         # the Read/Revert/Reset/Pause/Checkpoint/Compact/Text/Code row
+    show_status: bool = True           # the bottom status strip (audio levels, ASR/LLM, capture, screen)
+    show_monitor: bool = False         # the performance / context / resource monitor section (off by default)
+
+
+@dataclass
+class MonitorConfig:
+    """What the View → Monitor section displays (2026-10-07). ``[ui].show_monitor`` turns the whole
+    section on or off; these pick which readouts appear inside it (the "Monitor" settings tab).
+    The hardware-utilisation rows (gpu / igpu / npu) also hide themselves automatically when the
+    machine has no such device, so enabling one on a machine that lacks it is harmless."""
+    show_performance: bool = True   # the local model's speed: time-to-first-token, tokens/second
+    show_context: bool = True       # the context window, its breakdown by source, and the running summary
+    show_cpu: bool = True           # whole-machine CPU utilisation
+    show_ram: bool = True           # system memory used / total
+    show_gpu: bool = True           # the dedicated GPU: utilisation + VRAM in use
+    show_igpu: bool = True          # the integrated GPU (iGPU) utilisation
+    show_npu: bool = True           # the NPU / AI accelerator utilisation (e.g. Intel AI Boost)
 
 
 @dataclass
@@ -792,6 +815,7 @@ class Config:
     explain: ExplainConfig = field(default_factory=ExplainConfig)
     handsfree: HandsFreeConfig = field(default_factory=HandsFreeConfig)
     context: ContextConfig = field(default_factory=ContextConfig)
+    monitor: MonitorConfig = field(default_factory=MonitorConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)

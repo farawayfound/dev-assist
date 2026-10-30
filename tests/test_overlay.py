@@ -844,7 +844,7 @@ def fake_windows(
 
 # --------------------------------------------------------- bottom controls + choices ----
 def test_control_row_order_is_read_revert_reset_pause_checkpoint_text_code(window: OverlayWindow) -> None:
-    """One row: Read, Revert, Reset, Pause, Checkpoint, a stretch, then Text and Code on the right."""
+    """One row: Read, Revert, Reset, Pause, Checkpoint, Compact, a stretch, then Text and Code."""
     from PySide6.QtWidgets import QSizePolicy as _QSP
 
     row = window.read_btn.parentWidget()
@@ -852,10 +852,10 @@ def test_control_row_order_is_read_revert_reset_pause_checkpoint_text_code(windo
     layout = row.layout()
     items = [layout.itemAt(i) for i in range(layout.count())]
     widgets = [it.widget() for it in items]
-    assert [w.text() for w in widgets[:5]] == ["Read", "Revert", "Reset", "Pause", "Checkpoint"]
-    assert widgets[5] is None and items[5].spacerItem() is not None   # the stretch that right-aligns Text + Code
-    assert widgets[6] is window.text_btn and widgets[6].text() == "Text"
-    assert widgets[7] is window.code_btn and widgets[7].text() == "Code" and len(items) == 8
+    assert [w.text() for w in widgets[:6]] == ["Read", "Revert", "Reset", "Pause", "Checkpoint", "Compact"]
+    assert widgets[6] is None and items[6].spacerItem() is not None   # the stretch that right-aligns Text + Code
+    assert widgets[7] is window.text_btn and widgets[7].text() == "Text"
+    assert widgets[8] is window.code_btn and widgets[8].text() == "Code" and len(items) == 9
     assert window.text_btn.objectName() == "primary" == window.code_btn.objectName()
     # The row never raises the window's minimum width (the offscreen font is far wider than the
     # real one; see _build_control_row).

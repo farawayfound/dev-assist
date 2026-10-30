@@ -1183,6 +1183,41 @@ class TranscriptWindow:
             log.debug("context window: anchor -> %s (%d lines dropped, %d kept)", st.anchor, len(dropped), len(shown))
             return WindowResult(text, True, dropped_text, since_id, len(text), len(shown), windowed=True)
 
+    def compact_now(self, scope: int | None, *, keep_lines: int = 2) -> int:
+        """Force a compaction of `scope`'s window *now* (the overlay's "Compact" control, like the
+        ``/compact`` command): drop everything in the current window except the newest `keep_lines`
+        lines into the pending buffer and move the anchor past them, exactly as an overflow would,
+        so the next prompt carries only the newest speech and the caller's compaction job folds
+        the rest into this scope's running summary. Returns the number of characters dropped (0 =
+        the window already held `keep_lines` or fewer lines, nothing to do). Unlike overflow this
+        ignores the budget -- it is the user asking to free room immediately."""
+        keep = max(1, int(keep_lines))
+        with self._lock:
+            st = self._scope(scope)
+            last = self._transcript.last_id()
+            if st.anchor is not None and (last is None or last < st.anchor):
+                st = self._scopes[scope] = _Scope()      # transcript cleared under us: start afresh
+            start = scope
+            if st.anchor is not None:
+                start = st.anchor if scope is None else max(scope, st.anchor)
+            lines = self._transcript.lines(since_id=start, until_id=None)
+            if len(lines) <= keep:
+                return 0
+            dropped = lines[: len(lines) - keep]
+            dropped_text = "\n".join(t for _i, t in dropped)
+            if not dropped_text.strip():
+                return 0
+            st.anchor = dropped[-1][0]
+            # Raise the pending bound so this forced drop is never truncated before its job runs
+            # (render sizes `limit` to the budget; a user-driven compact can exceed that).
+            st.limit = max(st.limit, 4 * (len(dropped_text) + len(st.pending)), 1)
+            st.pending = _bound_tail(f"{st.pending}\n{dropped_text}" if st.pending else dropped_text, st.limit)
+            if st.staged:
+                st.summary, st.staged = st.staged, ""
+            log.info("context window: forced compaction of scope %s (%d lines -> pending)",
+                     scope, len(dropped))
+            return len(dropped_text)
+
     def anchor(self, scope: int | None) -> int | None:
         with self._lock:
             st = self._scopes.get(scope)
@@ -1729,6 +1764,11 @@ class ContextManager:
 
     def claim_compaction(self, scope: int | None, max_chars: int | None = None) -> tuple[str, str] | None:
         return self.window.claim_compaction(scope, max_chars)
+
+    def compact_now(self, scope: int | None, *, keep_lines: int = 2) -> int:
+        """Force `scope`'s window to shed everything but its newest lines into the pending buffer
+        now (see :meth:`TranscriptWindow.compact_now`); returns the characters dropped."""
+        return self.window.compact_now(scope, keep_lines=keep_lines)
 
     def restore_compaction(self, scope: int | None, dropped: str) -> None:
         self.window.restore_compaction(scope, dropped)

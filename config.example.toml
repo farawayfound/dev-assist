@@ -346,6 +346,18 @@ summary_tokens = 250
 chars_per_token = 3.6        # starting estimate for every budget; calibrated live from the server's own counts
 auto_calibrate = true
 
+[monitor]
+# What the View -> Monitor section displays (the "Monitor" settings tab). [ui].show_monitor turns
+# the whole section on; these pick which readouts appear inside it. The gpu/igpu/npu rows also hide
+# themselves automatically when the machine has no such device.
+show_performance = true   # the local model's speed: time-to-first-token, tokens/second
+show_context = true       # the context window, its breakdown by source, and the running summary
+show_cpu = true           # whole-machine CPU utilisation
+show_ram = true           # system memory used / total
+show_gpu = true           # the dedicated GPU: utilisation + VRAM in use
+show_igpu = true          # the integrated GPU (iGPU) utilisation
+show_npu = true           # the NPU / AI accelerator utilisation (e.g. Intel AI Boost)
+
 [ui]
 opacity = 0.93
 width = 460
@@ -356,6 +368,13 @@ font_size = 11
 start_hidden = false
 click_through = false
 always_on_top = true
+# View: which pieces of the full overlay's chrome are shown (toggled live from the "View" menu).
+# The title bar is always present, so the panel can never be made unreachable. These are ignored
+# in completion mode (the slim bar owns the layout) and overridden by the hands-free view.
+show_tabs = true        # the top strip: Live/Assist/Notes/Screen + the Manual/Hands-free switches
+show_controls = true    # the Read/Revert/Reset/Pause/Checkpoint/Compact/Text/Code button row
+show_status = true      # the bottom status strip (audio levels, ASR/LLM, capture, screen)
+show_monitor = false    # the performance monitor: LLM speed, the context window + its contents, CPU/RAM/VRAM
 
 [hotkeys]
 toggle_visible = "ctrl+alt+space"

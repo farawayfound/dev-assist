@@ -414,6 +414,42 @@ def test_the_view_menu_shows_the_current_view_and_switches_it(window: OverlayWin
     assert not window._completion_mode and window.stack.currentIndex() == 2
 
 
+def test_the_view_menu_carries_the_overlay_strips_once(window: OverlayWindow, actions: FakeActions) -> None:
+    """exo-cortex's strip toggles (2026-10-07) sit inside this View submenu, under "Overlay strips":
+    the ⋯ menu has one View entry, not two."""
+    window._rebuild_menu()
+    assert [a.text() for a in window._menu.actions()].count("View") == 1
+    view = _submenu(window._menu, "View")
+    texts = [a.text() for a in view.actions() if a.text()]
+    head = texts.index("Overlay strips")
+    assert texts[head + 1:head + 5] == ["Tabs", "Controls", "Status", "Monitor"]
+    assert not _action(view, "Overlay strips").isEnabled()
+    assert texts.index("Screen source") > head + 4
+    _action(view, "Controls").setChecked(False)
+    assert not window._cfg.ui.show_controls and not window.control_row.isVisibleTo(window)
+    assert ("apply_settings", ({"ui.show_controls": False},)) in actions.calls
+
+
+def test_the_view_strips_apply_on_the_board_except_the_tab_strip(window: OverlayWindow) -> None:
+    """The board stands in for the tab strip; the Controls / Status / Monitor choices still apply
+    while it is up, and the tab strip follows its own choice again once it closes."""
+    window._set_view_option("controls", False)
+    window._set_view_option("monitor", True)
+    window._set_dashboard_mode(True)
+    QTest.qWait(_WAIT_MS)
+    assert window.dashboard_view.isVisibleTo(window) and not window.tabstrip.isVisibleTo(window)
+    assert not window.control_row.isVisibleTo(window) and window.monitor.isVisibleTo(window)
+    window._set_view_option("tabs", False)
+    window._set_view_option("controls", True)
+    assert not window.tabstrip.isVisibleTo(window) and window.control_row.isVisibleTo(window)
+    window._set_dashboard_mode(False)
+    QTest.qWait(_WAIT_MS)
+    assert not window.tabstrip.isVisibleTo(window) and window.stack.isVisibleTo(window)
+    assert window.control_row.isVisibleTo(window) and window.monitor.isVisibleTo(window)
+    window._set_view_option("tabs", True)
+    assert window.tabstrip.isVisibleTo(window)
+
+
 def test_the_view_menu_sets_the_screen_source_and_the_repository(window: OverlayWindow, actions: FakeActions, bus: EventBus) -> None:
     cfg = window._cfg
     window._rebuild_menu()

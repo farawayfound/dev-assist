@@ -456,6 +456,10 @@ class _CompactJob:
     id: int
     scope: int | None
     attempts: int = 0
+    #: A user-driven ``compact()`` (not an overflow): its summary is installed ACTIVELY the moment
+    #: it finishes (one prefix re-evaluation), because the forced drop already moved the anchor, so
+    #: there is no imminent natural anchor move to fold a merely *staged* summary into.
+    force: bool = False
 
 
 @dataclass
@@ -1109,6 +1113,41 @@ class Assistant:
             self._plan_parsed = None
         self._bus.publish(CheckpointEvent(t=t, segment_id=seg_id))
         log.info("assistant: checkpoint set (segment %s, %d answer(s) so far)", seg_id, answers)
+
+    def compact(self) -> int:
+        """Compact the context window *now* (the overlay's "Compact" control, like the
+        ``/compact`` command): fold everything but the newest couple of lines of the whole-meeting
+        transcript window into its running summary straight away, instead of waiting for the
+        window to overflow.
+
+        The whole-meeting scope (``None``) is used on purpose: it is what the spoken/typed/on-screen
+        answers (auto, manual, ask, screen) build on, and what the Monitor's summary readout shows,
+        and it is the scope that grows across a long meeting. The checkpoint-scoped coding context
+        (``code`` / ``solve`` / ``text``) is already bounded to the post-checkpoint transcript, and
+        Checkpoint is its reset; compacting it here would leave the broad transcript untouched,
+        which is the opposite of what Compact is for.
+
+        The drop is immediate (the next prompt is already shorter); the summary of the dropped text
+        is produced by a compaction job on the notes lane (so it never competes with a live answer)
+        and, because the drop already moved the anchor, that job installs its summary ACTIVELY the
+        moment it finishes rather than staging it for a future anchor move -- otherwise the dropped
+        speech would be missing from every prompt AND its summary withheld until the next natural
+        overflow. Returns the transcript characters folded (0 = nothing to compact, or
+        ``[context].compaction`` is off -- with compaction off the window is left untouched rather
+        than silently discarding the transcript)."""
+        if self._cfg.context.compaction != "summary":
+            log.info("assistant: compact requested but [context].compaction is off; nothing folded")
+            return 0
+        scope = None   # the whole meeting (see the docstring)
+        try:
+            dropped = self._context.window.compact_now(scope)
+        except Exception:  # noqa: BLE001 - context bookkeeping must never break a user action
+            log.exception("assistant: forced compaction of scope %s failed", scope)
+            return 0
+        if dropped > 0:
+            self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=scope, force=True))
+            log.info("assistant: forced compaction queued (scope %s, %d chars folded)", scope, dropped)
+        return dropped
 
     def _checkpoint_boundary(self) -> int | None:
         """Transcript segment id the current checkpoint starts after (`None` = no checkpoint yet:
@@ -2386,17 +2425,27 @@ class Assistant:
                 if yielded and not self._stop_event.is_set():
                     log.info("compact job %d: stepped aside for an answer; re-queued", job.id)
                     self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=job.scope,
-                                                       attempts=job.attempts + 1))
+                                                       attempts=job.attempts + 1, force=job.force))
                 return
             self._observe_prompt(self._sent_chars(system, user, None), self._client.last_stats)
-            self._context.stage_summary(job.scope, summary)    # enters the prompt at the next anchor move
+            if job.force:
+                # A user-driven Compact already moved the anchor; there is no imminent natural
+                # anchor move to fold a staged summary into, so install it active now (one prefix
+                # re-evaluation) -- otherwise the dropped speech is absent AND unsummarised until
+                # the window next overflows on its own.
+                self._context.set_summary(job.scope, summary)
+            else:
+                self._context.stage_summary(job.scope, summary)    # enters the prompt at the next anchor move
             more = self._context.window.has_pending(job.scope)
         except Exception:  # noqa: BLE001
             log.exception("compact job %d: storing the summary failed", job.id)
             return
-        log.info("compact job %d: scope %s summary staged (%d chars)", job.id, job.scope, len(summary))
+        log.info("compact job %d: scope %s summary %s (%d chars)", job.id, job.scope,
+                 "installed" if job.force else "staged", len(summary))
         if more:
-            self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=job.scope))
+            # A forced compaction with a long backlog keeps folding actively (each chunk installed)
+            # until the pending buffer is drained, so the whole dropped span is summarised at once.
+            self._compact_slot.put(_CompactJob(id=next(self._job_ids), scope=job.scope, force=job.force))
 
     # ---- yielding to a live answer (2026-10-06) ---------------------------------------------
 

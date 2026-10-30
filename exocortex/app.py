@@ -795,6 +795,17 @@ class Engine(EngineActions):
         if self.completer is not None:
             self.completer.reset()
 
+    def compact(self) -> int:
+        """Compact the active context window now (`EngineActions.compact`). Never deferred: it is
+        window bookkeeping plus a notes-lane summary job, no blocking model call. Returns the
+        transcript characters folded (0 when there was nothing to fold / compaction is off)."""
+        if self.assistant is not None and hasattr(self.assistant, "compact"):
+            try:
+                return int(self.assistant.compact())
+            except Exception:  # noqa: BLE001 - a user action must never raise into the UI
+                log.exception("engine: compact() failed")
+        return 0
+
     def code(self, focus: str = "", label: str = "") -> int | None:
         """Returns the job id, or None when the request was deferred (LLM not ready yet).
         `label`: what the Assist tab shows as the question instead of `focus` (hands-free)."""

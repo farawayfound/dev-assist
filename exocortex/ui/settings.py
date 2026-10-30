@@ -313,6 +313,17 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "never the NVIDIA GPU. npu = Intel AI Boost via OpenVINO (1.5 s, ~0 CPU). cpu = OpenVINO CPU "
                    "(1.9 s) or onnxruntime (3.7 s, all cores). auto = igpu, else npu, else cpu."),
     ),
+    "Monitor": (
+        Field("monitor", "show_performance", "LLM performance (speed, tokens/second)", "bool"),
+        Field("monitor", "show_context", "Context window and its contents", "bool"),
+        Field("monitor", "show_cpu", "CPU utilisation", "bool"),
+        Field("monitor", "show_ram", "System RAM utilisation", "bool"),
+        Field("monitor", "show_gpu", "GPU utilisation and VRAM (dedicated GPU)", "bool"),
+        Field("monitor", "show_igpu", "Integrated GPU (iGPU) utilisation", "bool",
+              help="Hidden automatically when the machine has no integrated GPU."),
+        Field("monitor", "show_npu", "NPU utilisation", "bool",
+              help="The AI accelerator (e.g. Intel AI Boost). Hidden automatically when absent."),
+    ),
     "Window": (
         Field("ui", "opacity", "Opacity", "float", 0.4, 1.0, 0.05),
         Field("ui", "start_hidden", "Start hidden", "bool"),

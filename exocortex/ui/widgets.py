@@ -1417,6 +1417,354 @@ def _shorten(text: str, n: int) -> str:
     return text if len(text) <= n else text[: max(1, n - 1)] + "…"
 
 
+# ------------------------------------------------------------------ monitor ---------
+#: Colour per context-window source, in the order they stack in the segmented bar (oldest /
+#: most-stable first). The names match ContextUsageEvent's ``*_tokens`` fields.
+_CONTEXT_SEGMENTS: list[tuple[str, str, str]] = [
+    # (snapshot key, short label, colour)
+    ("system_tokens", "system", "#a5b4fc"),       # indigo-300
+    ("earlier_tokens", "earlier", "#c4b5fd"),      # violet-300
+    ("reference_tokens", "docs", "#6ee7b7"),       # emerald-300
+    ("lookup_tokens", "lookup", "#99f6e4"),        # teal-200
+    ("screen_tokens", "screen", "#fdba74"),        # orange-300
+    ("transcript_tokens", "transcript", None),     # None -> the accent colour (the live speech)
+]
+
+
+class _Dot(QLabel):
+    """A small filled circle used as a readiness indicator (a local twin of the overlay's
+    ``_DotIndicator`` so this module keeps no cross-import)."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setFixedSize(10, 10)
+        self.set_color(COLORS["warn"])
+
+    def set_color(self, color: str) -> None:
+        self.setStyleSheet(f"background: {color}; border-radius: 5px;")
+
+
+class _SegBar(QWidget):
+    """A thin, multi-colour horizontal bar: the context window filled by source, against the
+    server's per-request slot. Each segment is proportional to its token count; the remainder is
+    the free budget (faint). Painting works under the offscreen test platform."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._segments: list[tuple[str, int, str]] = []    # (label, tokens, colour)
+        self._total = 0                                    # slot tokens (the full width)
+        self.setFixedHeight(12)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+    def set_segments(self, segments: list[tuple[str, int, str]], total: int) -> None:
+        self._segments = [(lbl, max(0, int(tok)), col) for lbl, tok, col in segments]
+        self._total = max(0, int(total))
+        parts = ", ".join(f"{lbl} {tok}" for lbl, tok, _c in self._segments if tok > 0)
+        used = sum(tok for _l, tok, _c in self._segments)
+        self.setToolTip(
+            (f"Context window: {used} / {self._total or '?'} tokens" + (f"  ({parts})" if parts else ""))
+        )
+        self.update()
+
+    def paintEvent(self, event: QPaintEvent) -> None:  # noqa: N802 - Qt override
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        w = self.width()
+        h = self.height()
+        radius = h / 2
+        # Track (the free budget).
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor(255, 255, 255, 22))
+        painter.drawRoundedRect(QRectF(0, 0, w, h), radius, radius)
+        # Width the segments are scaled against: the slot if known, else the sum of the segments.
+        used = sum(tok for _l, tok, _c in self._segments)
+        scale_total = self._total if self._total > 0 else used
+        if scale_total <= 0 or w <= 0:
+            painter.end()
+            return
+        painter.setClipRect(0, 0, w, h)
+        x = 0.0
+        for _label, tokens, colour in self._segments:
+            if tokens <= 0:
+                continue
+            seg_w = w * (tokens / scale_total)
+            if seg_w <= 0:
+                continue
+            painter.setBrush(QColor(colour))
+            painter.drawRoundedRect(QRectF(x, 0, seg_w + radius, h), radius, radius)
+            x += seg_w
+        painter.end()
+
+
+class MonitorView(QFrame):
+    """The "View -> Monitor" section (2026-10-07): a compact, always-glanceable readout of the
+    local model's **performance** (last answer's time-to-first-token and tokens/second), the
+    **context window and its contents** (how the per-request budget is filled, by source, plus
+    the running summary of the earlier meeting and the document count), and **resource
+    utilisation** (CPU, system RAM, the dedicated GPU's use and VRAM, the integrated GPU, and the
+    NPU).
+
+    Which of those appear is driven by ``[monitor]`` (the Settings "Monitor" tab); the overlay
+    calls :meth:`apply_config` when it changes. The hardware-utilisation rows (GPU / iGPU / NPU)
+    additionally hide themselves when the machine reports no such device.
+
+    Driven entirely by ``OverlayWindow`` -- it feeds performance from ``AssistDoneEvent``, the
+    model state from ``ComponentStatusEvent("llm")``, the context from ``ContextUsageEvent`` /
+    ``EngineActions.context_usage()``, and resources from ``exocortex.ui.resources`` on a slow
+    timer. It never subscribes to the bus itself (like every widget here).
+    """
+
+    def __init__(self, cfg: Config, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._cfg = cfg
+        self.setObjectName("monitor")
+        self.setStyleSheet(
+            "QFrame#monitor { border: 1px solid %s; border-radius: 10px; }"
+            " QLabel { font-size: 8pt; }"
+            " QLabel#monhead { color: %s; font-weight: 600; letter-spacing: 0.4px; }"
+            " QLabel#monval { color: %s; }"
+            % (COLORS["border"], COLORS["text_dim"], COLORS["text"])
+        )
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(8, 6, 8, 6)
+        outer.setSpacing(5)
+
+        # ---- performance (its own box so the whole section can be hidden) ------------
+        self._perf_box = QWidget(self)
+        perf_row = QHBoxLayout(self._perf_box)
+        perf_row.setContentsMargins(0, 0, 0, 0)
+        perf_row.setSpacing(6)
+        self._perf_dot = _Dot(self._perf_box)
+        head = QLabel("LLM", self._perf_box)
+        head.setObjectName("monhead")
+        self._model_label = _BadgeLabel("", self._perf_box)
+        self._model_label.setObjectName("monval")
+        self._perf_label = QLabel("—", self._perf_box)
+        self._perf_label.setObjectName("monval")
+        self._perf_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        perf_row.addWidget(self._perf_dot)
+        perf_row.addWidget(head)
+        perf_row.addWidget(self._model_label, 1)
+        perf_row.addWidget(self._perf_label)
+        outer.addWidget(self._perf_box)
+
+        # ---- context window + contents ----------------------------------------------
+        self._ctx_box = QWidget(self)
+        ctx_v = QVBoxLayout(self._ctx_box)
+        ctx_v.setContentsMargins(0, 0, 0, 0)
+        ctx_v.setSpacing(4)
+        ctx_head = QHBoxLayout()
+        ctx_head.setSpacing(6)
+        ch = QLabel("Context", self._ctx_box)
+        ch.setObjectName("monhead")
+        self._ctx_label = QLabel("—", self._ctx_box)
+        self._ctx_label.setObjectName("monval")
+        self._ctx_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        ctx_head.addWidget(ch)
+        ctx_head.addStretch(1)
+        ctx_head.addWidget(self._ctx_label)
+        ctx_v.addLayout(ctx_head)
+        self._seg_bar = _SegBar(self._ctx_box)
+        ctx_v.addWidget(self._seg_bar)
+        self._legend_label = _BadgeLabel("", self._ctx_box)
+        self._legend_label.setObjectName("monval")
+        ctx_v.addWidget(self._legend_label)
+        # The running summary of the transcript that fell out of the window ("contents").
+        self._summary = QPlainTextEdit(self._ctx_box)
+        self._summary.setReadOnly(True)
+        self._summary.setFrameShape(QFrame.Shape.NoFrame)
+        self._summary.setMaximumHeight(48)
+        self._summary.setPlaceholderText("no earlier summary yet")
+        self._summary.setStyleSheet("font-size: 8pt;")
+        ctx_v.addWidget(self._summary)
+        outer.addWidget(self._ctx_box)
+
+        # ---- resource utilisation ---------------------------------------------------
+        self._res_box = QWidget(self)
+        res_v = QVBoxLayout(self._res_box)
+        res_v.setContentsMargins(0, 0, 0, 0)
+        res_v.setSpacing(3)
+        self._res_head = QLabel("Resources", self._res_box)
+        self._res_head.setObjectName("monhead")
+        res_v.addWidget(self._res_head)
+        # One bar per device, keyed so apply_config()/set_resources() can show or hide each.
+        self._bars: dict[str, QProgressBar] = {}
+        for key, label in (("cpu", "CPU"), ("ram", "RAM"), ("gpu", "GPU"),
+                           ("igpu", "iGPU"), ("npu", "NPU")):
+            bar = QProgressBar(self._res_box)
+            bar.setRange(0, 100)
+            bar.setValue(0)
+            bar.setTextVisible(True)
+            bar.setFixedHeight(14)
+            bar.setFormat(f"{label} —")
+            res_v.addWidget(bar)
+            self._bars[key] = bar
+        outer.addWidget(self._res_box)
+
+        self._summary_text = ""
+        #: Whether each hardware device has ever reported a reading; a device that never does
+        #: (absent on this machine) keeps its row hidden even when its [monitor] toggle is on.
+        self._available: dict[str, bool] = {"cpu": True, "ram": True, "gpu": False,
+                                            "igpu": False, "npu": False}
+        self.apply_config()
+
+    # ---- configuration ----------------------------------------------------------------
+    def apply_config(self) -> None:
+        """Show or hide each section / row per ``[monitor]`` (the Settings "Monitor" tab). Called
+        at build time and whenever the settings change."""
+        m = self._cfg.monitor
+        self._perf_box.setVisible(bool(m.show_performance))
+        self._ctx_box.setVisible(bool(m.show_context))
+        wanted = {"cpu": m.show_cpu, "ram": m.show_ram, "gpu": m.show_gpu,
+                  "igpu": m.show_igpu, "npu": m.show_npu}
+        any_res = False
+        for key, bar in self._bars.items():
+            # Core rows (cpu/ram) show whenever enabled; optional hardware rows also need the
+            # device to exist on this machine (self._available), so an absent iGPU/NPU never
+            # leaves a dead "—" row behind.
+            show = bool(wanted[key]) and (self._available[key] or key in ("cpu", "ram"))
+            bar.setVisible(show)
+            any_res = any_res or show
+        self._res_head.setVisible(any_res)
+        self._res_box.setVisible(any_res)
+
+    # ---- performance ------------------------------------------------------------------
+    def set_llm_state(self, state: str, detail: str = "") -> None:
+        self._perf_dot.set_color(_state_color(state))
+        if state == "ready" and detail:
+            self._model_label.setText(_shorten(detail, 40))
+        elif state in ("loading", "busy"):
+            self._model_label.setText(_shorten(detail, 40) if detail else state + "…")
+        elif state == "error":
+            self._model_label.setText("error" + (f": {_shorten(detail, 30)}" if detail else ""))
+
+    def set_model(self, name: str) -> None:
+        if name:
+            self._model_label.setText(_shorten(name, 40))
+
+    def on_assist_done(self, ttft_s: float, tokens: int, tok_per_s: float, cancelled: bool) -> None:
+        if cancelled:
+            return
+        self._perf_label.setText(f"ttft {ttft_s:.2f}s · {tok_per_s:.0f} tok/s · {tokens} tok")
+        self._perf_label.setToolTip(
+            f"Last answer: {ttft_s:.2f}s to the first token, {tok_per_s:.0f} tokens/second, "
+            f"{tokens} tokens generated"
+        )
+
+    # ---- context ----------------------------------------------------------------------
+    def set_context(self, snap: dict) -> None:
+        """Render ``EngineActions.context_usage()`` (or a ContextUsageEvent turned into a dict)."""
+        if not snap:
+            return
+        slot = int(snap.get("slot_tokens", 0) or 0)
+        segments: list[tuple[str, int, str]] = []
+        used = 0
+        legend_parts: list[str] = []
+        for key, label, colour in _CONTEXT_SEGMENTS:
+            tok = int(snap.get(key, 0) or 0)
+            used += tok
+            segments.append((label, tok, colour or COLORS["accent"]))
+            if tok > 0:
+                legend_parts.append(f"{label} {tok}")
+        self._seg_bar.set_segments(segments, slot)
+        pct = f" ({100 * used / slot:.0f}%)" if slot > 0 else ""
+        prompt_tokens = snap.get("prompt_tokens")
+        server = f" · server {int(prompt_tokens)}" if prompt_tokens else ""
+        trimmed = " · trimmed" if snap.get("trimmed") else ""
+        # Both feeds are normalised to the CONTRIBUTING count: a ContextUsageEvent carries it as
+        # `documents`, the poll snapshot as `documents_used` (its `documents` is the ENABLED count).
+        docs = int(snap.get("documents_used", snap.get("documents", 0)) or 0)
+        doc_txt = f" · {docs} doc{'s' if docs != 1 else ''} used" if docs else ""
+        self._ctx_label.setText(f"{used} / {slot or '?'}{pct}{server}")
+        self._ctx_label.setToolTip(
+            "Context window used / per-request slot (the app's token estimate; 'server' is the "
+            "model's own prompt-token count for the last request)"
+        )
+        self._legend_label.setText("  ".join(legend_parts) + trimmed + doc_txt)
+        # Only the full poll snapshot carries the running summary; a raw ContextUsageEvent does
+        # not, so leave the existing text alone when the key is absent (never blank it).
+        if "earlier_summary" in snap:
+            self._summary_text = str(snap.get("earlier_summary", "") or "")
+            self._render_summary()
+
+    def _render_summary(self) -> None:
+        """Paint the earlier-meeting summary."""
+        self._summary.setPlaceholderText("no earlier summary yet")
+        if self._summary.toPlainText() != self._summary_text:
+            self._summary.setPlainText(self._summary_text)
+
+    # ---- resources --------------------------------------------------------------------
+    @staticmethod
+    def _set_pct(bar: QProgressBar, label: str, pct: float | None, suffix: str = "", tip: str = "") -> None:
+        if pct is None:
+            bar.setValue(0)
+            bar.setFormat(f"{label} —{suffix}")
+        else:
+            bar.setValue(int(round(max(0.0, min(100.0, pct)))))
+            bar.setFormat(f"{label} {pct:.0f}%{suffix}")
+        if tip:
+            bar.setToolTip(tip)
+
+    def set_resources(self, sample: "ResourceSample") -> None:
+        """Update every resource bar from one :class:`~exocortex.ui.resources.ResourceSample`. A
+        hardware device that reports a value (even 0.0) is marked available, so its row appears;
+        one that is always ``None`` (absent) keeps its row hidden."""
+        cpu = getattr(sample, "cpu_percent", None)
+        self._set_pct(self._bars["cpu"], "CPU", cpu, tip="Whole-machine CPU utilisation")
+
+        ram_used = getattr(sample, "ram_used_mb", None)
+        ram_total = getattr(sample, "ram_total_mb", None)
+        if ram_used is not None and ram_total:
+            pct = 100 * ram_used / ram_total
+            self._bars["ram"].setValue(int(round(pct)))
+            self._bars["ram"].setFormat(f"RAM {ram_used / 1024:.1f} / {ram_total / 1024:.1f} GB")
+            self._bars["ram"].setToolTip("System memory in use / total")
+        else:
+            self._bars["ram"].setValue(0)
+            self._bars["ram"].setFormat("RAM —")
+
+        # Dedicated GPU: utilisation plus VRAM in use, on one bar (bar value tracks VRAM).
+        gpu = getattr(sample, "gpu_percent", None)
+        vused = getattr(sample, "vram_used_mb", None)
+        vtotal = getattr(sample, "vram_total_mb", None)
+        source = getattr(sample, "vram_source", "none")
+        gpu_bar = self._bars["gpu"]
+        util_txt = f"{gpu:.0f}%" if gpu is not None else "—"
+        if vused is not None and vtotal:
+            gpu_bar.setValue(int(round(100 * vused / vtotal)))
+            gpu_bar.setFormat(f"GPU {util_txt} · {vused / 1024:.1f}/{vtotal / 1024:.1f} GB")
+            gpu_bar.setToolTip(f"Dedicated GPU utilisation; VRAM in use / total (source: {source})")
+        else:
+            gpu_bar.setValue(int(round(gpu)) if gpu is not None else 0)
+            gpu_bar.setFormat(f"GPU {util_txt}")
+            gpu_bar.setToolTip("Dedicated GPU utilisation")
+        gpu_available = gpu is not None or (vused is not None and bool(vtotal))
+
+        igpu = getattr(sample, "igpu_percent", None)
+        self._set_pct(self._bars["igpu"], "iGPU", igpu, tip="Integrated GPU utilisation")
+        npu = getattr(sample, "npu_percent", None)
+        self._set_pct(self._bars["npu"], "NPU", npu, tip="NPU / AI-accelerator utilisation")
+
+        # Learn which optional devices exist, then re-apply the show/hide rules.
+        avail = dict(self._available)
+        avail["gpu"] = avail["gpu"] or gpu_available
+        avail["igpu"] = avail["igpu"] or (igpu is not None)
+        avail["npu"] = avail["npu"] or (npu is not None)
+        if avail != self._available:
+            self._available = avail
+            self.apply_config()
+
+    def clear(self) -> None:
+        """Forget the per-session readouts (a Reset / New session): the context and performance
+        belong to the session; the resource meters keep sampling."""
+        self._perf_label.setText("—")
+        self._ctx_label.setText("—")
+        self._legend_label.setText("")
+        self._seg_bar.set_segments([], 0)
+        self._summary_text = ""
+        self._render_summary()
+
+
 # ------------------------------------------------------------------ ask box ---------
 class _AskLineEdit(QLineEdit):
     """QLineEdit that clears itself (instead of propagating) on Escape."""

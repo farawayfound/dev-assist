@@ -65,6 +65,15 @@ class EngineActions(Protocol):
         problem starts fresh). The transcript, notes, answer history and the ask box keep the
         whole meeting. Publishes a `CheckpointEvent`."""
 
+    def compact(self) -> int:
+        """Compact the active context window now (the Controls row's "Compact" button, like the
+        ``/compact`` command): fold everything but the newest lines of the current scope's
+        transcript window into a short running summary straight away, instead of waiting for the
+        window to overflow. The scope is the current checkpoint's (the coding context), or the
+        whole meeting when none is set. The drop is immediate and the summary is produced on the
+        notes lane (never blocking a live answer). Returns the transcript characters folded (0
+        when there was nothing to fold, or ``[context].compaction`` is off)."""
+
     def code(self, focus: str = "") -> None:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now, in the primary language unless the task calls for another.

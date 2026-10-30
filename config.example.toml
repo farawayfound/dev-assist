@@ -210,11 +210,11 @@ width = 1180                # window width in dashboard mode (the normal size is
 view_refresh_s = 5          # the board re-renders its timestamps this often (no model call)
 persist = true              # keep the items in the session folder (dashboard.sqlite); false = memory only
 
-# ---- model context (2026-10-20, docs/DASHBOARD.md): what the model may look up beyond the
+# ---- the project (2026-10-20, docs/DASHBOARD.md): what the model may look up beyond the
 # transcript and the screen -- the repository being worked on (searched for the names a prompt
 # mentions, never read wholesale) and the Claude Code toolkit installed in it (a compact catalog
 # auto-discovered from <repo_root>/.claude and CLAUDE.local.md, re-checked every rescan_s).
-[context]
+[project]
 repo_root = ""              # the project directory, e.g. "D:/repos/my-service"; "" = the auto-detected one (below)
 repo_auto = true            # with no repo_root: the project Claude Code last ran in (its session logs under
                             # ~/.claude/projects), re-checked every few seconds -- its toolkit is found with no setup

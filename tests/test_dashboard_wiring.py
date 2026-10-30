@@ -16,24 +16,40 @@ def test_the_new_sections_round_trip_through_toml(tmp_path: Path) -> None:
     cfg.dashboard.enabled = True
     cfg.dashboard.refresh_interval_s = 45
     cfg.dashboard.show_notes = False
-    cfg.context.repo_root = "D:/repos/thing"
-    cfg.context.repo_exclude = [".git", "vendor"]
-    cfg.context.toolkit_dir = "~/claude-toolkit"
+    cfg.project.repo_root = "D:/repos/thing"
+    cfg.project.repo_exclude = [".git", "vendor"]
+    cfg.project.toolkit_dir = "~/claude-toolkit"
     cfg.llm.dashboard_max_tokens = 500
     cfg.hotkeys.toggle_dashboard = "ctrl+alt+shift+d"
     path = save_config(cfg, tmp_path / "config.toml")
     text = path.read_text(encoding="utf-8")
-    assert "[dashboard]" in text and "[context]" in text and 'toggle_dashboard = "ctrl+alt+shift+d"' in text
+    assert "[dashboard]" in text and "[project]" in text and 'toggle_dashboard = "ctrl+alt+shift+d"' in text
     loaded = load_config(path)
     assert loaded.dashboard.enabled and loaded.dashboard.refresh_interval_s == 45 and not loaded.dashboard.show_notes
-    assert loaded.context.repo_root == "D:/repos/thing" and loaded.context.repo_exclude == [".git", "vendor"]
-    assert loaded.context.toolkit_dir == "~/claude-toolkit" and loaded.llm.dashboard_max_tokens == 500
+    assert loaded.project.repo_root == "D:/repos/thing" and loaded.project.repo_exclude == [".git", "vendor"]
+    assert loaded.project.toolkit_dir == "~/claude-toolkit" and loaded.llm.dashboard_max_tokens == 500
     defaults = Config()
     assert defaults.dashboard.track and defaults.dashboard.refresh_interval_s == 90 and defaults.dashboard.width == 1180
     assert defaults.dashboard.show_goals and defaults.dashboard.show_constraints and defaults.dashboard.show_prompts
-    assert defaults.context.toolkit and defaults.context.repo_search and defaults.context.repo_root == ""
-    assert defaults.context.repo_auto and defaults.context.repo_auto_max_age_h == 12
+    assert defaults.project.toolkit and defaults.project.repo_search and defaults.project.repo_root == ""
+    assert defaults.project.repo_auto and defaults.project.repo_auto_max_age_h == 12
     assert defaults.hotkeys.toggle_dashboard == "ctrl+alt+d"
+
+
+def test_an_older_config_keeps_its_project_keys_from_the_context_section(tmp_path: Path) -> None:
+    """Until 2026-10-29 the repository / toolkit keys lived in [context]: they load into [project]
+    (a key already in [project] wins) and the next save writes them there."""
+    path = tmp_path / "config.toml"
+    path.write_text(
+        '[context]\nrepo_root = "D:/repos/old"\nrepo_auto = false\ntoolkit_max_chars = 1200\n\n'
+        '[project]\ntoolkit_max_chars = 900\n',
+        encoding="utf-8",
+    )
+    loaded = load_config(path)
+    assert loaded.project.repo_root == "D:/repos/old" and not loaded.project.repo_auto
+    assert loaded.project.toolkit_max_chars == 900
+    text = save_config(loaded, path).read_text(encoding="utf-8")
+    assert 'repo_root = "D:/repos/old"' in text.split("[project]", 1)[1]
 
 
 class _Service:
@@ -129,12 +145,12 @@ def test_completion_context_switches_the_lookups_too() -> None:
     cfg = Config()
     eng = Engine(cfg, EventBus())
     eng.set_completion_context({"repo": False, "toolkit": False, "screen": False})
-    assert not cfg.context.repo_search and not cfg.context.toolkit_in_answers and not cfg.completion.use_screen
+    assert not cfg.project.repo_search and not cfg.project.toolkit_in_answers and not cfg.completion.use_screen
     eng.set_completion_context({"repo": True})
-    assert cfg.context.repo_search and not cfg.context.toolkit_in_answers
+    assert cfg.project.repo_search and not cfg.project.toolkit_in_answers
 
 
-def test_apply_settings_reconfigures_the_context_and_toggles_the_mode(tmp_path: Path) -> None:
+def test_apply_settings_reconfigures_the_project_and_toggles_the_mode(tmp_path: Path) -> None:
     from exocortex.app import Engine
 
     class _Context:
@@ -153,22 +169,22 @@ def test_apply_settings_reconfigures_the_context_and_toggles_the_mode(tmp_path: 
     sub = bus.subscribe()
     eng = Engine(cfg, bus)
     ctx = _Context()
-    eng.context = ctx
+    eng.project = ctx
     repo = tmp_path / "repo"
     repo.mkdir()
-    cfg.context.repo_root = str(repo)
+    cfg.project.repo_root = str(repo)
     cfg.dashboard.enabled = True
     cfg.screen.interval_s = 1.5
-    eng.apply_settings({"context.repo_root": str(repo), "dashboard.enabled": True, "dashboard.track": True})
+    eng.apply_settings({"project.repo_root": str(repo), "dashboard.enabled": True, "dashboard.track": True})
     assert ctx.reconfigured == 1
     events = drain(sub)
     assert any(isinstance(e, DashboardModeEvent) and e.enabled for e in events)
-    assert any(isinstance(e, ComponentStatusEvent) and e.component == "context" and e.detail == "Context: repo: no toolkit installed"
+    assert any(isinstance(e, ComponentStatusEvent) and e.component == "project" and e.detail == "Project: repo: no toolkit installed"
                for e in events)
     cfg.screen.monitor = 1
     eng.apply_settings({"screen.monitor": 1})               # no reader yet: nothing to re-point, no crash
     assert load_config(cfg.path).screen.monitor == 1
     saved = load_config(cfg.path)
-    assert saved.context.repo_root == str(repo) and saved.dashboard.enabled
+    assert saved.project.repo_root == str(repo) and saved.dashboard.enabled
     assert saved.screen.interval_s == 1.5                   # the view mode never touches the capture cadence
     assert eng.screen is None                               # and nothing here started or re-tuned the reader

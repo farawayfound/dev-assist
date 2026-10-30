@@ -443,10 +443,10 @@ agents, named exactly as installed, with the task's details and constraints as a
 prompt naming something not installed is thrown away); answers get the catalog too with
 `toolkit_in_answers` on, and a mentioned part's full text is handed over on demand. Which
 repository: the one Claude Code last ran in, read from its own session logs
-(`[context].repo_auto`, the default), or a folder you pin under **⋯ › View › Repository** /
-`[context].repo_root`. The repository itself is never injected wholesale: with `repo_search` on,
+(`[project].repo_auto`, the default), or a folder you pin under **⋯ › View › Repository** /
+`[project].repo_root`. The repository itself is never injected wholesale: with `repo_search` on,
 the identifiers and file names a prompt mentions are looked up and only the matching lines go in.
-Both live on the Settings dialog's **Context** tab, everything else on its **Dashboard** tab.
+Both live on the Settings dialog's **Project** tab, everything else on its **Dashboard** tab.
 The card actions, the View menu and every key: [docs/DASHBOARD.md](docs/DASHBOARD.md).
 
 ### Screen reading
@@ -761,7 +761,7 @@ Explanations, **Hands-free** (what makes a new task — new-line and view-change
 **when code is on screen** — settle time, deviation, cumulative context size, Text/Code on or
 off, accurate OCR, **manual advance** with its press-and-hold time and the quick-middle-click
 option), Assist (including **Focus**, **Use libraries** and **Comments in generated
-code**), Notes, **Dashboard** (the board's tracking, columns and width), **Context** (the
+code**), Notes, **Dashboard** (the board's tracking, columns and width), **Project** (the
 repository root, the on-demand repository lookups and the Claude Code toolkit catalog), Screen
 (including **OCR device**), Window, Audio — covering everything in the Configuration section
 below. The old **Model** tab (backend, model, context size, llama.cpp
@@ -854,7 +854,7 @@ show_goals = true           # each column can be hidden (show_notes, show_nextst
                             # show_questions, show_blindspots; show_prompts for the prompts under the action items)
 width = 1180                # window width in dashboard mode; the normal size is restored on exit
 
-[context]
+[project]
 repo_root = ""              # the project directory: searched on demand for the names a prompt mentions,
                             # never read wholesale; also where the Claude Code toolkit (.claude/,
                             # CLAUDE.local.md) is auto-discovered and re-checked every rescan_s

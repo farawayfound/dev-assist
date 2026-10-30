@@ -24,9 +24,9 @@ SPEAKER_MODEL = MODELS / "wespeaker_en_voxceleb_CAM++.onnx"
 
 @pytest.fixture(autouse=True)
 def _no_repo_auto_detect(monkeypatch: pytest.MonkeyPatch) -> None:
-    """[context].repo_auto reads the real ~/.claude/projects: keep every test independent of the
+    """[project].repo_auto reads the real ~/.claude/projects: keep every test independent of the
     repository the developer happens to be working in (a test that exercises it passes `home`)."""
-    monkeypatch.setattr("exocortex.context.provider.detect_repo_root", lambda *a, **k: None)
+    monkeypatch.setattr("exocortex.project.provider.detect_repo_root", lambda *a, **k: None)
 
 
 @pytest.fixture(scope="session")

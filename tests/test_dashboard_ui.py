@@ -433,22 +433,22 @@ def test_the_view_menu_sets_the_screen_source_and_the_repository(window: Overlay
 
     repo = _submenu(_submenu(window._menu, "View"), "Repository")
     texts = [a.text() for a in repo.actions() if a.text()]
-    assert texts[0] == "Context: not known yet" and not repo.actions()[0].isEnabled()
+    assert texts[0] == "Project: not known yet" and not repo.actions()[0].isEnabled()
     auto = _action(repo, "Auto-detect from Claude Code")
     assert auto.isChecked() and auto.isEnabled() and "Choose a folder…" in texts and "Clear the folder" not in " ".join(texts)
     auto.setChecked(False)
-    assert not cfg.context.repo_auto and ("apply_settings", ({"context.repo_auto": False},)) in actions.calls
-    bus.publish(ComponentStatusEvent(component="context", state="info", detail="Context: scenario-1 (detected from Claude Code): 8 skills"))
+    assert not cfg.project.repo_auto and ("apply_settings", ({"project.repo_auto": False},)) in actions.calls
+    bus.publish(ComponentStatusEvent(component="project", state="info", detail="Project: scenario-1 (detected from Claude Code): 8 skills"))
     window._poll()
-    assert window.toast.text() == "Context: scenario-1 (detected from Claude Code): 8 skills"
-    cfg.context.repo_root = "D:/repos/thing"
+    assert window.toast.text() == "Project: scenario-1 (detected from Claude Code): 8 skills"
+    cfg.project.repo_root = "D:/repos/thing"
     window._rebuild_menu()
     repo = _submenu(_submenu(window._menu, "View"), "Repository")
     texts = [a.text() for a in repo.actions() if a.text()]
-    assert texts[0] == "Context: scenario-1 (detected from Claude Code): 8 skills"
+    assert texts[0] == "Project: scenario-1 (detected from Claude Code): 8 skills"
     assert "Folder: D:/repos/thing" in texts and not _action(repo, "Auto-detect").isEnabled()
     _action(repo, "Clear the folder").trigger()
-    assert cfg.context.repo_root == "" and ("apply_settings", ({"context.repo_root": ""},)) in actions.calls
+    assert cfg.project.repo_root == "" and ("apply_settings", ({"project.repo_root": ""},)) in actions.calls
 
 
 def test_settings_dialog_has_the_dashboard_and_context_tabs_and_the_overlay_mirrors_them(window: OverlayWindow, actions: FakeActions, qapp: QApplication) -> None:
@@ -457,18 +457,18 @@ def test_settings_dialog_has_the_dashboard_and_context_tabs_and_the_overlay_mirr
                 "suggest_prompts", "show_resolved", "resolved_keep", "show_notes", "show_nextsteps", "show_goals",
                 "show_constraints", "show_questions", "show_blindspots", "show_prompts", "width", "view_refresh_s", "persist"):
         assert key in dashboard_keys, key
-    context_keys = [f.key for f in FIELDS["Context"]]
+    context_keys = [f.key for f in FIELDS["Project"]]
     for key in ("repo_root", "repo_auto", "repo_auto_max_age_h", "repo_search", "repo_max_files", "repo_max_chars", "toolkit",
                 "toolkit_lookup", "toolkit_in_answers", "toolkit_user_layer", "toolkit_dir", "toolkit_max_chars", "rescan_s"):
         assert key in context_keys, key
     assert "monitor" in [f.key for f in FIELDS["Screen"]]
     assert list(FIELDS).index("Dashboard") == list(FIELDS).index("Notes") + 1
-    assert list(FIELDS).index("Context") == list(FIELDS).index("Dashboard") + 1
+    assert list(FIELDS).index("Project") == list(FIELDS).index("Dashboard") + 1
     dlg = SettingsDialog(Config(), None)
     try:
-        assert dlg.show_tab("Dashboard") and dlg.show_tab("Context")
-        assert isinstance(dlg._widgets["context.repo_root"], QLineEdit)
-        assert isinstance(dlg._widgets["context.toolkit"], QCheckBox) and isinstance(dlg._widgets["context.repo_auto"], QCheckBox)
+        assert dlg.show_tab("Dashboard") and dlg.show_tab("Project")
+        assert isinstance(dlg._widgets["project.repo_root"], QLineEdit)
+        assert isinstance(dlg._widgets["project.toolkit"], QCheckBox) and isinstance(dlg._widgets["project.repo_auto"], QCheckBox)
         assert isinstance(dlg._widgets["dashboard.refresh_interval_s"], QSpinBox) and isinstance(dlg._widgets["screen.monitor"], QSpinBox)
     finally:
         dlg.close()
@@ -488,7 +488,7 @@ def test_settings_dialog_has_the_dashboard_and_context_tabs_and_the_overlay_mirr
 
 
 def test_the_slim_bar_context_menu_switches_the_lookups(window: OverlayWindow, actions: FakeActions) -> None:
-    window._cfg.context.repo_search = False
+    window._cfg.project.repo_search = False
     window._rebuild_context_menu()
     acts = {a.text(): a for a in window._context_menu.actions() if a.text()}
     assert not acts["Repository lookup (answers, dashboard)"].isChecked()

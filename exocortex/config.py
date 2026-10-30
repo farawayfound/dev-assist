@@ -429,13 +429,13 @@ class DashboardConfig:
 
 
 @dataclass
-class ContextConfig:
+class ProjectConfig:
     """What the model may look up beyond the transcript and the screen (2026-10-20): the
     repository being worked on, and the Claude Code toolkit installed in it. Nothing here is
     injected wholesale -- the repo is SEARCHED for the file names and identifiers a prompt
     mentions, and only the matching lines go in; the toolkit is a compact, auto-discovered
     catalog of what is installed (skills, agents, rules, workflows, hooks) plus, on mention,
-    one part's full text. Edited on the settings dialog's "Context" tab.
+    one part's full text. Edited on the settings dialog's "Project" tab.
     """
     # The project directory ("" = none): searched on demand, never read wholesale. Also where the
     # Claude Code toolkit is looked for (<repo_root>/.claude, <repo_root>/CLAUDE.local.md).
@@ -701,7 +701,7 @@ class Config:
     assist: AssistConfig = field(default_factory=AssistConfig)
     notes: NotesConfig = field(default_factory=NotesConfig)
     dashboard: DashboardConfig = field(default_factory=DashboardConfig)
-    context: ContextConfig = field(default_factory=ContextConfig)
+    project: ProjectConfig = field(default_factory=ProjectConfig)
     screen: ScreenConfig = field(default_factory=ScreenConfig)
     completion: CompletionConfig = field(default_factory=CompletionConfig)
     explain: ExplainConfig = field(default_factory=ExplainConfig)
@@ -843,6 +843,32 @@ def _migrate_llm_url_keys(llm_data: dict[str, Any]) -> None:
         )
 
 
+#: The keys ``[project]`` took over from ``[context]`` (2026-10-29): until then the repository /
+#: toolkit settings lived in a ``[context]`` section, which exo-cortex's reference documents and
+#: context window now own. No upstream ``[context]`` key shares one of these names.
+_PROJECT_KEYS = frozenset(f.name for f in fields(ProjectConfig))
+
+
+def _migrate_project_keys(data: dict[str, Any]) -> None:
+    """Move the repository / toolkit keys of an older config.toml from ``[context]`` to
+    ``[project]``, in place, BEFORE ``_apply`` runs. A key already present in ``[project]`` wins;
+    the next save writes everything under ``[project]``. A ``[context]`` section left empty by
+    the move is dropped, so it is not reported as unknown."""
+    old = data.get("context")
+    if not isinstance(old, dict):
+        return
+    moved = {k: old.pop(k) for k in [k for k in old if k in _PROJECT_KEYS]}
+    if not moved:
+        return
+    project = data.setdefault("project", {})
+    if isinstance(project, dict):
+        for k, v in moved.items():
+            project.setdefault(k, v)
+    if not old:
+        del data["context"]
+    log.info("config: moved [context] %s to [project]", ", ".join(sorted(moved)))
+
+
 def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     cfg = Config()
     p = Path(path) if path else find_config_path()
@@ -850,6 +876,7 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
         return cfg
     with open(p, "rb") as f:
         data = tomllib.load(f)
+    _migrate_project_keys(data)
     for sec_name, sec_data in data.items():
         if not hasattr(cfg, sec_name) or not isinstance(sec_data, dict):
             log.warning("config: unknown section [%s] ignored", sec_name)

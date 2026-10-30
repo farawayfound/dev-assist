@@ -1,12 +1,12 @@
-"""Repository lookups (exocortex.context.repo / provider, 2026-10-20): identifier extraction,
+"""Repository lookups (exocortex.project.repo / provider, 2026-10-20): identifier extraction,
 the file index, the budgeted search and the provider's config gating."""
 from __future__ import annotations
 
 from pathlib import Path
 
 from exocortex.config import Config
-from exocortex.context.provider import ContextProvider
-from exocortex.context.repo import RepoHit, RepoIndex, extract_terms, render_hits
+from exocortex.project.provider import ProjectContext
+from exocortex.project.repo import RepoHit, RepoIndex, extract_terms, render_hits
 
 
 def test_extract_terms_keeps_identifier_shapes_only() -> None:
@@ -89,16 +89,16 @@ def test_render_hits_only_whole_files_within_the_budget() -> None:
 def test_provider_respects_the_config(tmp_path: Path) -> None:
     _tree(tmp_path)
     cfg = Config()
-    cfg.context.repo_root = str(tmp_path)
-    cfg.context.toolkit = True
-    provider = ContextProvider(cfg, home=tmp_path / "nohome")
+    cfg.project.repo_root = str(tmp_path)
+    cfg.project.toolkit = True
+    provider = ProjectContext(cfg, home=tmp_path / "nohome")
     assert provider.repo_available and provider.repo_root == tmp_path
     block = provider.repo_block("where is TenantCache used?", "", time_budget_s=2.0)
     assert block.startswith(f'<repo root="{tmp_path.name}">') and "src/pkg/billing.py" in block and block.endswith("</repo>")
     assert provider.repo_block("nothing identifier like here") == ""
-    cfg.context.repo_search = False
+    cfg.project.repo_search = False
     assert provider.repo_block("TenantCache") == ""
-    cfg.context.repo_search = True
+    cfg.project.repo_search = True
     assert provider.toolkit_block() == "" and provider.toolkit_lookup("/recon") == "" and not provider.has_toolkit
     assert provider.toolkit_summary() == ""
     # a toolkit installed later is picked up by refresh()
@@ -109,8 +109,8 @@ def test_provider_respects_the_config(tmp_path: Path) -> None:
     assert provider.toolkit_block().startswith("<toolkit>\n") and "/recon [topic]: look around" in provider.toolkit_block()
     assert "### /recon [topic] (skill)" in provider.toolkit_lookup("try /recon first")
     assert provider.toolkit_summary().startswith("1 skill (")
-    cfg.context.toolkit = False
+    cfg.project.toolkit = False
     assert provider.toolkit_block() == "" and provider.toolkit_lookup("/recon") == ""
-    cfg.context.repo_root = ""
+    cfg.project.repo_root = ""
     provider.reconfigure()
     assert not provider.repo_available and provider.repo_block("TenantCache") == ""

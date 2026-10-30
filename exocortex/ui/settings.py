@@ -233,7 +233,7 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("dashboard", "max_new_items", "New items per column (and per task) per refresh", "int", 1, 8),
         Field("dashboard", "suggest_prompts", "Suggest prompts for Claude Code under the action items", "bool",
               help="Exactly what to type into Claude Code next, one per task that needs one. With a toolkit "
-                   "installed in the repository (the Context tab) every prompt starts with one of its slash "
+                   "installed in the repository (the Project tab) every prompt starts with one of its slash "
                    "commands or agents, named exactly as installed; a prompt naming something that is not "
                    "installed is thrown away."),
         Field("dashboard", "show_resolved", "Keep answered / done / met items visible, collapsed", "bool"),
@@ -255,37 +255,37 @@ FIELDS: dict[str, tuple[Field, ...]] = {
               help="Applies to the next session (New session / the next launch); off = in memory only. "
                    "The board is also written as dashboard.md next to the notes either way."),
     ),
-    # ---- model context (2026-10-20): what the model may look up beyond transcript + screen ----
-    "Context": (
-        Field("context", "repo_root", "Repository root (the project being worked on)", "text",
+    # ---- the project (2026-10-20): what the model may look up beyond transcript + screen ----
+    "Project": (
+        Field("project", "repo_root", "Repository root (the project being worked on)", "text",
               help="A directory. Searched on demand for the file names and identifiers a prompt mentions; "
                    "never read wholesale. Also where the Claude Code toolkit is looked for (.claude/, "
                    "CLAUDE.local.md). Empty = the auto-detected one below, when that is on."),
-        Field("context", "repo_auto", "Auto-detect the repository from Claude Code", "bool",
+        Field("project", "repo_auto", "Auto-detect the repository from Claude Code", "bool",
               help="With no root above: the directory Claude Code was most recently run in, read from its own "
                    "session logs (~/.claude/projects), re-checked every few seconds -- so the toolkit installed "
                    "in the project you are working in is found with no setup. The ⋯ menu's View > Repository "
                    "shows what was found."),
-        Field("context", "repo_auto_max_age_h", "... only a session active within (hours; 0 = any)", "int", 0, 720),
-        Field("context", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
+        Field("project", "repo_auto_max_age_h", "... only a session active within (hours; 0 = any)", "int", 0, 720),
+        Field("project", "repo_search", "Look up files / identifiers mentioned (answers, dashboard)", "bool",
               help="Only the matching lines go to the model, only when something identifier-like was said, "
                    "typed or shown. Not for inline completions (latency)."),
-        Field("context", "repo_max_files", "... files per lookup", "int", 1, 20),
-        Field("context", "repo_max_chars", "... characters of matched lines", "int", 200, 8000, 100),
-        Field("context", "toolkit", "Claude Code toolkit context (auto-discovered in the repository)", "bool",
+        Field("project", "repo_max_files", "... files per lookup", "int", 1, 20),
+        Field("project", "repo_max_chars", "... characters of matched lines", "int", 200, 8000, 100),
+        Field("project", "toolkit", "Claude Code toolkit context (auto-discovered in the repository)", "bool",
               help="The installed skills, agents, rules, workflows and hooks, as a compact catalog built from "
                    "their own files -- nothing hard-coded -- so the model names them exactly and suggests "
                    "the right one. Re-checked every few seconds (below): an install mid-session is picked up."),
-        Field("context", "toolkit_lookup", "... hand over the full text of a skill / agent that is mentioned", "bool"),
-        Field("context", "toolkit_in_answers", "... also for answers, ask and recap (not only the dashboard)", "bool",
+        Field("project", "toolkit_lookup", "... hand over the full text of a skill / agent that is mentioned", "bool"),
+        Field("project", "toolkit_in_answers", "... also for answers, ask and recap (not only the dashboard)", "bool",
               help="The catalog sits at the end of the system prompt, so it is prefix-cached across turns."),
-        Field("context", "toolkit_user_layer", "... also scan ~/.claude (the opt-in user layer)", "bool"),
-        Field("context", "toolkit_dir", "Toolkit clone (optional)", "text",
+        Field("project", "toolkit_user_layer", "... also scan ~/.claude (the opt-in user layer)", "bool"),
+        Field("project", "toolkit_dir", "Toolkit clone (optional)", "text",
               help="Richer one-line descriptions from its modules/index.json for the parts installed. Empty = "
                    "~/claude-toolkit or ~/.claude/dev-toolkit when present. Never lists parts that are not "
                    "installed."),
-        Field("context", "toolkit_max_chars", "Toolkit catalog budget (chars)", "int", 300, 8000, 100),
-        Field("context", "rescan_s", "Re-check the repository's .claude/ every (s)", "int", 5, 600, 5),
+        Field("project", "toolkit_max_chars", "Toolkit catalog budget (chars)", "int", 300, 8000, 100),
+        Field("project", "rescan_s", "Re-check the repository's .claude/ every (s)", "int", 5, 600, 5),
     ),
     "Screen": (
         Field("screen", "interval_s", "Capture interval (s)", "float", 0.5, 10.0, 0.5),

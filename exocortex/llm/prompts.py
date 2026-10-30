@@ -109,7 +109,7 @@ _FOCUS_RULE = (
 #: Exact reply the model gives when there is nothing technical to do; callers drop such answers.
 SKIP_MARKER = "(nothing to do)"
 
-#: The standing instruction that goes with a <toolkit> block (exocortex.context: the Claude Code
+#: The standing instruction that goes with a <toolkit> block (exocortex.project: the Claude Code
 #: skills / agents / rules installed in the user's repository, auto-discovered): name what is
 #: listed exactly as listed, never invent one. Config-only text, so a system prompt carrying it
 #: stays byte-identical across turns (the KV-cache rule in the module docstring).
@@ -164,7 +164,7 @@ context_lines = _context_lines
 
 def _extra_block(extra: str) -> str:
     """Render the optional on-demand context blocks a user turn carries right before its ask
-    (``<repo>`` lines from the project, ``<toolkit_detail>``: exocortex.context) -- "" when
+    (``<repo>`` lines from the project, ``<toolkit_detail>``: exocortex.project) -- "" when
     there is none. Volatile, so always after the screen block."""
     text = (extra or "").strip()
     return f"{text}\n\n" if text else ""

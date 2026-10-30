@@ -307,7 +307,7 @@ class DashboardModeEvent(Event):
 
 
 # ---- system ------------------------------------------------------------------
-Component = Literal["audio", "asr", "diarization", "llm", "session", "app", "completion", "dashboard", "context"]
+Component = Literal["audio", "asr", "diarization", "llm", "session", "app", "completion", "dashboard", "project"]
 ComponentState = Literal["loading", "ready", "error", "info", "busy"]
 
 

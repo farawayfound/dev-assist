@@ -187,7 +187,7 @@ _CANCELS: dict[str, tuple[str, ...]] = {
 }
 
 #: Kinds whose SYSTEM prompt carries the installed Claude Code toolkit's catalog (<toolkit>,
-#: exocortex.context) when `[context].toolkit_in_answers` is on; "dashboard" builds its own.
+#: exocortex.project) when `[project].toolkit_in_answers` is on; "dashboard" builds its own.
 _TOOLKIT_KINDS: frozenset[str] = frozenset({"ask", "auto", "manual", "screen", "recap", "text", "code", "solve", "suggest", "insights"})
 #: Kinds whose USER turn gets the on-demand <repo> / <toolkit_detail> lookups (the question, the
 #: tail of the transcript and the screen name the identifiers searched for).
@@ -497,11 +497,11 @@ class Assistant:
         #: Dashboard mode (exocortex.dashboard, 2026-10-20): the DashboardService's hooks that
         #: BUILD a "dashboard" job's prompt from its store and SETTLE the result (None = no
         #: dashboard wired: `dashboard_now` refuses, and the Notes-tab insights passes run as
-        #: before). And the on-demand context provider (exocortex.context.provider) that adds the
+        #: before). And the project context (exocortex.project.provider) that adds the
         #: installed toolkit's catalog and repository lookups to the other kinds' prompts.
         self._dashboard_build: Callable[..., tuple[str, str, int]] | None = None
         self._dashboard_settle: Callable[..., None] | None = None
-        self._context_provider: Any = None
+        self._project: Any = None
 
         self._auto_enabled = cfg.assist.auto_answer_questions
         #: Global pause for all *automatic* assist activity (auto-answer, screen questions,
@@ -863,20 +863,20 @@ class Assistant:
         except Exception:  # noqa: BLE001 - the service's own bug must never kill the worker
             log.exception("assistant: dashboard settle hook failed for job %d", job.id)
 
-    # ---- on-demand context (exocortex.context, 2026-10-20) ------------------------------------
+    # ---- on-demand context (exocortex.project, 2026-10-20) ------------------------------------
 
-    def set_context_provider(self, provider: Any) -> None:
-        """Register (or with None, clear) the `exocortex.context.provider.ContextProvider` whose
+    def set_project_context(self, provider: Any) -> None:
+        """Register (or with None, clear) the `exocortex.project.provider.ProjectContext` whose
         `toolkit_block()` joins the system prompt of answers and `repo_block()` /
         `toolkit_lookup()` the user turn (`_TOOLKIT_KINDS` / `_LOOKUP_KINDS`). Called on the
         assist-worker thread once per job, never from here."""
-        self._context_provider = provider
+        self._project = provider
 
     def _toolkit_system_suffix(self, kind: str) -> str:
         """The <toolkit> catalog (with its standing rule) to append to a system prompt, or ""."""
-        provider = self._context_provider
-        context_cfg = getattr(self._cfg, "context", None)
-        if provider is None or kind not in _TOOLKIT_KINDS or not getattr(context_cfg, "toolkit_in_answers", False):
+        provider = self._project
+        project_cfg = getattr(self._cfg, "project", None)
+        if provider is None or kind not in _TOOLKIT_KINDS or not getattr(project_cfg, "toolkit_in_answers", False):
             return ""
         try:
             block = provider.toolkit_block() or ""
@@ -885,22 +885,22 @@ class Assistant:
             return ""
         return f"\n{prompts.TOOLKIT_RULE}\n{block}" if block.strip() else ""
 
-    def _context_extra(self, job: _AssistJob, window: str, screen_text: str) -> str:
+    def _project_extra(self, job: _AssistJob, window: str, screen_text: str) -> str:
         """The on-demand blocks for a user turn: lines from the repository matching the names
         the question / recent transcript / screen mention, and the full text of a toolkit part
         that was mentioned. "" when there is no provider, nothing to look up or nothing found."""
-        provider = self._context_provider
+        provider = self._project
         if provider is None or job.kind not in _LOOKUP_KINDS:
             return ""
         tail = window[-600:] if window else ""
-        context_cfg = getattr(self._cfg, "context", None)
+        project_cfg = getattr(self._cfg, "project", None)
         try:
             repo = provider.repo_block(job.question, job.focus, tail, screen_text, time_budget_s=_LOOKUP_BUDGET_S) or ""
             detail = ""
-            if getattr(context_cfg, "toolkit_in_answers", False):
+            if getattr(project_cfg, "toolkit_in_answers", False):
                 detail = provider.toolkit_lookup(job.question, job.focus, tail) or ""
         except Exception:  # noqa: BLE001
-            log.exception("assistant: context lookup failed for job %d", job.id)
+            log.exception("assistant: project lookup failed for job %d", job.id)
             return ""
         return "\n\n".join(part for part in (repo.strip(), detail.strip()) if part)
 
@@ -1583,14 +1583,14 @@ class Assistant:
 
         A "dashboard" job's prompt comes from the dashboard service's hook (`_dashboard_prompt`:
         the board's open items, the transcript up to `until_id`, the context lookups). Every
-        other kind is built by `_build_prompt_parts_base` and then, through the context
-        provider (2026-10-20): the installed toolkit's catalog is appended to the system prompt
+        other kind is built by `_build_prompt_parts_base` and then, through the project
+        context (2026-10-20): the installed toolkit's catalog is appended to the system prompt
         (`_toolkit_system_suffix`, config-stable, so it stays a cached prefix) and the on-demand
-        repository / toolkit-detail lookups go into the user turn (`_context_extra`).
+        repository / toolkit-detail lookups go into the user turn (`_project_extra`).
         """
         if job.kind == "dashboard":
             return self._dashboard_prompt(job, screen_text, until_id)
-        extra = self._context_extra(job, window, screen_text)
+        extra = self._project_extra(job, window, screen_text)
         system, user, max_tokens = self._build_prompt_parts_base(job, window, screen_text, choices, question, extra=extra)
         suffix = self._toolkit_system_suffix(job.kind)
         return (system + suffix if suffix else system), user, max_tokens

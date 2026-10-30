@@ -589,7 +589,7 @@ class OverlayWindow(QWidget):
         # and the stacked tabs; the window widens to [dashboard].width and the normal geometry is
         # remembered and restored on exit, the way completion mode's slim bar does it.
         self._dashboard_mode = False
-        self._context_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
+        self._project_detail = ""        # the engine's last word on the repository / toolkit (the View menu shows it)
         self._dashboard_normal_geometry: QRect | None = None
 
         # Window flags must be set once, before the first show(). A visible copilot: a normal
@@ -921,8 +921,8 @@ class OverlayWindow(QWidget):
             act.setChecked(on)
             act.toggled.connect(lambda checked, k=key: self._actions.set_completion_context({k: checked}))
         menu.addSeparator()
-        # 2026-10-20: the on-demand lookups (exocortex.context) that answers and the dashboard get.
-        ctx = self._cfg.context
+        # 2026-10-20: the on-demand lookups (exocortex.project) that answers and the dashboard get.
+        ctx = self._cfg.project
         repo_action = menu.addAction("Repository lookup (answers, dashboard)")
         repo_action.setCheckable(True)
         repo_action.setChecked(bool(ctx.repo_search))
@@ -2088,23 +2088,23 @@ class OverlayWindow(QWidget):
     def _populate_repository_menu(self, menu: QMenu) -> None:
         """Which repository the lookups and the toolkit discovery use: auto-detected from Claude
         Code's own session logs (the default), or a folder chosen here / in the settings."""
-        c = self._cfg.context
-        current = menu.addAction(self._context_detail or "Context: not known yet")
+        c = self._cfg.project
+        current = menu.addAction(self._project_detail or "Project: not known yet")
         current.setEnabled(False)
         menu.addSeparator()
         auto = menu.addAction("Auto-detect from Claude Code (the project of its latest session)")
         auto.setCheckable(True)
         auto.setChecked(bool(c.repo_auto))
         auto.setEnabled(not (c.repo_root or "").strip())
-        auto.toggled.connect(lambda checked: self._apply_context_option("repo_auto", bool(checked)))
+        auto.toggled.connect(lambda checked: self._apply_project_option("repo_auto", bool(checked)))
         root = (c.repo_root or "").strip()
         choose = menu.addAction(f"Folder: {root}" if root else "Choose a folder…")
         choose.triggered.connect(self._choose_repo_root)
         if root:
             clear = menu.addAction("Clear the folder (back to auto-detect)")
-            clear.triggered.connect(lambda: self._apply_context_option("repo_root", ""))
+            clear.triggered.connect(lambda: self._apply_project_option("repo_root", ""))
         menu.addSeparator()
-        menu.addAction("Context settings…").triggered.connect(lambda: self.open_settings("Context"))
+        menu.addAction("Project settings…").triggered.connect(lambda: self.open_settings("Project"))
 
     def _switch_view(self, key: str) -> None:
         if key == "dashboard":
@@ -2136,22 +2136,22 @@ class OverlayWindow(QWidget):
             log.exception("actions.apply_settings(screen.monitor) failed")
         self._on_screen_mode_requested("monitor")
 
-    def _apply_context_option(self, key: str, value: object) -> None:
-        setattr(self._cfg.context, key, value)
+    def _apply_project_option(self, key: str, value: object) -> None:
+        setattr(self._cfg.project, key, value)
         try:
-            self._actions.apply_settings({f"context.{key}": value})   # the engine re-detects and says what it found
+            self._actions.apply_settings({f"project.{key}": value})   # the engine re-detects and says what it found
         except Exception:
-            log.exception("actions.apply_settings(context.%s) failed", key)
+            log.exception("actions.apply_settings(project.%s) failed", key)
 
     def _choose_repo_root(self) -> None:
         from pathlib import Path
 
         from PySide6.QtWidgets import QFileDialog
 
-        start = (self._cfg.context.repo_root or "").strip() or str(Path.home())
+        start = (self._cfg.project.repo_root or "").strip() or str(Path.home())
         path = QFileDialog.getExistingDirectory(self, "Repository root (the project being worked on)", start)
         if path:
-            self._apply_context_option("repo_root", path)
+            self._apply_project_option("repo_root", path)
 
     def _on_insights_now(self, sections: tuple[str, ...] = ()) -> None:
         """Refresh the co-pilot insights now (an Assist-menu entry or the hotkey; the Notes tab's
@@ -2722,10 +2722,10 @@ class OverlayWindow(QWidget):
             if ev.state == "error":
                 self.show_toast(f"Completion: {ev.detail or 'error'}")
             return
-        elif ev.component in ("context", "dashboard"):
+        elif ev.component in ("project", "dashboard"):
             # A repository / toolkit found or changed mid-session, a dashboard problem: say so, never a dot.
-            if ev.component == "context" and ev.detail:
-                self._context_detail = ev.detail      # the View menu's Repository entry shows the latest
+            if ev.component == "project" and ev.detail:
+                self._project_detail = ev.detail      # the View menu's Repository entry shows the latest
             self.show_toast(ev.detail or ev.component)
             return
         elif ev.state == "error":

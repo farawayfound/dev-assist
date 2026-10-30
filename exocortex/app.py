@@ -173,7 +173,7 @@ class Engine(EngineActions):
         self.screen: Any = None          # ScreenReader
         self.completer: Any = None       # Completer (completion mode)
         self.handsfree: Any = None       # HandsFreeController (hands-free mode), created on first use
-        self.context: Any = None         # exocortex.context.provider.ContextProvider (toolkit catalog, repo lookups)
+        self.project: Any = None         # exocortex.project.provider.ProjectContext (toolkit catalog, repo lookups)
         self.dashboard: Any = None       # exocortex.dashboard.service.DashboardService (the tracked board)
         self._models_cache: list[str] = []
         # 2026-09-27 (portable-install): the model manager's one-at-a-time Hub pull ("model-pull"
@@ -228,7 +228,7 @@ class Engine(EngineActions):
         self.recorder = SessionRecorder(cfg, self.bus, self.transcript, self.assistant)
         folder = self.recorder.start()
         log.info("session folder: %s", folder)
-        self._init_context()
+        self._init_project()
         self._init_dashboard(folder)
 
         self._llm_thread = threading.Thread(target=self._init_llm, name="llm-init", daemon=True)
@@ -244,25 +244,25 @@ class Engine(EngineActions):
         if cfg.dashboard.enabled:
             self.bus.publish(DashboardModeEvent(enabled=True))   # the overlay opens on the board
 
-    def _init_context(self) -> None:
-        """The on-demand context provider (2026-10-20): the Claude Code toolkit discovered in
-        [context].repo_root and the repository lookups, handed to the assistant (answers, ask,
+    def _init_project(self) -> None:
+        """The project context (2026-10-20): the Claude Code toolkit discovered in
+        [project].repo_root and the repository lookups, handed to the assistant (answers, ask,
         recap) and to the dashboard service. Never blocks start(): a failure just leaves prompts
         without it."""
         try:
-            from exocortex.context.provider import ContextProvider
+            from exocortex.project.provider import ProjectContext
 
-            self.context = ContextProvider(self.cfg, self.clock)
-            if self.assistant is not None and hasattr(self.assistant, "set_context_provider"):
-                self.assistant.set_context_provider(self.context)
-            detail = f"Context: {self.context.context_summary()}"
+            self.project = ProjectContext(self.cfg, self.clock)
+            if self.assistant is not None and hasattr(self.assistant, "set_project_context"):
+                self.assistant.set_project_context(self.project)
+            detail = f"Project: {self.project.context_summary()}"
             log.info("%s", detail)
-            if self.context.repo_root is not None:      # a repository was found: say which (a toast)
-                self._status("context", "info", detail)
+            if self.project.repo_root is not None:      # a repository was found: say which (a toast)
+                self._status("project", "info", detail)
         except Exception as e:  # noqa: BLE001
-            log.exception("context provider failed to start")
-            self.context = None
-            self._status("app", "info", f"context lookups unavailable: {e}")
+            log.exception("project context failed to start")
+            self.project = None
+            self._status("app", "info", f"repository / toolkit lookups unavailable: {e}")
 
     def _init_dashboard(self, folder: Path | None) -> None:
         """The dashboard service (2026-10-20): the tracked board's store (in the session folder
@@ -272,7 +272,7 @@ class Engine(EngineActions):
             from exocortex.dashboard.service import DashboardService
 
             self.dashboard = DashboardService(
-                self.cfg, self.bus, self.transcript, self.assistant, self.clock, context=self.context,
+                self.cfg, self.bus, self.transcript, self.assistant, self.clock, project=self.project,
                 screen_provider=lambda: self.screen.latest_text if self.screen is not None else "",
                 folder=folder if self.cfg.dashboard.persist else None,
             )
@@ -993,12 +993,12 @@ class Engine(EngineActions):
                           ("answers", "use_answers"), ("notes", "use_notes")):
             if key in sources:
                 setattr(cc, attr, bool(sources[key]))
-        # 2026-10-20: the same menu switches the on-demand lookups (exocortex.context) -- the
+        # 2026-10-20: the same menu switches the on-demand lookups (exocortex.project) -- the
         # repository search and the toolkit catalog that answers and the dashboard get.
         if "repo" in sources:
-            self.cfg.context.repo_search = bool(sources["repo"])
+            self.cfg.project.repo_search = bool(sources["repo"])
         if "toolkit" in sources:
-            self.cfg.context.toolkit_in_answers = bool(sources["toolkit"])
+            self.cfg.project.toolkit_in_answers = bool(sources["toolkit"])
         if hint is not None:
             cc.hint = hint.strip()
         if self.completer is not None:
@@ -1054,12 +1054,12 @@ class Engine(EngineActions):
         if "handsfree.manual" in changed:
             self.set_manual_advance(bool(changed["handsfree.manual"]))   # publishes the sync event
         # every other [handsfree] value is read live by the controller on its next evaluation
-        if any(k.startswith("context.") for k in changed) and self.context is not None:
+        if any(k.startswith("project.") for k in changed) and self.project is not None:
             try:
-                self.context.reconfigure()      # a new repo root / toolkit dir: re-index, rescan now
-                self._status("context", "info", f"Context: {self.context.context_summary()}")
+                self.project.reconfigure()      # a new repo root / toolkit dir: re-index, rescan now
+                self._status("project", "info", f"Project: {self.project.context_summary()}")
             except Exception:  # noqa: BLE001
-                log.exception("context reconfigure failed")
+                log.exception("project reconfigure failed")
         if "dashboard.enabled" in changed:
             self.set_dashboard_mode(bool(changed["dashboard.enabled"]))   # publishes the sync event
         # every other [dashboard] value is read live by the service on its next tick / refresh

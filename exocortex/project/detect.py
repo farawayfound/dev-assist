@@ -7,7 +7,7 @@ and what the answers and the dashboard should know about, without the user typin
 
 Best effort and read-only: an unreadable folder, a log without a ``cwd`` or a directory that no
 longer exists is skipped, and nothing here ever raises. Scratch sessions (a ``cwd`` under the
-system temp directory) are ignored. ``[context].repo_root`` always wins over this.
+system temp directory) are ignored. ``[project].repo_root`` always wins over this.
 """
 from __future__ import annotations
 

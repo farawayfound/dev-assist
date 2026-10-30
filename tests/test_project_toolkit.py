@@ -1,4 +1,4 @@
-"""Toolkit auto-discovery (exocortex.context.toolkit, 2026-10-20): a repo laid out the way
+"""Toolkit auto-discovery (exocortex.project.toolkit, 2026-10-20): a repo laid out the way
 claude-toolkit installs itself, the frontmatter parser, the catalog's rendering budget, mention
 lookups, the rescan watcher, the user layer and the clone's enrichment."""
 from __future__ import annotations
@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from exocortex.context import toolkit as tk
+from exocortex.project import toolkit as tk
 
 REAL_TOOLKIT = Path(r"D:\repos\career-tech\InterviewTracker\Final_prep\toolkit")
 

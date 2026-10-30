@@ -2,7 +2,7 @@
 
 Owns a "dashboard-timer" daemon thread that, every ``TICK_S`` seconds, drains its own bus
 subscription (the running notes land in the store as soon as the notes worker publishes them),
-re-checks the repository's toolkit install through the context provider, and starts a background
+re-checks the repository's toolkit install through the project context, and starts a background
 refresh when one is due: ``[dashboard].refresh_interval_s`` has passed since the last one AND
 either ``min_new_words`` of new speech arrived since the last refresh or the screen changed
 substantially (the same two triggers as the Notes tab's insights passes, which these replace while
@@ -66,7 +66,7 @@ class DashboardService:
         assistant: Any,
         clock: Callable[[], float],
         *,
-        context: Any | None = None,
+        project: Any | None = None,
         screen_provider: Callable[[], str] | None = None,
         folder: Path | None = None,
     ) -> None:
@@ -75,7 +75,7 @@ class DashboardService:
         self._transcript = transcript
         self._assistant = assistant
         self._clock = clock
-        self._context = context
+        self._project = project
         self._screen_provider = screen_provider
         self._folder = folder
         self._lock = threading.RLock()
@@ -247,14 +247,14 @@ class DashboardService:
                 if isinstance(ev, NotesUpdatedEvent):
                     self.store.set_notes(ev.markdown, ev.generated_at)
                     self.publish(auto=True, detail="notes updated")
-        if self._context is not None:
+        if self._project is not None:
             try:
-                if self._context.refresh():
-                    detail = f"Context: {self._context.context_summary()}"
+                if self._project.refresh():
+                    detail = f"Project: {self._project.context_summary()}"
                     log.info("dashboard: %s", detail)
-                    self._bus.publish(ComponentStatusEvent(component="context", state="info", detail=detail))
+                    self._bus.publish(ComponentStatusEvent(component="project", state="info", detail=detail))
             except Exception:  # noqa: BLE001
-                log.exception("dashboard: context refresh failed")
+                log.exception("dashboard: project refresh failed")
         return self._maybe_auto()
 
     def _maybe_auto(self) -> bool:
@@ -317,14 +317,14 @@ class DashboardService:
         new = self._transcript.window_text(budget, until_id=until_id, since_id=since_id)
         earlier = self._transcript.window_text(EARLIER_CHARS, until_id=since_id) if since_id is not None else ""
         repo = detail = toolkit = example = ""
-        if self._context is not None:
+        if self._project is not None:
             try:
-                toolkit = self._context.toolkit_block()
-                example = self._context.toolkit_example()
-                detail = self._context.toolkit_lookup(new, screen_text)
-                repo = self._context.repo_block(new, screen_text)
-            except Exception:  # noqa: BLE001 - context is optional, never a reason to fail a refresh
-                log.exception("dashboard: context lookup failed")
+                toolkit = self._project.toolkit_block()
+                example = self._project.toolkit_example()
+                detail = self._project.toolkit_lookup(new, screen_text)
+                repo = self._project.repo_block(new, screen_text)
+            except Exception:  # noqa: BLE001 - project context is optional, never a reason to fail a refresh
+                log.exception("dashboard: project lookup failed")
         system = dprompts.system_dashboard(
             persona=a.persona, role=a.role, context=a.session_context, max_new=int(d.max_new_items),
             kinds=kinds, toolkit=toolkit, example=example,
@@ -341,10 +341,10 @@ class DashboardService:
     def _prompt_installed(self, text: str) -> bool:
         """False for a prompt that opens with a slash command / agent the installed toolkit does not
         have (a hallucinated one would only fail when typed). Always True without a toolkit."""
-        if self._context is None:
+        if self._project is None:
             return True
         try:
-            return bool(self._context.check_prompt(text))
+            return bool(self._project.check_prompt(text))
         except Exception:  # noqa: BLE001
             return True
 

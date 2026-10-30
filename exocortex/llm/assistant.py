@@ -130,11 +130,12 @@ from exocortex.bus import (
 )
 from exocortex.config import Config
 from exocortex.context import ContextBundle, ContextManager, ContextStore
-from exocortex.llm import prompts, questions
+from exocortex.llm import codeformat, prompts, questions
 from exocortex.llm.choices import ChoiceSet, annotate_choices, choices_block, finalize_answer, find_choices
 from exocortex.llm.client import LLMError, LMStudioClient, StreamStats
 from exocortex.plan import PlanView, containment, split_plan, typed_fraction
 from exocortex.transcript import Transcript
+from exocortex.workspace import Workspace
 
 log = logging.getLogger(__name__)
 
@@ -802,6 +803,11 @@ class _AssistJob:
     #: tells the model to ignore the code already on screen, whatever `[assist].consider_given_code`
     #: says (`Assistant._consider_given_code`).
     fresh: bool = False
+    #: 2026-10-29, kinds "code" / "text": read the screen afresh when the job starts (the Code /
+    #: Text shortcuts: the user is on the file they mean NOW) -- `Assistant._refresh_screen_for`;
+    #: and the <workspace> block built for it (the OTHER files of the task), "" for none.
+    read_now: bool = False
+    workspace: str = ""
     #: 2026-10-07 (capabilities): the tool loop's state for this job, resolved ONCE by
     #: `Assistant._job_tools` (None = no tools for it) so the system prompt, the user turn, the
     #: prompt rebuilt by the overflow retry and the loop itself all agree on one budget.
@@ -956,6 +962,15 @@ class Assistant:
         self._screen_provider: Callable[[], str] | None = None
         self._last_screen_text = ""
         self._screen_text_lock = threading.Lock()
+        #: 2026-10-29 (multi-file tasks): the task's workspace -- the files / panes seen since the
+        #: checkpoint (`exocortex.workspace`), fed from every changed screen event; a Code / Text job
+        #: gets the OTHER views as its <workspace> block. `_screen_refresh` reads the screen afresh
+        #: for a job that asks for it (`read_now`); the title / process of the latest capture name a
+        #: view (the file in an editor's title).
+        self._workspace = Workspace()
+        self._screen_refresh: Callable[[], bool] | None = None
+        self._last_screen_title = ""
+        self._last_screen_process = ""
 
         #: Auto-suggest throttle state, updated when a suggest job STARTS (see
         #: `_record_suggest_start`), not merely when one is submitted/queued.
@@ -1198,6 +1213,18 @@ class Assistant:
         """
         self._screen_provider = fn
 
+    def set_screen_refresh(self, fn: Callable[[], bool] | None) -> None:
+        """2026-10-29: register (or clear) the function a Code / Text job calls to read the screen
+        afresh before building its prompt (`Engine._refresh_screen`: `ScreenReader.capture_and_wait`),
+        returning whether the read completed in time. Called on the assist-worker thread, once per
+        job that asks (`read_now`), gated by `[screen].read_on_shortcut`."""
+        self._screen_refresh = fn
+
+    @property
+    def workspace(self) -> Workspace:
+        """The task's workspace (the views seen since the checkpoint) -- status and tests."""
+        return self._workspace
+
     def suggest_now(self, focus: str = "") -> None:
         """Generate proactive suggestions from the current screen text + recent transcript now.
 
@@ -1221,7 +1248,7 @@ class Assistant:
             return
         self._enqueue_side_job("solve", focus=focus, screen_lines=None)
 
-    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int:
         """Write the code for the task discussed (transcript since the last checkpoint) and/or
         shown on screen, right now (kind "code", the Code button). Returns the job id.
         `label`, when given, is what the Assist tab / history show as the question instead of
@@ -1235,9 +1262,12 @@ class Assistant:
         while paused (see `exocortex.actions.EngineActions.code`). `focus` is an optional extra
         instruction; blank falls back to `prompts.user_code`'s default ask.
         """
-        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label, fresh=fresh)
+        # 2026-10-29: `read_now` (default) reads the screen the moment the job starts -- the file the
+        # user is on when the shortcut fires -- see `_screen_text_for_job`.
+        return self._enqueue_side_job("code", focus=focus, screen_lines=None, label=label, fresh=fresh,
+                                      read_now=read_now)
 
-    def text(self, focus: str = "", label: str = "") -> int:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int:
         """Walk through, in plain English, the task discussed (transcript since the last checkpoint)
         and/or shown on screen, right now (kind "text", the Text button): what is asked, the key
         insight, the approach step by step, the edge cases and the complexity -- or, for a
@@ -1253,7 +1283,7 @@ class Assistant:
         the auto-solve throttle. `focus` is an optional extra instruction; blank falls back to
         `prompts.user_text`'s default ask; `label` as for `code()`.
         """
-        return self._enqueue_side_job("text", focus=focus, screen_lines=None, label=label)
+        return self._enqueue_side_job("text", focus=focus, screen_lines=None, label=label, read_now=read_now)
 
     def recap(self, focus: str = "") -> int:
         """Recap the session right now (kind "recap", the Recap action): the goal, what is done,
@@ -1482,6 +1512,7 @@ class Assistant:
             self._checkpoint_answers = answers
             self._checkpoint_time = t
             self._code_answers = []
+        self._workspace.reset()      # 2026-10-29: the next capture starts the next task's workspace
         if old_seg_id is not None and old_seg_id != seg_id:
             # The window's anchor / pending compaction of the OLD checkpoint scope will never be
             # used again (the whole-meeting scope, None, is the ask box's and stays).
@@ -1831,6 +1862,7 @@ class Assistant:
             self._checkpoint_answers = 0
             self._checkpoint_time = None
             self._code_answers = []
+        self._workspace.reset()
         log.info("assistant: reset")
 
     # ---- assist-worker ---------------------------------------------------------
@@ -1852,7 +1884,7 @@ class Assistant:
 
     def _enqueue_side_job(
         self, kind: AssistKind, *, focus: str, screen_lines: tuple[str, ...] | None,
-        plan_id: int | None = None, label: str = "", fresh: bool = False,
+        plan_id: int | None = None, label: str = "", fresh: bool = False, read_now: bool = False,
     ) -> int:
         """Queue a side-lane ("suggest"/"solve"/"code"), text-lane ("text") or explain-lane
         ("explain") job. Cancels only a running job that the new kind supersedes (`_CANCELS`); a
@@ -1869,7 +1901,7 @@ class Assistant:
         job = _AssistJob(
             id=next(self._job_ids), kind=kind, question=display_question,
             cancel=threading.Event(), focus=focus, screen_lines=screen_lines, plan_id=plan_id,
-            fresh=bool(fresh and kind == "code"),
+            fresh=bool(fresh and kind == "code"), read_now=bool(read_now and kind in ("code", "text")),
         )
         self._cancel_running_of(_CANCELS.get(kind, ()))
         self._preempt_auto_insights()
@@ -2079,6 +2111,19 @@ class Assistant:
             ttft_s = (first_delta_wall - start_wall) if first_delta_wall is not None else elapsed
             tokens = delta_count
             tok_per_s = tokens / elapsed
+
+        # 2026-10-29: a Code answer is plain code only (`[assist].code_only`): prose and the complexity
+        # line become comments inside the one block, markdown inside it becomes comments too; with
+        # explanations on, only the inside of the block changes (the plan shape is kept).
+        if not cancelled and job.kind == "code" and self._cfg.assist.code_only and text.strip():
+            try:
+                cleaned = codeformat.code_only(text, explain=is_plan, language=self._cfg.assist.primary_language)
+            except Exception:  # noqa: BLE001 - a formatting bug must never lose an answer
+                log.exception("assist job %d: code-only formatting failed", job.id)
+                cleaned = text
+            if cleaned != text:
+                log.info("assist job %d: code answer normalised to code only", job.id)
+                text = cleaned
 
         # The multiple-choice verdict line goes to the bus and the history only; the plan (what
         # the completer offers as ghost text) keeps the raw answer.
@@ -2295,8 +2340,9 @@ class Assistant:
         extra = self._project_extra(job, tail, prompt_screen)
         # The characters of the user turn that are not a context block (the manager budgets the
         # rest): the ask / question / focus, the <choices> block, the <previous> code (or the
-        # insights' lists, the recap's notes), the project lookups, the tags.
-        fixed = 200 + len(block) + len(previous) + len(prompt_question if spoken else job.focus) + len(extra)
+        # insights' lists, the recap's notes), the <workspace> block, the project lookups, the tags.
+        fixed = (200 + len(block) + len(previous) + len(job.workspace)
+                 + len(prompt_question if spoken else job.focus) + len(extra))
         tool_ctx = self._job_tools(job)
         if tool_ctx is not None:
             # The room one tool result may take, and the <map> block: the transcript window is cut
@@ -2363,6 +2409,11 @@ class Assistant:
         fresh = bool(job.fresh) and job.kind == "code"
         return bool(self._cfg.assist.consider_given_code) and not fresh
 
+    def _code_only(self, job: _AssistJob) -> bool:
+        """2026-10-29: whether this job's answer must be plain code (`[assist].code_only`, read live;
+        only a "code" job)."""
+        return job.kind == "code" and bool(self._cfg.assist.code_only)
+
     def _system_for(self, job: _AssistJob, choices: ChoiceSet | None = None) -> str:
         """The system prompt for `job`. `choices` is accepted for symmetry with the budget but does
         not change it: the multiple-choice rule is worded conditionally ("If a <choices> block is
@@ -2379,15 +2430,19 @@ class Assistant:
         if job.kind in ("solve", "code"):
             ex = self._cfg.explain
             level = prompts.normalize_comment_level(self._cfg.assist.comments)
-            builder = prompts.system_solve if job.kind == "solve" else prompts.system_code
-            return builder(
-                persona, explain=ex.enabled, comments=level,
-                language=self._cfg.assist.primary_language, libraries=self._cfg.assist.libraries,
-                context=context, consider_given_code=self._consider_given_code(job), **extra,
+            kwargs: dict[str, Any] = dict(
+                explain=ex.enabled, comments=level, language=self._cfg.assist.primary_language,
+                libraries=self._cfg.assist.libraries, context=context,
+                consider_given_code=self._consider_given_code(job), **extra,
             )
+            if job.kind == "solve":
+                return prompts.system_solve(persona, **kwargs)
+            # 2026-10-29: the <workspace> rule (static for a fixed config) and the code-only shape
+            return prompts.system_code(persona, workspace=bool(self._cfg.screen.workspace),
+                                       code_only=self._code_only(job), **kwargs)
         if job.kind == "text":
             return prompts.system_text(persona, context, consider_given_code=self._consider_given_code(job),
-                                       **extra)
+                                       workspace=bool(self._cfg.screen.workspace), **extra)
         if job.kind == "explain":
             return prompts.system_explain(persona, context)
         if job.kind == "suggest":
@@ -2515,7 +2570,7 @@ class Assistant:
             prev = self._previous_code_text() if previous is None else previous
             builder = prompts.user_code if job.kind == "code" else prompts.user_text
             return builder(window, screen_text, prev, job.focus, extra=extra,
-                           consider_given_code=self._consider_given_code(job), **ctx)
+                           consider_given_code=self._consider_given_code(job), workspace=job.workspace, **ctx)
         if job.kind == "explain":
             with self._plan_lock:
                 plan = self._plan
@@ -2628,6 +2683,12 @@ class Assistant:
         question line (e.g. "how would you implement this?" with no antecedent for "this"), so
         gating it the same way as a normal spoken-question answer would defeat the feature's own
         purpose. Any exception from the provider is swallowed and treated as no screen text.
+
+        2026-10-29 (multi-file tasks): a job with `read_now` (the Code / Text shortcuts) first has the
+        screen read afresh (`_refresh_screen_for`), so the text is the file the user is on at that
+        moment; the hands-free context is rendered around that fresh screen (its provider takes it as
+        the "on screen now" part); and the current screen is sorted into the task's workspace, whose
+        OTHER views become the job's <workspace> block (`job.workspace`).
         """
         provider = self._screen_provider
         text = ""
@@ -2639,28 +2700,73 @@ class Assistant:
                 or self._cfg.screen.use_in_answers
             )
         max_chars = self._cfg.screen.max_text_chars
+        if wants_screen and job.read_now:
+            self._refresh_screen_for(job)
+        current = ""
+        if provider is not None and wants_screen:
+            try:
+                current = provider() or ""
+            except Exception:  # noqa: BLE001 - a broken screen provider must never break answers
+                log.exception("assistant: screen_provider() raised for job %d; using no screen text", job.id)
+                current = ""
         context = self._hands_free_context if self._hands_free and job.kind in ("text", "code") else None
         if context is not None and wants_screen:
             # Hands-free: the cumulative screen of the task (what scrolled out of view + the
             # current screen), with its own, larger budget; "" means nothing read yet.
             try:
-                text = context() or ""
+                text = self._hands_free_text(context, current)
             except Exception:  # noqa: BLE001 - never break answers over the context provider
                 log.exception("assistant: hands-free context provider raised for job %d", job.id)
                 text = ""
             if text:
                 max_chars = max(max_chars, int(self._cfg.handsfree.context_chars))
-        if not text and provider is not None and wants_screen:
-            try:
-                text = provider() or ""
-            except Exception:  # noqa: BLE001 - a broken screen provider must never break answers
-                log.exception("assistant: screen_provider() raised for job %d; using no screen text", job.id)
-                text = ""
+        if not text:
+            text = current
         if max_chars >= 0:
             text = text[:max_chars]
+        job.workspace = self._workspace_for_job(job, current) if wants_screen else ""
         with self._screen_text_lock:
             self._last_screen_text = text
         return text
+
+    @staticmethod
+    def _hands_free_text(context: Callable[..., str], current: str) -> str:
+        """The hands-free cumulative context rendered around the `current` screen (the provider's
+        2026-10-29 form, `HandsFreeController.context_text(current)`); an older zero-argument provider
+        is called as before."""
+        try:
+            return context(current) or ""
+        except TypeError:
+            return context() or ""
+
+    def _refresh_screen_for(self, job: _AssistJob) -> None:
+        """Read the screen afresh for `job` (`[screen].read_on_shortcut`): blocks on the assist-worker
+        thread until the reader has run the pass (at most `[screen].read_timeout_s`, inside the
+        engine's callback); a read that does not complete leaves the latest text in use, logged."""
+        refresh = self._screen_refresh
+        if refresh is None or not self._cfg.screen.read_on_shortcut:
+            return
+        try:
+            if not refresh():
+                log.info("assistant: job %d (%s): the fresh screen read did not complete; using the latest text",
+                         job.id, job.kind)
+        except Exception:  # noqa: BLE001 - a reader problem must never break an answer
+            log.exception("assistant: job %d (%s): the fresh screen read failed", job.id, job.kind)
+
+    def _workspace_for_job(self, job: _AssistJob, current: str) -> str:
+        """The <workspace> block of a Code / Text job: the current screen is sorted into the task's
+        workspace (synchronously, so the view it lands in is the current one whatever the bus
+        listener has seen so far) and the OTHER views are rendered within `[screen].workspace_chars`."""
+        if job.kind not in ("code", "text") or not self._cfg.screen.workspace or not current.strip():
+            return ""
+        try:
+            now = self._clock()
+            view = self._workspace.observe(current, title=self._last_screen_title,
+                                           process=self._last_screen_process, now=now)
+            return self._workspace.others_text(current=view, max_chars=int(self._cfg.screen.workspace_chars), now=now)
+        except Exception:  # noqa: BLE001 - the workspace is an extra: never break an answer over it
+            log.exception("assistant: job %d (%s): the workspace block failed", job.id, job.kind)
+            return ""
 
     def _record_suggest_start(self, job: _AssistJob, screen_text: str) -> None:
         """Record the auto-suggest throttle state when a suggest job starts (see the module
@@ -3437,9 +3543,20 @@ class Assistant:
 
         `prev_lines` is updated on every changed event regardless of either feature's config
         flag or outcome, so a later toggle sees only genuinely new lines from that point on.
+
+        2026-10-29: every changed capture is also sorted into the task's workspace (the window
+        title / process remembered for the job-time sort as well).
         """
+        self._last_screen_title = str(getattr(event, "window_title", "") or "")
+        self._last_screen_process = str(getattr(event, "window_process", "") or "")
         if not event.changed:
             return
+        if self._cfg.screen.workspace:
+            try:
+                self._workspace.observe(event.text, title=self._last_screen_title,
+                                        process=self._last_screen_process, now=self._clock())
+            except Exception:  # noqa: BLE001 - never let the workspace break screen handling
+                log.exception("assistant: sorting the screen into the workspace failed")
         prev = self._screen_prev_lines
         current = tuple(event.lines)
         new = self._compute_new_lines(prev, current)

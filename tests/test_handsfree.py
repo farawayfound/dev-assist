@@ -109,6 +109,7 @@ class FakeHooks:
         self.defer_text = False
         self.defer_code = False
         self.recent_code_text = ""
+        self.read_now_flags: list[tuple[str, bool]] = []   # 2026-10-29: (kind, read_now) per step
         self._next_id = 1
 
     def capture_now(self, accurate: bool = False) -> None:
@@ -119,18 +120,20 @@ class FakeHooks:
         self.calls.append(("checkpoint",))
         self.checkpoint_calls += 1
 
-    def text(self, focus: str = "", label: str = "") -> int | None:
+    def text(self, focus: str = "", label: str = "", read_now: bool = False) -> int | None:
         self.calls.append(("text", focus, label))
+        self.read_now_flags.append(("text", read_now))
         self.text_calls += 1
         self.text_focus_labels.append((focus, label))
         jid = None if self.defer_text else self._alloc()
         self.text_ids.append(jid)
         return jid
 
-    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = False) -> int | None:
         # 2026-10-29: a "code_fresh" step calls with fresh=True; recorded as a 4th element so the
         # older 3-tuple comparisons stay exact for the ordinary steps
         self.calls.append(("code", focus, label, "fresh") if fresh else ("code", focus, label))
+        self.read_now_flags.append(("code", read_now))
         self.code_calls += 1
         self.code_focus_labels.append((focus, label))
         jid = None if self.defer_code else self._alloc()

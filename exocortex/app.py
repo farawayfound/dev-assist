@@ -402,6 +402,8 @@ class Engine(EngineActions):
                 self.screen.set_snapshot_dir(self.recorder.folder)
             if self.assistant is not None and hasattr(self.assistant, "set_screen_provider"):
                 self.assistant.set_screen_provider(lambda: self.screen.latest_text if self.screen else "")
+            if self.assistant is not None and hasattr(self.assistant, "set_screen_refresh"):
+                self.assistant.set_screen_refresh(self._refresh_screen)   # 2026-10-29: read-on-shortcut
             self.screen.start()
         except Exception as e:  # noqa: BLE001
             log.exception("screen reader failed to start")
@@ -898,6 +900,19 @@ class Engine(EngineActions):
         if self.screen is not None:
             self.screen.capture_now()
 
+    def _refresh_screen(self) -> bool:
+        """2026-10-29: a fresh read for a Code / Text job (`Assistant.set_screen_refresh`):
+        `ScreenReader.capture_and_wait` with `[screen].read_timeout_s`; False when there is no reader
+        (or an older one) or the pass did not finish in time -- the job then uses the latest text."""
+        screen = self.screen
+        if screen is None or not hasattr(screen, "capture_and_wait"):
+            return False
+        try:
+            return bool(screen.capture_and_wait(float(self.cfg.screen.read_timeout_s)))
+        except Exception:  # noqa: BLE001 - a reader problem must never break an answer
+            log.exception("engine: the fresh screen read failed")
+            return False
+
     def suggest_now(self) -> None:
         if self.assistant is not None and hasattr(self.assistant, "suggest_now") and not self._defer("suggest"):
             self.assistant.suggest_now()
@@ -927,15 +942,17 @@ class Engine(EngineActions):
                 log.exception("engine: compact() failed")
         return 0
 
-    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int | None:
         """Returns the job id, or None when the request was deferred (LLM not ready yet).
         `label`: what the Assist tab shows as the question instead of `focus` (hands-free).
         `fresh` (2026-10-29, the "Code from scratch" gesture): the job ignores the code already on
         screen whatever `[assist].consider_given_code` says; deferred under its own pending kind
-        so the replay keeps the flag."""
+        so the replay keeps the flag. `read_now` (2026-10-29, default): the job reads the screen
+        afresh when it starts -- the file the user is on when the shortcut fires; the hands-free
+        cycle passes False after its own accurate read (a replayed deferral reads afresh)."""
         kind = "code_fresh" if fresh else "code"
         if self.assistant is not None and hasattr(self.assistant, "code") and not self._defer(kind, focus, label):
-            kwargs: dict[str, object] = {}
+            kwargs: dict[str, object] = {"read_now": read_now}
             if label:
                 kwargs["label"] = label
             if fresh:
@@ -943,12 +960,13 @@ class Engine(EngineActions):
             return self.assistant.code(focus, **kwargs)
         return None
 
-    def text(self, focus: str = "", label: str = "") -> int | None:
-        """Returns the job id, or None when the request was deferred (LLM not ready yet)."""
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int | None:
+        """Returns the job id, or None when the request was deferred (LLM not ready yet). `read_now`
+        as for `code`."""
         if self.assistant is not None and hasattr(self.assistant, "text") and not self._defer("text", focus, label):
             if label:
-                return self.assistant.text(focus, label=label)
-            return self.assistant.text(focus)
+                return self.assistant.text(focus, label=label, read_now=read_now)
+            return self.assistant.text(focus, read_now=read_now)
         return None
 
     # ---- co-pilot insights / recap (pair programming, 2026-10-20) ----
@@ -2291,11 +2309,14 @@ class _HandsFreeHooks:
     def checkpoint(self) -> None:
         self._engine.checkpoint()
 
-    def text(self, focus: str = "", label: str = "") -> int | None:
-        return self._engine.text(focus, label)
+    def text(self, focus: str = "", label: str = "", read_now: bool = False) -> int | None:
+        return self._engine.text(focus, label, read_now=read_now)
 
-    def code(self, focus: str = "", label: str = "") -> int | None:
-        return self._engine.code(focus, label)
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = False) -> int | None:
+        # 2026-10-29: `fresh` (the Code-from-scratch gesture) was missing here, so a hands-free
+        # code_fresh step raised inside the controller; `read_now` is True for a manual gesture
+        # (the controller did not read for it) and False for the cycle's own steps.
+        return self._engine.code(focus, label, fresh=fresh, read_now=read_now)
 
     def recent_code(self) -> str:
         assistant = self._engine.assistant

@@ -146,6 +146,22 @@ when Windows does not expose its performance counter (the NPU counter is only pr
 Windows builds). GPU, iGPU and NPU utilisation and system RAM come from Windows performance
 counters; dedicated-GPU VRAM uses the GPU driver (NVML on NVIDIA).
 
+## Focus
+
+The shortcuts never move the keyboard focus. Every hotkey, tap and mouse gesture is read by Windows
+or by a low-level hook, never by the overlay, so the app you are working in keeps the keyboard:
+nothing is brought to the front, and the overlay is shown or updated without being activated. Two
+shortcuts exist to take the keyboard and are the exceptions: `Ctrl+Alt+Q` puts the cursor in the ask
+box, and the region picker (`Ctrl+Alt+R`) covers the desktop -- on Windows it reads its own Esc and
+Enter through a hook, so your window stays focused even then; elsewhere it takes the focus and gives
+it back when it closes.
+
+Clicking the panel follows the same rule. A left click on a button, a switch or a tab works without
+moving the focus; the ask box, the text panes (typing, selecting, Ctrl+C), the title bar and the
+slim bar (dragging), the edges and the sliders take it as any window would, and so does a
+right-click (the menus need it). A middle or thumb-button click on the panel never takes it. In the
+hands-free view a click that lands on the click-through content never activates the panel either.
+
 ## Changing a shortcut
 
 **Settings › Shortcuts** lists every shortcut -- the global hotkeys above and the three manual-advance

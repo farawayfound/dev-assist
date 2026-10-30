@@ -211,6 +211,11 @@ FIELDS: dict[str, tuple[Field, ...]] = {
                    "code is filled in. Off: the best solution from scratch, keeping only the entry point the "
                    "task dictates. The manual-advance 'Code from scratch' gesture (Shortcuts tab) always "
                    "ignores the given code."),
+        Field("assist", "code_only", "Code answers as plain code only", "bool",
+              help="On (default): a Code answer is one code block and nothing else -- a note or the complexity "
+                   "goes inside it as comment lines in the language's own syntax, and markdown the model slips "
+                   "in (a heading, bold, bullets) is turned into comments. With explanations on, the walkthrough "
+                   "stays and the rule applies to the code block. Off: the answer as the model wrote it."),
         Field("assist", "style", "Answer style", "choice", choices=("bullets", "short", "detailed")),
         Field("assist", "focus", "What is worth answering (screen questions, hands-free tasks)", "choice",
               choices=("auto", "technical", "all"),
@@ -339,6 +344,17 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("screen", "interval_s", "Capture interval (s)", "float", 0.5, 10.0, 0.5),
         Field("screen", "monitor", "Monitor to read in monitor mode (0 = primary)", "int", 0, 8,
               help="The ⋯ menu's View > Screen source lists the monitors by number with their size and position."),
+        Field("screen", "read_on_shortcut", "Read the screen when Code / Text is pressed", "bool",
+              help="On (default): the Code and Text shortcuts, buttons and gestures read the screen at that moment "
+                   "and work on the file you are in, instead of the last pass (up to the capture interval old). "
+                   "Waits at most the read timeout for the OCR."),
+        Field("screen", "read_timeout_s", "Read timeout (s)", "float", 0.5, 15.0, 0.5),
+        Field("screen", "workspace", "Workspace: hand the other files of the task to Code / Text", "bool",
+              help="On (default): every file or pane seen since the checkpoint -- the task statement, a parent "
+                   "class, an interface, a test -- is kept as the task's workspace and handed to Code / Text "
+                   "next to the screen, so the answer is written for the file on screen in the context of the "
+                   "others. A checkpoint starts a new workspace."),
+        Field("screen", "workspace_chars", "Workspace text handed to the model (chars)", "int", 500, 12000, 250),
         Field("screen", "auto_suggest", "Solve / suggest when the screen changes", "bool",
               help="Off by default while you drive: your editor changes all the time, and every change "
                    "would start an unrequested solve that takes over the Assist tab. On for an interview / "

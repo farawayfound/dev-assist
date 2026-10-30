@@ -190,6 +190,9 @@ insight_max_items = 4       # bullets per section
 # is context, not a template). The manual-advance "Code from scratch" gesture ([hotkeys].
 # manual_code_fresh) ignores the given code whatever this says.
 consider_given_code = true
+# 2026-10-29: a Code answer is plain code only -- one code block, notes and the complexity as
+# comment lines inside it, markdown the model slips in turned into comments. false = as written.
+code_only = true
 
 [notes]
 auto_interval_s = 180
@@ -265,6 +268,14 @@ max_text_chars = 2500
 save_text = false
 show_text = false
 exclude_own_windows = true  # blank this app's own windows out of the screen text (the overlay is capturable)
+# 2026-10-29 (multi-file tasks): read the screen the moment Code / Text is pressed (the file you
+# are in), waiting at most read_timeout_s for the OCR; keep every file / pane seen since the
+# checkpoint as the task's workspace and hand the OTHER ones to Code / Text as <workspace>
+# (workspace_chars caps that block).
+read_on_shortcut = true
+read_timeout_s = 4.0
+workspace = true
+workspace_chars = 3000
 
 [completion]
 enabled = false

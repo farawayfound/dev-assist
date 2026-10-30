@@ -367,6 +367,8 @@ class FakeAssistant:
         self.code_labels: list[str] = []
         self.text_labels: list[str] = []
         self.recent_code_value = ""
+        self.read_now_flags: list[tuple[str, bool]] = []   # 2026-10-29: (kind, read_now) per call
+        self.fresh_flags: list[bool] = []
         self._next_id = 100
 
     def set_hands_free(self, enabled: bool, context_provider: Any = None) -> None:
@@ -384,15 +386,18 @@ class FakeAssistant:
     def checkpoint(self) -> None:
         self.checkpoint_calls += 1
 
-    def code(self, focus: str = "", label: str = "") -> int:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int:
         self.code_calls.append(focus)
         self.code_labels.append(label)
+        self.read_now_flags.append(("code", read_now))
+        self.fresh_flags.append(fresh)
         self._next_id += 1
         return self._next_id
 
-    def text(self, focus: str = "", label: str = "") -> int:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int:
         self.text_calls.append(focus)
         self.text_labels.append(label)
+        self.read_now_flags.append(("text", read_now))
         self._next_id += 1
         return self._next_id
 

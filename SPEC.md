@@ -3860,6 +3860,122 @@ every shortcut on the way. Developed on `feat/given-code-shortcuts` alongside tw
   from the old "left" / "middle" keys to "mouse_left" / "mouse_middle"; `tests/test_assistant_text.py`
   now expects the given-code sentence after a focus text.
 
+### Shortcuts never move the focus (added 2026-10-29)
+
+Request: every shortcut works with the overlay in the background and never brings it to the front
+or moves the keyboard away from the window being worked in. The inputs already were global
+(`RegisterHotKey` for key combinations, `WH_KEYBOARD_LL` for taps, `WH_MOUSE_LL` for mouse
+buttons); the focus moved on the window side, in four places, all closed here:
+
+- **`OverlayWindow`** carries `WA_ShowWithoutActivating` (Qt.Tool already shows without activating
+  on Windows; the attribute states the intent and holds everywhere). `focus_ask` is the one shortcut
+  that takes the keyboard and now does so explicitly (`activateWindow()` before `askbox.focus()`:
+  `setFocus` alone only records the focus child while the window is inactive, so `Ctrl+Alt+Q` from
+  another app used to show the panel without the cursor actually landing in the ask box).
+- **Clicks on the panel** -- `OverlayWindow.nativeEvent` answers `WM_MOUSEACTIVATE` with
+  `MA_NOACTIVATE` where `_click_activates(mouse_msg, pos)` says the click must not take the keyboard
+  (`_mouse_activate_answer` decodes the `MSG`; the policy is pure and offscreen-testable). Policy: a
+  right click always activates (the context menus are popups; a popup's outside-click dismissal needs
+  its thread to own the foreground, since only the foreground thread can capture the mouse); a middle
+  or X-button click never does (no keyboard use; usually a manual-advance gesture); a left click
+  activates on the text panes and inputs (`QAbstractScrollArea`, `QLineEdit`, spin boxes, combos:
+  typing, selecting, Ctrl+C), on the drag handles (`_TitleBar` -- also the slim bar --, `_EdgeGrip`,
+  `QSizeGrip`) and the sliders (a drag that leaves the window keeps its mouse capture only while the
+  window is foreground), and on a button with a menu; on every other button, switch, tab, label or
+  empty frame it does not (the button works without the focus). In the hands-free view a left click
+  on the click-through content never activates: `_update_hands_free_click_through` flips
+  `WS_EX_TRANSPARENT` from the cursor position once per 30 ms poll, so a gesture that lands in that
+  gap arrived on the panel by accident -- the "focus shifts sometimes when a gesture fires" report.
+- **`RegionPicker`** -- on the real Windows platform with `llhooks.BareKeyHook` importable the picker
+  is a `WindowDoesNotAcceptFocus` window (Qt maps it to `WS_EX_NOACTIVATE` and answers
+  `MA_NOACTIVATE`; clicks and drags still arrive) and reads Esc (cancel) / Enter (accept) through a
+  `BareKeyHook({"esc", "enter"}, max_tap_s=3.0)` installed in `begin()` and removed in `_end()`,
+  swallowing the two keys while it is up; the window the user was in keeps the keyboard throughout.
+  `activateWindow()` is never attempted on that path (Qt refuses `requestActivate` for the flag). Where
+  the hook is unavailable (another platform, the offscreen tests) the picker takes the focus as
+  before and `_restore_foreground()` hands it back on close to the window `_foreground_now()` saw in
+  `begin()` -- without it Windows activates the picker's owner, the overlay, which is where the focus
+  used to land after every region selection. `win32.foreground_window()` / `win32.activate_window(hwnd)`
+  are the two new helpers (prototypes in `_load_dlls`).
+- Tests: `tests/test_overlay_focus.py` (the attribute; the policy per widget class, button, pane,
+  handle, slider, right / middle / thumb click, hands-free content; `MSG` decoding through
+  `_mouse_activate_answer` and `nativeEvent`; every trigger-table callback but `ask_focus` leaves
+  `activateWindow` uncalled) and three additions to `tests/test_region_picker.py` (the hooked path
+  through a spy hook, the fallback hand-back through a stub `win32`, a hook that fails to install);
+  the stub `win32` there gained `foreground_window` / `activate_window` and `_windows_picker` always
+  pins `_KeyHook` to a spy or None so no test hooks the real keyboard. Not exercised live:
+  `MA_NOACTIVATE` through a real click and the picker's hook.
+
+### Multi-file tasks: the workspace, read-on-shortcut, code-only answers (added 2026-10-29)
+
+Request: (1) files captured since the checkpoint that belong to the same problem are grouped and
+handed to Code / Text together, so an interface, a test or a helper is written for when it is the
+file in front, not skipped for the "main" object; accidental non-clearing (no checkpoint between
+problems) is told apart by how much of the OCR stays the same; (2) the Code / Text shortcut reads
+the screen immediately and the output matches the file in focus; (3) a Code answer is always plain
+code (comments never as markdown).
+
+- **`exocortex/workspace.py`** -- `Workspace.observe(text, title=, process=, now=)` sorts one reading
+  into `View`s (thread-safe): (a) the file named in the window title (`file_in_title`: "main.py -
+  myproj - Visual Studio Code", "myproj – Main.java") → that view; (b) the same window title with
+  any content in common (`RELATED_LINES` 0.12 containment) → that view (a page scrolled); (c)
+  containment of the capture's *distinctive* lines (3+ words or code, not the one-word labels of
+  menus / file trees) in a view ≥ `SAME_VIEW` 0.55 → that view; (d) related -- any shared lines ≥
+  0.12, ≥ `RELATED_IDENTIFIERS` 2 shared identifiers (`identifiers()`: CamelCase / snake_case / long
+  words minus a stop list), or a file in a development window's title unless `project_in_title`
+  names a project different from every view's -- → a new view; (e) otherwise foreign: ignored unless
+  `looks_like_task` (2 code lines or a task statement) and `FOREIGN_RESET` 4 consecutive mutually
+  related ones arrive, which restarts the workspace from them. A view keeps every line first-seen
+  (`View.merge`: a line gone from the reading with a near-identical one present -- `handsfree.is_edit`
+  -- is replaced; scrolled-away lines stay), `MAX_VIEWS` 12 (the oldest unseen evicted, never the
+  current). `others_text(current=, max_chars=, now=)` renders every other view newest-first under
+  `[name]` headers (file, else title, else "pane"), budget shared (≥ 400 chars each), views unseen
+  for `STALE_S` 900 s left out. `reset()` on checkpoint / reset. Known limit: the next problem on the
+  same site shares its chrome and joins as a view until it ages out (documented in the README).
+- **Assistant** -- `_workspace` fed from every changed `ScreenTextEvent` in `_handle_screen_event`
+  (`[screen].workspace`; title / process remembered); `_screen_text_for_job` sorts the job's own
+  current screen in synchronously and sets `job.workspace = others_text(...)` (`workspace_chars`);
+  `_user_for` passes it to `user_code` / `user_text`, `_prepare` counts it as fixed chars,
+  `_system_for` passes `workspace=bool(cfg.screen.workspace)` (a static rule: KV-stable) and
+  `code_only=_code_only(job)`. `checkpoint()` / `reset()` reset the workspace.
+- **Read on shortcut** -- `ScreenReader.capture_and_wait(timeout_s, accurate=False)`: `capture_now`
+  plus a request counter (`_pass_requested` / `_pass_started` / `_pass_completed`, a Condition on the
+  reader's lock) the worker echoes in `_run`'s `finally` after every tick (`_tick` records the
+  requests it serves under its lock); True once the pass that saw the request is over (text
+  published, or nothing to publish: paused / off / grab error), False at once off the worker or
+  from its own thread, False on timeout; `stop()` notifies waiters. `Engine._refresh_screen()` wraps
+  it with `[screen].read_timeout_s` and is registered through `Assistant.set_screen_refresh`;
+  `_AssistJob.read_now` (set by `Assistant.code/text(read_now=True)`, the default; `Engine.code/
+  text(read_now=True)` default) makes `_screen_text_for_job` call it before reading the provider,
+  gated by `[screen].read_on_shortcut`. Hands-free: `HandsFreeHooks.text/code(..., read_now)`,
+  `_request_step(kind, read_now=)` -- True for a manual gesture (`_command("manual")`), False for
+  the cycle's steps (they follow the controller's accurate read); `HandsFreeController.
+  context_text(current="")` / `ScreenContext.text(max_chars, current=None)` render a fresh screen
+  as the "on screen now" part without recording it (`Assistant._hands_free_text` calls the
+  provider with the fresh screen, falling back to the zero-argument form). `_HandsFreeHooks.code`
+  also gained the `fresh` parameter it lacked (a hands-free code_fresh step used to raise inside
+  the controller).
+- **Code only** -- `prompts._code_only_shape(explain, comments, language)` replaces `_solve_shape`
+  in `system_code(code_only=True)`: one fenced block and nothing outside it, notes and the
+  complexity as comment lines inside; with `explain` the plan shape plus "never markdown inside the
+  block". `exocortex/llm/codeformat.py`: `code_only(text, explain=, language=)` -- the main block
+  (largest / still open) is kept, `clean_code_line` turns headings (unless `#` is the comment
+  marker), bold-only lines, prose bullets and bold-marked prose inside it into comments
+  (`comment_syntax(tag, body)`: `#` / `//` / `--` / `<!-- -->` by fence tag, else inferred from the
+  code), every non-blank line outside it (`unmark`ed) becomes a comment appended after a blank
+  line, fence-less code (`_mostly_code`) is fenced with `language_tag(primary_language)`, prose is
+  left alone; with `explain` only the inside of the block changes. Applied in `_run_assist_job`
+  to a finished, non-cancelled "code" answer before the plan / history / `_code_answers` see it
+  (`[assist].code_only`).
+- Config / settings: `ScreenConfig.read_on_shortcut = True`, `read_timeout_s = 4.0`, `workspace =
+  True`, `workspace_chars = 3000`; `AssistConfig.code_only = True`; fields on the Screen and Assist
+  tabs; `config.example.toml`; README ("Multi-file tasks, read-on-shortcut and plain-code answers").
+- Tests: `tests/test_workspace.py`, `tests/test_codeformat.py`, `tests/test_prompts_workspace.py`,
+  `tests/test_screen_reader_wait.py`, `tests/test_assistant_workspace.py`,
+  `tests/test_handsfree_readnow.py`; the hands-free `FakeHooks` / wiring `FakeAssistant` accept
+  `read_now` (and `fresh`). Not exercised live: the fresh read's latency on the real OCR path and
+  the model's response to the workspace block.
+
 ## Coding rules for implementers
 - Windows-only OK, but guard imports so `pytest` runs (e.g., import pyaudiowpatch inside functions or try/except at module import with a clear error at use time).
 - Never call the network except LM Studio (localhost), the model download in `models_dl.py`, and

@@ -894,6 +894,28 @@ def _solve_shape(explain: bool, comments: str = "normal", language: str = "Pytho
     )
 
 
+def _code_only_shape(explain: bool, comments: str = "normal", language: str = "Python") -> str:
+    """2026-10-29: `_solve_shape` for a Code answer that must be plain code -- one fenced block and
+    nothing outside it, every note (an assumption, the complexity) a comment line inside it in the
+    language's own syntax, never markdown. With `explain` the plan shape stays (the walkthrough and
+    the complexity line are what `exocortex.plan.split_plan` parses) and the rule applies to the
+    inside of the block. `exocortex.llm.codeformat.code_only` enforces the same on the answer."""
+    language = _resolve_language(language)
+    if not explain:
+        return (
+            "Output ONLY code: one fenced code block in the language shown "
+            f"({language} if none is indicated) and nothing outside it -- no title, no explanation, no "
+            "bullet list, no complexity line outside the block. Anything worth saying -- an assumption, "
+            "the time and space complexity -- goes INSIDE the block as comment lines in the language's own "
+            "comment syntax (# or // ...), at the end. Markdown (headings, **bold**, bullets, backticks) "
+            f"never appears, inside or outside the block.{_comment_rule(comments)}"
+        )
+    return _solve_shape(True, comments, language) + (
+        " Inside the fenced block only code and comment lines in the language's own comment syntax "
+        "appear -- never markdown (headings, **bold**, bullets)."
+    )
+
+
 #: Shared by `system_solve`, `system_code` and (in a rephrased form) `system_complete`: a task
 #: that indicates its own language wins; `language` (`cfg.assist.primary_language`) is only the
 #: fallback for an open or ambiguous choice. Never volatile (depends only on the config), so the
@@ -1027,6 +1049,51 @@ def _given_code_ask(kind: str, consider: bool | None) -> str:
     return _GIVEN_CODE_ASKS.get((kind, bool(consider)), "")
 
 
+#: 2026-10-29 (multi-file tasks): the <workspace> block of a Code / Text user turn -- the OTHER files
+#: and panes of the task seen since the checkpoint (`exocortex.workspace`) -- and the rules that read
+#: it. The block is rendered only when there is something to put in it; the system-prompt rule is
+#: static for a fixed config (`[screen].workspace`), so the KV prefix holds across turns.
+_WORKSPACE_RULE_CODE = (
+    "<workspace> (when present) holds the OTHER files and panes of this same task that were on the "
+    "user's screen since the checkpoint -- the task statement, a parent class, an interface, a test "
+    "file, a config -- each under a [name] header. <screen> is the file or pane the user is in RIGHT "
+    "NOW. Write the code for THAT file: when it is an interface, an abstract class, a test, a helper "
+    "module, a config or a stub, produce what THAT file needs -- complete, and consistent with the "
+    "other files' names, signatures and types -- never the parent or main object instead of it. The "
+    "workspace is context only: do not re-emit the other files unless the task asks for them, and do "
+    "not restate the task statement."
+)
+_WORKSPACE_RULE_TEXT = (
+    "<workspace> (when present) holds the OTHER files and panes of this same task that were on the "
+    "user's screen since the checkpoint -- the task statement, a parent class, an interface, a test "
+    "file -- each under a [name] header. <screen> is the file or pane the user is in RIGHT NOW: walk "
+    "through what THAT file needs (an interface, a test or a helper included), in the context of the "
+    "others, rather than the main object."
+)
+_WORKSPACE_ASKS = {
+    "code": (
+        " The screen shows the file I am in right now; the workspace holds the other files of the same "
+        "task. Write the code for the file on screen, consistent with them."
+    ),
+    "text": (
+        " The screen shows the file I am in right now; the workspace holds the other files of the same "
+        "task. Walk through what the file on screen needs, in the context of them."
+    ),
+}
+
+
+def workspace_block(workspace: str = "") -> str:
+    """Render the <workspace> block (the OTHER views of the task), "" when there is none. Volatile
+    like <screen>, so it sits right before it, after every stable block."""
+    body = (workspace or "").strip()
+    return f"<workspace>\n{body}\n</workspace>\n\n" if body else ""
+
+
+def _workspace_ask(kind: str, workspace: str) -> str:
+    """The sentence appended to a Code / Text ask when a <workspace> block is present."""
+    return _WORKSPACE_ASKS.get(kind, "") if (workspace or "").strip() else ""
+
+
 def system_solve(persona: str, explain: bool = False, comments: str = "normal", language: str = "Python",
                  libraries: str = "basic", context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
     """System prompt for autonomous mode: SOLVE whatever task is on the user's screen.
@@ -1104,7 +1171,8 @@ def user_solve(transcript_window: str, screen_text: str, focus: str = "", choice
 
 
 def system_code(persona: str, explain: bool = False, comments: str = "normal", language: str = "Python",
-                libraries: str = "basic", context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
+                libraries: str = "basic", context: str = "", *, tools: str = "", consider_given_code: bool | None = None,
+                workspace: bool | None = None, code_only: bool | None = None) -> str:
     """System prompt for kind "code" (the Code button): write the code for the coding task being
     discussed / shown, right now.
 
@@ -1115,6 +1183,10 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
     entirely: a Code press never forks (the language default, via `_language_rule`, always
     resolves what would otherwise be the one common fork -- which language to use) and
     `Assistant._detect_choices` never looks for a <choices> block on a "code" job either.
+
+    2026-10-29: `workspace` adds the rule that reads the <workspace> block (the other files of the
+    task; `_WORKSPACE_RULE_CODE`), `code_only` swaps the answer shape for `_code_only_shape` (plain
+    code, nothing else). Both default to None, which renders exactly what the builder rendered before.
     """
     lines = [
         "You are the user's silent, real-time co-pilot. The user just pressed \"Code\": write the "
@@ -1126,10 +1198,11 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
         "questions, and do NOT describe what you could do -- just do it. When a detail is missing, "
         "make the most reasonable assumption and proceed; note it in at most one short line only if "
         "it materially changes the result.",
-        _solve_shape(explain, comments, language),
+        _code_only_shape(explain, comments, language) if code_only else _solve_shape(explain, comments, language),
         _language_rule(language),
         _library_rule(libraries),
         *_given_code_lines(consider_given_code),
+        *([_WORKSPACE_RULE_CODE] if workspace else []),
         "No preamble, no \"Sure\" or \"Here is\", no markdown headers, never mention being an AI, a "
         "model, or a co-pilot. OCR text can be garbled: infer the intent and ignore obvious noise.",
         _REFERENCE_RULE,
@@ -1145,7 +1218,7 @@ def system_code(persona: str, explain: bool = False, comments: str = "normal", l
 
 def user_code(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
               reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "",
-              consider_given_code: bool | None = None) -> str:
+              consider_given_code: bool | None = None, workspace: str = "") -> str:
     """User turn for `system_code`: transcript (stable) -> previous code (only when present) ->
     screen (volatile) -> on-demand context (`extra`, only when present) -> the ask.
 
@@ -1158,23 +1231,27 @@ def user_code(transcript_window: str, screen_text: str, previous: str = "", focu
 
     2026-10-06 (context library): `reference` / `earlier` go before <transcript>, `lookup` after
     <screen> (see `context_blocks` / `lookup_block`); all "" is byte-identical to the old output.
+    2026-10-29: `workspace` (the OTHER files of the task, `exocortex.workspace`) renders as a
+    <workspace> block right before <screen> and adds a sentence to the ask; "" renders nothing.
     """
     ask = (focus.strip() or (
         "Write the code for the coding task described in the transcript above and/or shown on the "
         "screen. If the transcript asks for a change to the previous code, apply it to that code. "
         "Output the finished code now."
-    )) + _given_code_ask("code", consider_given_code)
+    )) + _given_code_ask("code", consider_given_code) + _workspace_ask("code", workspace)
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
         f"{context_blocks(reference, earlier, map_text)}"
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
+        f"{workspace_block(workspace)}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
         f"{lookup_block(lookup)}{_extra_block(extra)}{ask}"
     )
 
 
-def system_text(persona: str, context: str = "", *, tools: str = "", consider_given_code: bool | None = None) -> str:
+def system_text(persona: str, context: str = "", *, tools: str = "", consider_given_code: bool | None = None,
+                workspace: bool | None = None) -> str:
     """System prompt for kind "text" (the Text button): a plain-English walkthrough of the task
     being discussed / shown, right now -- the way an engineer talks a problem through out loud
     before writing any code.
@@ -1203,6 +1280,7 @@ def system_text(persona: str, context: str = "", *, tools: str = "", consider_gi
         "updated; the edge cases to handle; the time and space complexity. For a non-coding question, "
         "walk through the reasoning to the answer and end with the answer.",
         *_given_code_lines(consider_given_code, kind="text"),
+        *([_WORKSPACE_RULE_TEXT] if workspace else []),
         "Prose only: short plain-English paragraphs or a compact list of lines starting with \"- \", "
         "6 to 12 lines in total, first person is fine (\"I'd start by ...\"), ready to say out loud. "
         "No code fences and no code -- at most a few tokens of code inline (a variable or function "
@@ -1225,7 +1303,7 @@ def system_text(persona: str, context: str = "", *, tools: str = "", consider_gi
 
 def user_text(transcript_window: str, screen_text: str, previous: str = "", focus: str = "", extra: str = "", *,
               reference: str = "", earlier: str = "", lookup: str = "", map_text: str = "",
-              consider_given_code: bool | None = None) -> str:
+              consider_given_code: bool | None = None, workspace: str = "") -> str:
     """User turn for `system_text`: the same checkpoint-scoped transcript -> previous code (only
     when present) -> screen -> on-demand context -> ask layout as `user_code`, with the ask asking
     for the walkthrough. `focus` is an optional extra instruction; blank falls back to the default
@@ -1235,12 +1313,13 @@ def user_text(transcript_window: str, screen_text: str, previous: str = "", focu
         "and/or shown on the screen: what is asked, the key insight, the approach step by step, the "
         "edge cases and the complexity. If code was produced earlier, walk through that approach. "
         "Output the walkthrough now."
-    )) + _given_code_ask("text", consider_given_code)
+    )) + _given_code_ask("text", consider_given_code) + _workspace_ask("text", workspace)
     previous_block = f"<previous>\n{previous.strip()}\n</previous>\n\n" if previous.strip() else ""
     return (
         f"{context_blocks(reference, earlier, map_text)}"
         f"<transcript>\n{transcript_window.strip() or '(nothing said since the checkpoint)'}\n</transcript>\n\n"
         f"{previous_block}"
+        f"{workspace_block(workspace)}"
         f"{_screen_block(screen_text) or '<screen>\n(nothing readable on screen)\n</screen>\n\n'}"
         f"{lookup_block(lookup)}{_extra_block(extra)}{ask}"
     )

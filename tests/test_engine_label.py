@@ -102,11 +102,11 @@ class _FakeEngineForHooks:
         self.code_calls: list[tuple[str, str]] = []
         self.text_calls: list[tuple[str, str]] = []
 
-    def code(self, focus: str = "", label: str = "") -> int | None:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int | None:
         self.code_calls.append((focus, label))
         return 42
 
-    def text(self, focus: str = "", label: str = "") -> int | None:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int | None:
         self.text_calls.append((focus, label))
         return 43
 

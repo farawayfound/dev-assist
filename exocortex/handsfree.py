@@ -215,12 +215,12 @@ class HandsFreeHooks(Protocol):
     def checkpoint(self) -> None:
         """Soft-reset the coding context (publishes a CheckpointEvent)."""
 
-    def text(self, focus: str = "", label: str = "") -> int | None:
+    def text(self, focus: str = "", label: str = "", read_now: bool = False) -> int | None:
         """Start a "text" (walkthrough) job for the task on screen / discussed since the
         checkpoint; returns its job id (None when the engine deferred it: LLM not ready).
         ``focus`` is an extra instruction (blank: the default ask), ``label`` what the UI shows."""
 
-    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int | None:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = False) -> int | None:
         """Start a "code" job for the same task; returns its job id (None when deferred). ``fresh``
         (2026-10-29): the "Code from scratch" gesture -- the job ignores the code on screen."""
 
@@ -580,12 +580,16 @@ class ScreenContext:
         with self._lock:
             return not self._seen and not self._current_text
 
-    def text(self, max_chars: int) -> str:
+    def text(self, max_chars: int, current: str | None = None) -> str:
         """The cumulative context, at most ``max_chars``: earlier lines that are no longer on
         screen (an earlier reading of a line since edited is dropped -- same squashed head), the
-        oldest trimmed first, then the current screen verbatim."""
+        oldest trimmed first, then the current screen verbatim. 2026-10-29: ``current`` (a fresh
+        reading of the screen, non-blank) stands in for the recorded current screen -- the "on
+        screen now" part is that text and the earlier lines are judged against it -- without
+        changing what is recorded (the controller's own reads keep doing that)."""
+        fresh = (current or "").strip()
         with self._lock:
-            current = set(self._current_keys)
+            current = set(normalize_keys(fresh.splitlines())) if fresh else set(self._current_keys)
             heads = {squash(k)[:_SAME_LINE_HEAD] for k in current if len(squash(k)) >= _SAME_LINE_HEAD}
             earlier: list[str] = []
             for key, text in self._seen.items():
@@ -595,7 +599,7 @@ class ScreenContext:
                 if len(sq) >= _SAME_LINE_HEAD and sq[:_SAME_LINE_HEAD] in heads:
                     continue
                 earlier.append(text)
-            now = self._current_text
+            now = fresh or self._current_text
         if not earlier:
             return now[:max_chars]
         budget = max_chars - len(now) - len(CONTEXT_EARLIER_HEADER) - len(CONTEXT_NOW_HEADER) - 4
@@ -697,12 +701,14 @@ class HandsFreeController:
                 return "paused"
             return self._phase if self._phase else self._watch  # type: ignore[return-value]
 
-    def context_text(self) -> str:
+    def context_text(self, current: str = "") -> str:
         """The cumulative screen context for the current task (``[handsfree].context_chars``),
-        "" while hands-free is off or nothing has been read yet. Any thread."""
-        if not self.enabled or self.context.empty:
+        "" while hands-free is off or nothing has been read yet. 2026-10-29: ``current``, a fresh
+        reading of the screen (the Code / Text shortcut's read-on-shortcut), is rendered as the
+        "on screen now" part instead of the controller's last read. Any thread."""
+        if not self.enabled or (self.context.empty and not current.strip()):
             return ""
-        return self.context.text(max(500, int(self._cfg.handsfree.context_chars)))
+        return self.context.text(max(500, int(self._cfg.handsfree.context_chars)), current=current)
 
     def start(self) -> None:
         """Turn hands-free on: the current screen is treated as a (possibly new) task right
@@ -860,7 +866,9 @@ class HandsFreeController:
             if self._paused:
                 return
             self._abort_cycle()
-            self._request_step(str(command[1]))
+            # 2026-10-29: the gesture's step reads the screen afresh (the cycle's own steps follow an
+            # accurate read and pass read_now=False)
+            self._request_step(str(command[1]), read_now=True)
         elif name == "resume_auto":
             if self._paused or self._manual() or not self._armed or self._phase is not None:
                 return
@@ -1116,7 +1124,7 @@ class HandsFreeController:
             return
         self._request_step(self._steps.pop(0))
 
-    def _request_step(self, kind: str, detail: str = "") -> None:
+    def _request_step(self, kind: str, detail: str = "", *, read_now: bool = False) -> None:
         # 2026-10-29: "code_fresh" (the Code-from-scratch gesture) is a "code" step whose job ignores
         # the code on screen; the phase and the awaited kind stay "code" (the events carry that kind).
         fresh = kind == "code_fresh"
@@ -1132,11 +1140,11 @@ class HandsFreeController:
             focus, label = HANDS_FREE_CODE_FOCUS, HANDS_FREE_CODE_LABEL
         try:
             if kind == "text":
-                job_id = self._hooks.text(focus, label) if focus else self._hooks.text()
+                job_id = self._hooks.text(focus, label, read_now=read_now)
             elif fresh:
-                job_id = self._hooks.code(focus, label, fresh=True)
+                job_id = self._hooks.code(focus, label, fresh=True, read_now=read_now)
             else:
-                job_id = self._hooks.code(focus, label) if focus else self._hooks.code()
+                job_id = self._hooks.code(focus, label, read_now=read_now)
         except Exception:  # noqa: BLE001
             log.exception("hands-free: %s step failed to start", kind)
             self._next_step()

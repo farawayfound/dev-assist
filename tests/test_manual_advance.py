@@ -592,11 +592,13 @@ class RecordingAssistant:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str]] = []
 
-    def text(self, focus: str = "", label: str = "") -> int:
+    def text(self, focus: str = "", label: str = "", read_now: bool = True) -> int:
         self.calls.append(("text", focus))
         return 1
 
-    def code(self, focus: str = "", label: str = "", fresh: bool = False) -> int:
+    def code(self, focus: str = "", label: str = "", fresh: bool = False, read_now: bool = True) -> int:
+        # 2026-10-29: `read_now` (read the screen afresh) is accepted and ignored here -- the
+        # routing is what these tests check; tests/test_handsfree_readnow.py covers the flag.
         self.calls.append(("code", focus) if not fresh else ("code_fresh", focus))
         return 2
 

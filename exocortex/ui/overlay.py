@@ -16,6 +16,11 @@ import sys
 import time
 from collections.abc import Callable
 
+try:
+    from ctypes import wintypes as _wintypes   # WM_MOUSEACTIVATE decoding (see nativeEvent)
+except Exception:  # pragma: no cover - a platform without ctypes.wintypes
+    _wintypes = None  # type: ignore[assignment]
+
 from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QTimer, Qt, Signal
 from PySide6.QtGui import (
     QActionGroup,
@@ -46,7 +51,11 @@ from PySide6.QtWidgets import (
     QTextEdit,
     QVBoxLayout,
     QWidget,
+    QAbstractButton,
     QAbstractScrollArea,
+    QAbstractSlider,
+    QAbstractSpinBox,
+    QComboBox,
 )
 
 from exocortex.actions import EngineActions
@@ -193,6 +202,12 @@ _GRIP_PX = 6          # resize band; inside the root layout's 8 px margin, so it
 _GRIP_CORNER_PX = 18  # this close to the end of an edge band, the drag resizes the corner
 _TITLE_STRIP_PX = 40  # top strip (title bar: drag handle + menu) that must stay on a screen
 _KEEP_VISIBLE_PX = 120
+#: WM_MOUSEACTIVATE -- Windows asking, on a click, whether this window may become the active one
+#: (take the keyboard) -- and the answer that says no. HIWORD(lParam) is the mouse message.
+_WM_MOUSEACTIVATE = 0x0021
+_MA_NOACTIVATE = 3
+_LEFT_BUTTON_MSGS = frozenset({0x0201, 0x0203, 0x00A1, 0x00A3})    # WM_(NC)LBUTTONDOWN / DBLCLK
+_RIGHT_BUTTON_MSGS = frozenset({0x0204, 0x0206, 0x00A4, 0x00A6})   # WM_(NC)RBUTTONDOWN / DBLCLK
 
 
 #: The Assist menu's Role submenu, in display order (keys: exocortex.llm.prompts.ROLES).
@@ -626,6 +641,11 @@ class OverlayWindow(QWidget):
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
         )
+        # 2026-10-29: shown -- by a hotkey, focus_ask -- without taking the keyboard from the window
+        # the user is working in (a normal top-level window is activated when shown; the attribute
+        # shows it without that, on every platform). Which CLICKS on the panel may take the keyboard
+        # is decided in `_click_activates`.
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
         self.setStyleSheet(build_qss(cfg.ui.font_size))
         self.setWindowOpacity(cfg.ui.opacity)
@@ -2784,6 +2804,77 @@ class OverlayWindow(QWidget):
         for grip in self._edge_grips:
             grip.place(self.size())
 
+    # ---------------------------------------------------------------- focus -------
+    #: Parts of the panel a LEFT click keeps activating (taking the keyboard): the text panes and
+    #: inputs (typing, selecting, Ctrl+C), the drag handles (title bar, slim bar, edges, corner grip)
+    #: and the sliders -- a drag that leaves the window keeps its mouse capture only while the
+    #: window is the foreground one.
+    _ACTIVATING_WIDGETS: tuple[type, ...] = (
+        QAbstractScrollArea, QLineEdit, QAbstractSpinBox, QComboBox, QAbstractSlider, QSizeGrip, _TitleBar, _EdgeGrip,
+    )
+
+    def _click_activates(self, mouse_msg: int, pos: QPoint) -> bool:
+        """Whether a click arriving on this window (``mouse_msg`` the button message from
+        ``WM_MOUSEACTIVATE``, ``pos`` the cursor in global logical pixels) may make it the active
+        window -- that is, take the keyboard focus away from the app the user is working in.
+
+        2026-10-29: the panel sits over the user's work, so a click on one of its buttons or
+        switches (Manual, Hands-free, Code, Pause, the tabs, the title-bar icons...) must not move
+        the focus: the button works without it. The focus is taken only where it is needed -- a
+        right click (the context menus are popups whose outside-click dismissal needs this window
+        to be the foreground one), a left click on the ask box or a text pane (typing, selecting,
+        Ctrl+C), on a drag handle or a slider (a drag keeps its mouse capture outside the window
+        only while the window is foreground), or on a button that opens a menu. A middle or thumb
+        button click never activates (it has no use for the keyboard here; it is usually a manual-
+        advance gesture). In the hands-free view a click on the click-through content never
+        activates either: it is a click meant for the app underneath that arrived before the
+        cursor-tracking flag caught up (`_update_hands_free_click_through` runs every poll tick),
+        and the gesture code, not the panel, owns it."""
+        if mouse_msg in _RIGHT_BUTTON_MSGS:
+            return True
+        if mouse_msg not in _LEFT_BUTTON_MSGS:
+            return False
+        try:
+            if self._hands_free and not self._completion_mode and not self._hands_free_clickable_at(pos):
+                return False
+            w = self.childAt(self.mapFromGlobal(pos))
+            while w is not None and w is not self:
+                if isinstance(w, QAbstractButton):
+                    menu = getattr(w, "menu", None)
+                    return callable(menu) and menu() is not None
+                if isinstance(w, self._ACTIVATING_WIDGETS):
+                    return True
+                w = w.parentWidget()
+        except Exception:
+            log.exception("click activation check failed")
+            return True    # fail open: the behaviour of every ordinary window
+        return False
+
+    def _mouse_activate_answer(self, address: int, pos: QPoint | None = None) -> int | None:
+        """Decode the native message at ``address``: ``MA_NOACTIVATE`` when it is a
+        ``WM_MOUSEACTIVATE`` whose click `_click_activates` refuses, else None (Qt and Windows
+        decide as usual). ``pos`` defaults to the cursor position."""
+        if _wintypes is None or not address:
+            return None
+        msg = _wintypes.MSG.from_address(int(address))
+        if msg.message != _WM_MOUSEACTIVATE:
+            return None
+        mouse_msg = (int(msg.lParam) >> 16) & 0xFFFF
+        if self._click_activates(mouse_msg, QCursor.pos() if pos is None else pos):
+            return None
+        return _MA_NOACTIVATE
+
+    def nativeEvent(self, eventType: object, message: object) -> object:  # noqa: N802 - Qt override
+        """Answer ``WM_MOUSEACTIVATE`` (see `_click_activates`); everything else goes to Qt."""
+        try:
+            if eventType == b"windows_generic_MSG":
+                answer = self._mouse_activate_answer(int(message))  # type: ignore[call-overload]
+                if answer is not None:
+                    return True, answer
+        except Exception:
+            log.exception("WM_MOUSEACTIVATE handling failed")
+        return super().nativeEvent(eventType, message)
+
     def closeEvent(self, event: QCloseEvent) -> None:  # noqa: N802 - Qt override
         self._save_geometry()
         self._stop_timers()
@@ -3129,6 +3220,10 @@ class OverlayWindow(QWidget):
         """Ensure the overlay is visible and give the ask box keyboard focus."""
         if not self.isVisible():
             self.show()
+        # The one shortcut whose job is to take the keyboard: typing must land in the ask box, so
+        # the window is activated explicitly (setFocus alone only records the focus child while the
+        # window is inactive). Every other shortcut leaves the focus where it is (2026-10-29).
+        self.activateWindow()
         self.askbox.focus()
 
     def nudge(self, dx: int, dy: int) -> None:

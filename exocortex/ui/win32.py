@@ -68,6 +68,12 @@ def _load_dlls() -> tuple[ctypes.WinDLL, ctypes.WinDLL] | tuple[None, None]:
         wintypes.UINT,
     ]
     user32.SetWindowPos.restype = wintypes.BOOL
+    user32.GetForegroundWindow.argtypes = []
+    user32.GetForegroundWindow.restype = wintypes.HWND
+    user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+    user32.SetForegroundWindow.restype = wintypes.BOOL
+    user32.IsWindow.argtypes = [wintypes.HWND]
+    user32.IsWindow.restype = wintypes.BOOL
 
     kernel32.FormatMessageW.argtypes = [
         wintypes.DWORD,
@@ -192,6 +198,38 @@ def set_topmost(hwnd: int) -> None:
     if not ok:
         err = ctypes.get_last_error()
         log.debug("SetWindowPos(HWND_TOPMOST) failed for hwnd=%s: %s", hwnd, last_error_message(err))
+
+
+def foreground_window() -> int:
+    """Handle of the window that has the keyboard right now (``GetForegroundWindow``); 0 when
+    there is none or off Windows."""
+    if not IS_WINDOWS or _user32 is None:
+        return 0
+    try:
+        return int(_user32.GetForegroundWindow() or 0)
+    except OSError:
+        log.exception("GetForegroundWindow raised")
+        return 0
+
+
+def activate_window(hwnd: int) -> bool:
+    """Give the keyboard back to ``hwnd`` (``SetForegroundWindow``).
+
+    2026-10-29: used to return the focus to the window the user was working in after one of this
+    app's windows had to take it (the region picker when its key hook is unavailable). Windows
+    lets a process set the foreground window while it is itself the foreground process, which is
+    the case at that moment. A handle that no longer names a window is ignored. True when the
+    window was activated.
+    """
+    if not IS_WINDOWS or _user32 is None or not hwnd:
+        return False
+    try:
+        if not _user32.IsWindow(wintypes.HWND(hwnd)):
+            return False
+        return bool(_user32.SetForegroundWindow(wintypes.HWND(hwnd)))
+    except OSError:
+        log.exception("SetForegroundWindow raised for hwnd=%s", hwnd)
+        return False
 
 
 # ---------------------------------------------------------------------------------------------

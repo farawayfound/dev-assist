@@ -387,6 +387,12 @@ class AssistConfig:
     # scratch, keeping only the entry point the task dictates. The manual-advance "Code from
     # scratch" gesture ([hotkeys].manual_code_fresh) ignores the given code whatever this says.
     consider_given_code: bool = True
+    # 2026-10-29: a Code answer is plain code only -- one code block and nothing outside it; a note
+    # or the complexity goes inside as comment lines in the language's own syntax, and markdown the
+    # model slips in (a heading, **bold**, bullets) is turned into comments (exocortex/llm/
+    # codeformat.py). With explanations on the walkthrough stays and the rule applies to the code
+    # block. Off: the answer is shown as the model wrote it.
+    code_only: bool = True
 
 
 @dataclass
@@ -518,6 +524,17 @@ class ScreenConfig:
     # the screen text would include the co-pilot's own answers and suggested questions and feed
     # them back into the next prompt.
     exclude_own_windows: bool = True
+    # 2026-10-29 (multi-file tasks): read the screen the moment Code / Text is pressed and hand
+    # that job the fresh text -- otherwise it gets the last pass, up to interval_s old and often
+    # the wrong file -- waiting at most read_timeout_s for the capture + OCR to finish.
+    read_on_shortcut: bool = True
+    read_timeout_s: float = 4.0
+    # The task's workspace (exocortex/workspace.py): every file / pane seen since the checkpoint,
+    # grouped by similarity, handed to Code / Text as <workspace> next to the <screen> so the
+    # answer is written for the file on screen in the context of the others (the task statement,
+    # a parent class, an interface, a test). workspace_chars caps that block.
+    workspace: bool = True
+    workspace_chars: int = 3000
 
 
 @dataclass

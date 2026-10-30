@@ -291,7 +291,9 @@ vendor. See `exocortex/llm/route.py`.
      **Consider given code** on (Settings › Assist, the default) it also works *with* the code you
      have already typed in the development window — completing it, or fixing only what is wrong,
      keeping your structure, names and approach — rather than jumping to the optimal solution from
-     scratch; see "Consider given code" below.
+     scratch; see "Consider given code" below. Both **Text** and **Code** read the screen the moment
+     they are pressed and write for the *file you are in*, with the other files of the task seen since
+     the checkpoint as context (see "Multi-file tasks" below), and a Code answer is plain code only.
 7. Everything is saved to `~/Documents/ExoCortex/sessions/<timestamp>/` (transcript.md/.jsonl,
    notes.md, answers.md, session.json, llama-server.log).
 
@@ -470,6 +472,9 @@ The **Screen** tab reads what is on your screen and folds it into everything els
   when it visibly changed); **Monitor** reads the whole primary monitor; **Region…**
   (`Ctrl+Alt+R`) lets you drag a rectangle, e.g. the shared-slides pane or a chat box.
   `Ctrl+Alt+V` pauses/resumes reading.
+- **Code** and **Text** read the screen the moment they are pressed (`[screen].read_on_shortcut`, on
+  by default; at most `read_timeout_s` of waiting), so they work on the file you are in right then,
+  not on the last pass up to `interval_s` ago.
 - OCR runs locally: Windows' built-in OCR (~110 ms per screen) by default, RapidOCR (more accurate,
   slower on the CPU, fast on the iGPU/NPU — see "OCR on the iGPU / NPU" below) with
   `ocr_engine = "rapidocr"`. Nothing is uploaded and no screenshots are written to disk.
@@ -680,10 +685,56 @@ manual advance the third mouse gesture — **Code from scratch**, mouse button 4
 ignores the given code whatever this setting says, so the middle button and the thumb button give
 you both behaviours side by side.
 
+### Multi-file tasks, read-on-shortcut and plain-code answers
+
+A coding task rarely fits one screen or one file: the statement sits in a browser tab or a README,
+the code spans an interface, its implementation and a test, and you move between them while the
+screen is read every `[screen].interval_s`. Three things (added 2026-10-29) make **Code** and
+**Text** work with that instead of with whatever the last capture happened to show:
+
+- **Read on shortcut** (`[screen].read_on_shortcut`, on). The Code / Text hotkey, button or
+  manual-advance gesture reads the screen *at that moment* and the answer is written for the file
+  you are in — an interface, a test, a helper, a config — not for whatever the model takes to be
+  the main object. The job waits at most `read_timeout_s` (4 s) for the OCR; a read that does not
+  finish in time leaves the latest text in use.
+- **The task's workspace** (`[screen].workspace`, on; `workspace_chars` caps it at 3000 characters).
+  Every file or pane read since the last checkpoint is kept as a *view* — the same file scrolled or
+  edited stays one view (lines that scrolled away are kept, an edited line keeps its latest reading),
+  another file named in the editor's title, or a page sharing lines or identifiers with the task,
+  becomes another view — and Code / Text get the *other* views as a `<workspace>` block beside the
+  `<screen>`, with the rule to write for the file on screen, consistent with the others, and never
+  to re-emit them. **Checkpoint** (`Ctrl+Alt+B`) starts a new workspace, and stays the explicit
+  boundary between problems. Forgetting it is covered as far as OCR allows: a glance at a chat or a
+  mail changes nothing; four consecutive captures of a *different, task-like* context — another
+  project in the editor (told apart by the project name in the title), another site — restart the
+  workspace by themselves; views unseen for 15 minutes drop out of the block. The next problem on
+  the *same* site, though, shares its page chrome with the previous one and joins the workspace as
+  another view until it ages out — checkpoint between problems to keep the block clean.
+- **Plain code** (`[assist].code_only`, on — **Code answers as plain code only** on the Assist
+  settings tab). A Code answer is one code block and nothing else: the model is told so, and the
+  finished answer is normalised anyway — a note or the complexity line outside the block becomes
+  comment lines at its end, a `### Step 1`, `**Approach**` or `- bullet` that landed inside the
+  block becomes a comment in the language's own syntax, a fence-less answer that is code is fenced.
+  With explanations on the walkthrough and the complexity line stay (they are what the plan parser
+  reads) and the rule applies to the code block.
+
+Hands-free mode keeps its own cumulative context of the current task; with read-on-shortcut the
+gesture's step renders the fresh screen as its "on screen now" part, and the workspace block is
+added there too.
+
 ### Hotkeys (global, work while the meeting app has focus)
 
 Every shortcut, including the in-window keys, the mouse gestures and how to get a hidden overlay
 back, is listed in [docs/SHORTCUTS.md](docs/SHORTCUTS.md).
+
+They work from the background and leave the focus where it is. Every shortcut is read by Windows
+(`RegisterHotKey`) or by a low-level hook, never by the overlay, so the app you are working in keeps
+the keyboard: nothing is brought to the front, and the overlay is shown or updated without being
+activated. The exceptions are the two that exist to take the keyboard: `Ctrl+Alt+Q` puts the cursor
+in the ask box, and the region picker (`Ctrl+Alt+R`) — which reads its own Esc and Enter through a
+hook, so even it leaves your window focused. Clicking a button or switch on the panel does not move
+the focus either; the text panes, the ask box, the title bar and the sliders take it as any window
+would, and so does a right-click (the menus need it).
 
 | Keys | Action |
 |---|---|
@@ -1238,6 +1289,7 @@ libraries = "basic"          # none | basic | all -- a default: "no libraries" s
 primary_language = "Python" # fallback for solve, Code and completions when the task names none
 comments = "normal"        # none | minimal | normal | detailed
 consider_given_code = true  # work WITH the code already on screen (complete it, fix only what's wrong); false = from scratch
+code_only = true            # a Code answer is one code block, notes and the complexity as comments inside it
 style = "bullets"           # bullets | short | detailed
 persona = ""                # e.g. "I am a backend engineer interviewing for a platform role."
 
@@ -1261,6 +1313,10 @@ toolkit_in_answers = true   # ... also for answers / ask / recap, not only the d
 
 [screen]
 interval_s = 1.5             # capture cadence; also hands-free mode's sampling interval
+read_on_shortcut = true      # Code / Text read the screen the moment they are pressed (the file you are in)
+read_timeout_s = 4.0         # ...waiting at most this long for the OCR
+workspace = true             # keep every file / pane seen since the checkpoint; Code / Text get the others as <workspace>
+workspace_chars = 3000       # the size of that block
 ocr_device = "auto"          # RapidOCR: auto = Intel iGPU (OpenVINO) > NPU > cpu; on a non-Intel
                              # GPU (e.g. AMD) "igpu" runs via onnxruntime-directml instead; never
                              # the discrete NVIDIA GPU

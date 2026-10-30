@@ -764,14 +764,40 @@ off, accurate OCR, **manual advance** with its press-and-hold time and the quick
 option), Assist (including **Focus**, **Use libraries** and **Comments in generated
 code**), Notes, **Dashboard** (the board's tracking, columns and width), **Project** (the
 repository root, the on-demand repository lookups and the Claude Code toolkit catalog), Screen
-(including **OCR device**), Monitor, Window, Audio and **Optimize** (where each job runs on this
-machine, a benchmark, a plan per goal — see "Optimize" below) — covering everything in the
-Configuration section below. The old **Model** tab (backend, model, context size, llama.cpp
+(including **OCR device**), Monitor, Window, **Audio** (pick the system-audio and microphone
+devices from a list, **Test** each one, and check the speaker routing — see "Audio devices" below)
+and **Optimize** (where each job runs on this machine, a benchmark, a plan per goal — see
+"Optimize" below) — covering everything in the Configuration section below. The old **Model** tab
+(backend, model, context size, llama.cpp
 knobs) has moved to **`⋯ › Models…`** (see above) — this dialog no longer touches `[llm]` at all.
 **Apply**/**OK** write the values into the running app (most take effect at once;
 the few that need a restart, such as the OCR engine or capture exclusion, are marked *(restart)*
 and listed after you apply) and save `config.toml` immediately. **Restore defaults** fills in the
 built-in defaults without touching anything until you apply.
+
+**Audio devices.** The Audio tab lists what WASAPI actually offers — the loopback devices for
+system audio (the other side of the call) and the input devices for your microphone — and says
+which device *Default* resolves to. Pick one from the list (stored by its full name, so it survives
+a device index renumbering) or type part of a name or a device index. **Test** opens the device for
+1.5 s exactly the way the app does (resolve, open at its native rate, downmix, resample), moves a
+level meter while it listens and then says in words what happened: *OK … peak −12 dBFS*; *audio flows
+but it is silent* (nothing playing, or the mic level is down); *no audio arrived* (WASAPI loopback
+idles while nothing plays, or another app holds the device in exclusive mode); or the open error.
+The test reads the values as they are on the page, so a device can be checked before it is applied.
+The status line shows how many devices were found and what the running app has open right now.
+Devices, the keep-alive tone and the two capture switches **apply live** — the affected capture is
+reopened in the background, the other source keeps running — while the voice-detection knobs
+(speech threshold, silence that ends an utterance, shortest speech kept, longest utterance,
+pre-roll) take effect at the next launch. `--doctor` prints the same device list for a shell.
+
+**Check** (under the devices): speakers are attributed by source — the mic is *Me*, the system
+audio is everyone else — so the routing decides how right the transcript is. After a microphone
+**Test**, a mic Windows has muted (it opens fine but delivers digital silence) or turned down to
+0 % is named, with an **Unmute in Windows** button. **Check speaker routing** plays a short chirp
+on the output behind the chosen loopback and measures where it lands: it should reach the
+system-audio feed and not the mic (a mic that hears the speakers transcribes remote voices as
+*Me*), and the verdict offers to turn echo suppression on or off to match. A running mic that has
+delivered digital silence for 8 s raises a warning once, and `--doctor` reports a muted mic.
 
 Menus, the settings page and the Models window open **above** the overlay (it is always-on-top,
 so without this they would land behind it) and are excluded from screen capture like everything
@@ -1227,6 +1253,10 @@ enabled = false             # walkthrough before the solution, commented code, e
 typed_fraction = 0.9        # share of the solution's code lines seen on screen that triggers the explanation
 
 [audio]
+capture_system = true       # the other side: a WASAPI loopback of an output device (live from Settings > Audio)
+capture_mic = true
+system_device = "default"   # "default" follows the Windows default output; else part of a device name or an index
+mic_device = "default"      # same for the microphone (the Audio tab lists what resolves; Test checks a device)
 loopback_keepalive = true   # keeps WASAPI loopback flowing while nothing is playing
 echo_suppression = true
 
@@ -1484,8 +1514,9 @@ llama-server tests.
 - *"VISIBLE to capture"* in the status bar: Windows build too old, or the display-affinity call was
   rejected (the reason is shown). The content area is veiled while this lasts. Try
   `hide_from_capture = true` after updating Windows.
-- *No system audio*: pick the loopback device explicitly (`system_device = "Odyssey"`), check that the
-  meeting app plays through the default output device, and that no app holds it in exclusive mode.
+- *No system audio*: open **Settings › Audio**, pick the loopback device from the list and press **Test** —
+  it says whether the device opens and whether anything arrives (or set `system_device = "Odyssey"` by
+  hand); check that the meeting app plays through that device, and that no app holds it in exclusive mode.
 - *cuBLAS not found*: only relevant on an NVIDIA machine — the app prepends the pip-installed
   NVIDIA DLL folders to `PATH` itself; if you run pieces manually, import `exocortex.cuda_env` and
   call `setup_cuda_dlls()` first. On AMD/Intel this warning should never appear (the app never

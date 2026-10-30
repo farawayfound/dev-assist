@@ -1,4 +1,4 @@
-"""Tests for exocortex.audio.check (level verdicts, the speaker-routing check), the WASAPI default
+"""Tests for exocortex.audio.check (the speaker-routing check), the WASAPI default
 mic in exocortex.audio.capture, and exocortex.audio.endpoint.
 
 The routing check runs against a fake pyaudiowpatch-shaped module with no threads: the injected
@@ -16,9 +16,6 @@ import pytest
 from exocortex.audio import endpoint
 from exocortex.audio.capture import DeviceInfo, list_devices, resolve_device
 from exocortex.audio.check import (
-    QUIET_PEAK,
-    SILENCE_PEAK,
-    LevelTracker,
     RoutingResult,
     band_rms,
     chirp,
@@ -28,59 +25,6 @@ from exocortex.audio.check import (
 )
 
 RATE = 48000
-
-
-# --------------------------------------------------------------------------- #
-# LevelTracker
-# --------------------------------------------------------------------------- #
-
-
-class _Clock:
-    def __init__(self) -> None:
-        self.t = 100.0
-
-    def __call__(self) -> float:
-        return self.t
-
-
-def _feed(tracker: LevelTracker, clock: _Clock, peak: float, seconds: float) -> None:
-    for _ in range(int(seconds * 10)):
-        tracker.push(peak / 2, peak)
-        clock.t += 0.1
-
-
-def test_tracker_waits_for_a_full_window_before_calling_a_feed_silent() -> None:
-    clock = _Clock()
-    tracker = LevelTracker(window_s=1.5, clock=clock)
-    assert tracker.verdict() == "waiting"
-    _feed(tracker, clock, 1e-9, 0.5)
-    assert tracker.verdict() == "waiting"          # too early to call it
-    _feed(tracker, clock, 1e-9, 1.5)
-    assert tracker.verdict() == "silent"
-
-
-def test_tracker_ok_at_once_and_quiet_below_minus_50_dbfs() -> None:
-    clock = _Clock()
-    tracker = LevelTracker(window_s=1.5, clock=clock)
-    tracker.push(0.05, 0.1)
-    assert tracker.verdict() == "ok"               # speech-level peak: no need to wait
-    clock.t += 5.0
-    assert tracker.verdict() == "waiting"          # nothing for a whole window (no callbacks)
-    tracker.reset()
-    _feed(tracker, clock, QUIET_PEAK / 3, 2.0)
-    assert tracker.verdict() == "quiet"
-    assert SILENCE_PEAK < QUIET_PEAK / 3
-
-
-def test_tracker_one_loud_moment_in_the_window_is_enough() -> None:
-    clock = _Clock()
-    tracker = LevelTracker(window_s=1.5, clock=clock)
-    _feed(tracker, clock, 1e-9, 2.0)
-    tracker.push(0.1, 0.2)
-    assert tracker.verdict() == "ok"
-    assert tracker.peak() == pytest.approx(0.2)
-    _feed(tracker, clock, 1e-9, 2.0)
-    assert tracker.verdict() == "silent"
 
 
 # --------------------------------------------------------------------------- #

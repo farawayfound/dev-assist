@@ -284,7 +284,7 @@ def _check_audio(r: _Report, cfg: Config) -> None:
             state = capture_endpoint_state(d.name)
             if state is not None and state.muted:
                 r.line(_FAIL, f"mic '{state.name}' is muted in Windows: it opens fine but delivers silence "
-                              "(Settings > Audio > Test devices > Unmute)")
+                              "(Settings > Audio: Test the microphone, then Unmute in Windows)")
             elif state is not None and state.volume < 0.05:
                 r.line(_WARN, f"mic '{state.name}' input volume is {round(state.volume * 100)}% in Windows")
 

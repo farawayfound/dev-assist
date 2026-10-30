@@ -19,6 +19,7 @@ from typing import Any, Callable
 from exocortex import capabilities, cuda_env
 from exocortex.actions import EngineActions
 from exocortex.bus import (
+    Source,
     CompletionModeEvent,
     AssistDeltaEvent,
     AssistDoneEvent,
@@ -55,6 +56,16 @@ from exocortex.llm.route import resolve_route
 from exocortex.transcript import Transcript
 
 log = logging.getLogger(__name__)
+
+#: 2026-10-29 (Settings > Audio): the `[audio]` paths whose change reopens a capture live, and which
+#: one. The VAD knobs are not here (a segmenter is built once per source: restart-only).
+_AUDIO_RESTART_KEYS: dict[str, Source] = {
+    "audio.capture_system": Source.SYSTEM,
+    "audio.system_device": Source.SYSTEM,
+    "audio.loopback_keepalive": Source.SYSTEM,
+    "audio.capture_mic": Source.MIC,
+    "audio.mic_device": Source.MIC,
+}
 
 #: Cadence of the gpu-guard sampler (module-level so tests can shrink it).
 GPU_GUARD_INTERVAL_S = 5.0
@@ -778,6 +789,47 @@ class Engine(EngineActions):
         if self.pipeline:
             self.pipeline.set_mic_muted(muted)
 
+    def _start_audio_restart(self, sources: list[Source]) -> None:
+        """2026-10-29 (Settings > Audio): reopen the captures whose `[audio]` values changed, off the
+        caller's (UI) thread -- a WASAPI open takes hundreds of milliseconds and a stop joins threads.
+        The pipeline serialises restarts itself and reports on the bus (`AudioStatusEvent
+        "device_changed"` / `ComponentStatusEvent("audio", ...)`). Before the pipeline exists there is
+        nothing to do: `start()` reads the new values when it opens the captures."""
+        pipeline = self.pipeline
+        if pipeline is None:
+            return
+
+        def _run() -> None:
+            for source in sources:
+                try:
+                    pipeline.restart_source(source)
+                except Exception:  # noqa: BLE001 - already on the bus as ComponentStatusEvent("audio", "error")
+                    log.exception("audio: reopening the %s capture failed", source.value)
+
+        threading.Thread(target=_run, name="audio-restart", daemon=True).start()
+
+    def audio_status(self) -> dict[str, object]:
+        """Settings > Audio's status line (2026-10-29): ``{"running": bool, "system": {"enabled",
+        "spec", "device"}, "mic": {...}}`` -- ``device`` is the name of the capture open right now
+        ("" when none). Synchronous; never raises; never touches a device."""
+        pipeline = self.pipeline
+        devices: dict[Any, str] = {}
+        running = False
+        if pipeline is not None:
+            try:
+                devices = dict(pipeline.devices())
+                running = bool(pipeline.running)
+            except Exception:  # noqa: BLE001 - a fake or a half-built pipeline: report "not running"
+                log.debug("audio_status: the pipeline did not answer", exc_info=True)
+        a = self.cfg.audio
+        return {
+            "running": running,
+            "system": {"enabled": bool(a.capture_system), "spec": str(a.system_device),
+                       "device": devices.get(Source.SYSTEM, "")},
+            "mic": {"enabled": bool(a.capture_mic), "spec": str(a.mic_device),
+                    "device": devices.get(Source.MIC, "")},
+        }
+
     def rename_speaker(self, speaker_id: str, label: str) -> None:
         label = label.strip()
         if not label:
@@ -1125,11 +1177,9 @@ class Engine(EngineActions):
             self.set_explanations(bool(changed["explain.enabled"]))
         if "audio.mic_start_muted" in changed:
             self.set_mic_muted(bool(changed["audio.mic_start_muted"]))
-        for key, source in (("audio.mic_device", Source.MIC), ("audio.system_device", Source.SYSTEM)):
-            if key in changed and self.pipeline is not None:
-                # reopening a WASAPI stream takes a moment: never on the UI thread
-                threading.Thread(target=self.pipeline.restart_capture, args=(source,),
-                                 name=f"capture-{source.value}-switch", daemon=True).start()
+        audio_sources = sorted({s for k, s in _AUDIO_RESTART_KEYS.items() if k in changed}, key=lambda s: s.value)
+        if audio_sources:
+            self._start_audio_restart(audio_sources)      # 2026-10-29: a device / keep-alive / on-off change applies live
         if any(k.startswith("completion.") for k in changed) and self.completer is not None:
             self.completer.reset()          # lines / hint / timing changed: forget the current suggestion
         if "screen.interval_s" in changed and self.screen is not None:

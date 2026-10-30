@@ -232,6 +232,11 @@ class DeviceInfo:
 
 def list_devices() -> list[DeviceInfo]        # WASAPI host API only
 def resolve_device(kind: Literal["mic","system"], spec: str) -> DeviceInfo   # "default" | name substring | int
+def candidates_for(kind, devices) -> list[DeviceInfo]   # 2026-10-29: the devices a spec of this kind can resolve to
+def probe_device(kind, spec, *, seconds=1.5, keepalive=True, on_level=None) -> ProbeResult   # Settings > Audio "Test"
+    # a real AudioCapture for `seconds`, then stop; never raises. ProbeResult(kind, spec, ok, device, seconds, frames,
+    # rms, peak, error) with .peak_dbfs, .signal ("error" | "none" (opened, no callbacks) | "silent" (< -60 dBFS) | "ok")
+    # and .describe() (one sentence for a person, kind-specific hints)
 
 class AudioCapture:
     """Opens one pyaudiowpatch input stream (loopback or mic) with the device's native rate/channels,
@@ -984,6 +989,25 @@ Toggle `[explain].enabled` (💡 title-bar button left of ⌨, `Ctrl+Alt+E` = `h
   `set_explanations`, `audio.mic_start_muted` → `set_mic_muted`, any `completion.*` → `completer.reset()`,
   `screen.interval_s` → `capture_now()`) and `save_config()` (extracted from `stop()`). Everything else is read
   live from the shared `Config`; restart-only fields are just persisted.
+- **Audio tab (2026-10-29)**: a seventh field kind, `device` (`_DeviceCombo`: an editable picker whose value is a
+  device spec as `capture.resolve_device` reads it — "default", a name substring, an index; rows = "Default (resolved
+  name)" + every candidate device by full name with the spec in item data; typed text is stored as typed, no
+  completer). `FIELDS["Audio"]`: capture_system / system_device / loopback_keepalive / capture_mic / mic_device /
+  mic_start_muted / echo_suppression (all live) + vad_threshold / min_silence_s / min_speech_s / max_utterance_s /
+  pre_roll_s (restart: a segmenter is built once per source). The page is `ui/audio_panel.py::AudioPanel(cfg,
+  actions, form, host)` — registered in `SettingsDialog._PAGE_BUILDERS` next to Optimize, falls back to the plain
+  form — per source the on/off switch, the picker + **Test**, a level meter and a verdict. A device scan
+  (`capture.list_devices`) and each Test (`capture.probe_device`, 1.5 s, the production AudioCapture path, the
+  WIDGETS' spec + keep-alive so a device is checked before it is applied) run on daemon threads writing a `_Job`
+  holder that a 100 ms QTimer polls; no worker touches a widget. The status line: devices found + via
+  `actions.audio_status()` (`Engine`; `{"running", "system": {"enabled","spec","device"}, "mic": {...}}`) what is
+  open. **Live apply**: `Engine.apply_settings` maps `_AUDIO_RESTART_KEYS` (capture_system / system_device /
+  loopback_keepalive → SYSTEM; capture_mic / mic_device → MIC) to `SpeechPipeline.restart_source(source)` on an
+  `audio-restart` thread: the old capture stops (its "stopped" status swallowed while a replacement is on its way),
+  the new one opens from the current config, `AudioStatusEvent("device_changed", detail="settings")` +
+  `ComponentStatusEvent("audio", "ready", names)`; on failure the previous capture is started again and
+  `ComponentStatusEvent("audio", "error")` goes out; a source off at `start()` gets its VAD worker on the first
+  restart; serialised against itself and `stop()`. `SpeechPipeline.devices()` / `.running` back `audio_status`.
 - **Defaults**: `completion.max_lines` 3 → 8, `completion.max_tokens` 48 → 120 (several lines predicted at once).
 - **Popups above the overlay**: `_CaptureExclusionFilter` now also calls `win32.set_topmost(hwnd)` on every newly
   shown top-level window (menus, dialogs, tooltips) — a plain popup is not topmost and opened *behind* the

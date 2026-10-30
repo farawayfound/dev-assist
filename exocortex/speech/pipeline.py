@@ -241,6 +241,11 @@ class SpeechPipeline:
 
         self._captures: dict[Source, _CaptureLike] = {}
         self._captures_lock = threading.Lock()
+        # 2026-10-29 (Settings > Audio): `restart_source` is serialised against itself and against
+        # `stop()`; `_swapping` names the sources whose capture is being replaced right now, so the
+        # old capture's "stopped" status is swallowed (downstream it would read as "audio stopped").
+        self._restart_lock = threading.Lock()
+        self._swapping: set[Source] = set()
         self._segmenters: dict[Source, VadSegmenter] = {}
         self._frame_queues: dict[Source, "queue.Queue[np.ndarray]"] = {}
         self._vad_threads: dict[Source, threading.Thread] = {}
@@ -332,32 +337,9 @@ class SpeechPipeline:
         return sources
 
     def _start_source(self, source: Source, started_names: dict[Source, str]) -> None:
-        segmenter = self._build_segmenter()
-        self._segmenters[source] = segmenter
-        self._frame_queues[source] = queue.Queue(maxsize=_FRAME_QUEUE_MAXSIZE)
-        thread = threading.Thread(target=self._vad_worker, args=(source,), name=f"vad-{source.value}", daemon=True)
-        self._vad_threads[source] = thread
-        thread.start()
-        self._open_capture(source, started_names)
-
-    def _open_capture(self, source: Source, started_names: dict[Source, str]) -> None:
-        if source is Source.MIC:
-            self._mic_silent_since = None
-            self._mic_silence_warned = False
+        self._ensure_vad_worker(source)
         try:
-            capture = self._capture_factory(
-                source,
-                self._spec_for(source),
-                target_rate=_SAMPLE_RATE,
-                frame_samples=512,
-                on_frames=self._make_on_frames(source),
-                on_level=self._make_on_level(source),
-                on_status=self._make_on_status(source),
-                keepalive=self._cfg.audio.loopback_keepalive,
-            )
-            if source is Source.MIC and self._mic_muted:
-                capture.set_muted(True)
-            device = capture.start()
+            capture, device = self._open_capture(source)
         except Exception as exc:  # noqa: BLE001 - one failed capture must not stop the other
             log.exception("pipeline: failed to start %s capture", source.value)
             self._bus.publish(ComponentStatusEvent(component="audio", state="error", detail=f"{source.value}: {exc}"))
@@ -375,26 +357,122 @@ class SpeechPipeline:
             return
         started_names[source] = getattr(device, "name", "")
 
-    def restart_capture(self, source: Source) -> None:
-        """Reopen `source`'s capture on the device `cfg.audio.mic_device` / `system_device` names
-        now -- how Settings > Audio applies a device choice without a restart. The VAD worker,
-        its queue and the transcript carry on; only the stream changes. Blocks while the old
-        stream closes and the new one opens (WASAPI init): call it off the UI thread. A no-op
-        when the pipeline is stopped or `source` was not started at all."""
-        if not self._running or source not in self._frame_queues:
+    def _ensure_vad_worker(self, source: Source) -> None:
+        """The segmenter, frame queue and `vad-<source>` thread for `source`, created once. A source
+        that was disabled at `start()` and enabled later from Settings gets them on its first
+        `restart_source`; a source whose capture is merely reopened keeps the ones it has."""
+        if source in self._vad_threads:
+            return
+        segmenter = self._build_segmenter()
+        self._segmenters[source] = segmenter
+        self._frame_queues[source] = queue.Queue(maxsize=_FRAME_QUEUE_MAXSIZE)
+        thread = threading.Thread(target=self._vad_worker, args=(source,), name=f"vad-{source.value}", daemon=True)
+        self._vad_threads[source] = thread
+        thread.start()
+
+    def _open_capture(self, source: Source) -> tuple[_CaptureLike, Any]:
+        """Build and start `source`'s capture from the config as it is now (device spec, keep-alive,
+        the remembered mic mute); returns `(capture, device)`. Raises whatever the factory or
+        `start()` raises -- the callers decide what a failure means. A new mic capture re-arms the
+        digital-silence warning (`_watch_mic_silence`): the device may be another one now."""
+        if source is Source.MIC:
+            self._mic_silent_since = None
+            self._mic_silence_warned = False
+        capture = self._capture_factory(
+            source,
+            self._spec_for(source),
+            target_rate=_SAMPLE_RATE,
+            frame_samples=512,
+            on_frames=self._make_on_frames(source),
+            on_level=self._make_on_level(source),
+            on_status=self._make_on_status(source),
+            keepalive=self._cfg.audio.loopback_keepalive,
+        )
+        if source is Source.MIC and self._mic_muted:
+            capture.set_muted(True)
+        device = capture.start()
+        return capture, device
+
+    def restart_source(self, source: Source) -> str | None:
+        """Reopen `source`'s capture against the config as it is now -- Settings > Audio changed its
+        device, the keep-alive switch, or enabled / disabled it -- leaving the other source, the VAD
+        workers and the ASR thread alone (2026-10-29).
+
+        Returns the new device's name, or `None` when the source is now disabled (its capture, if
+        any, is stopped) or the pipeline is not running. The old capture is stopped before the new
+        one opens, so two captures never feed one frame queue, and its "stopped" status is swallowed
+        while a replacement is on its way. When the new capture cannot start, the previous one is
+        started again so the source keeps working as before, `ComponentStatusEvent("audio",
+        "error", ...)` goes out, and the error is re-raised for the caller's log. Serialised against
+        itself and against `stop()`; safe to call from any thread.
+        """
+        with self._restart_lock:
+            if not self._running:
+                return None
+            enabled = source in self._enabled_sources()
+            with self._captures_lock:
+                old = self._captures.pop(source, None)
+            if old is not None:
+                if enabled:
+                    self._swapping.add(source)
+                try:
+                    old.stop()
+                except Exception:  # noqa: BLE001 - a capture that will not stop must not block the new one
+                    log.exception("pipeline: error stopping the previous %s capture", source.value)
+                finally:
+                    self._swapping.discard(source)
+            if not enabled:
+                log.info("pipeline: %s capture disabled from settings", source.value)
+                names = self.devices()
+                if names:
+                    self._publish_audio_ready(names)
+                else:
+                    self._bus.publish(ComponentStatusEvent(component="audio", state="info", detail="no source enabled"))
+                return None
+
+            self._ensure_vad_worker(source)
+            try:
+                capture, device = self._open_capture(source)
+            except Exception as exc:  # noqa: BLE001 - reported on the bus, then re-raised for the caller
+                log.exception("pipeline: reopening the %s capture failed", source.value)
+                self._bus.publish(ComponentStatusEvent(component="audio", state="error", detail=f"{source.value}: {exc}"))
+                if old is not None:
+                    self._restore_capture(source, old)
+                raise
+            with self._captures_lock:
+                self._captures[source] = capture
+            name = str(getattr(device, "name", "") or "")
+            log.info("pipeline: %s capture reopened from settings -> %r", source.value, name)
+            self._bus.publish(AudioStatusEvent(source=source, state="device_changed", device_name=name, detail="settings"))
+            self._publish_audio_ready(self.devices())
+            return name
+
+    def _restore_capture(self, source: Source, old: _CaptureLike) -> None:
+        """After a failed reopen: start the previous capture again so `source` is not left silent."""
+        try:
+            old.start()
+        except Exception:  # noqa: BLE001 - nothing more to try; the error event is already out
+            log.exception("pipeline: could not restore the previous %s capture either", source.value)
             return
         with self._captures_lock:
-            old = self._captures.pop(source, None)
-        if old is not None:
-            try:
-                old.stop()
-            except Exception:  # noqa: BLE001 - the new stream matters more than a clean old one
-                log.exception("pipeline: error stopping the old %s capture", source.value)
-        self._open_capture(source, {})
+            self._captures[source] = old
+        log.warning("pipeline: %s capture kept on its previous device", source.value)
+
+    def devices(self) -> dict[Source, str]:
+        """The device name of every capture open right now, by source (Settings > Audio's status
+        line; `Engine.audio_status`). Never raises."""
         with self._captures_lock:
-            names = {s: getattr(c.device, "name", "") for s, c in self._captures.items() if c.device is not None}
-        self._publish_audio_ready(names)
-        log.info("pipeline: %s capture reopened on %r", source.value, names.get(source, ""))
+            captures = dict(self._captures)
+        out: dict[Source, str] = {}
+        for source, capture in captures.items():
+            device = getattr(capture, "device", None)
+            out[source] = str(getattr(device, "name", "") or "")
+        return out
+
+    @property
+    def running(self) -> bool:
+        """Whether `start()` has run and `stop()` has not."""
+        return self._running
 
     def _spec_for(self, source: Source) -> str:
         return self._cfg.audio.system_device if source is Source.SYSTEM else self._cfg.audio.mic_device
@@ -420,6 +498,10 @@ class SpeechPipeline:
         the thread exits - and finally the `asr-worker` thread is joined, which drains whatever
         those flushes queued before it exits. Safe to call multiple times / before `start()`.
         """
+        with self._restart_lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
         if not self._running:
             return
         self._running = False
@@ -547,13 +629,15 @@ class SpeechPipeline:
         log.warning("pipeline: mic %r has delivered digital silence for %.0fs", name, now - self._mic_silent_since)
         self._bus.publish(ComponentStatusEvent(
             component="audio", state="error",
-            detail=f"mic {name!r} hears nothing (muted in Windows?) - Settings > Audio > Test devices",
+            detail=f"mic {name!r} hears nothing (muted in Windows?) - Settings > Audio: Test the microphone",
         ))
 
     def _make_on_status(self, source: Source) -> Callable[[str, str, str], None]:
         def _on_status(state: str, device_name: str, detail: str = "") -> None:
             if state in ("muted", "unmuted"):
                 return  # set_mic_muted() publishes these explicitly (avoids double events)
+            if state == "stopped" and source in self._swapping:
+                return  # restart_source() is replacing this capture: "device_changed" follows instead
             self._bus.publish(AudioStatusEvent(source=source, state=state, device_name=device_name, detail=detail))
             if state == "error":
                 self._bus.publish(

@@ -358,5 +358,11 @@ class EngineActions(Protocol):
         folder: the model gets no tools"]}. Synchronous; never touches the filesystem or the
         network (a folder's existence is reported by the index thread, not here); never raises."""
 
+    def audio_status(self) -> dict[str, object]:
+        """Settings > Audio's status line (2026-10-29): {"running": bool, "system": {"enabled": bool,
+        "spec": the configured device spec, "device": the open capture's device name or ""}, "mic":
+        {...}}. Synchronous; never raises; never touches a device (the dialog's "Test" button runs
+        its own short capture through exocortex.audio.capture.probe_device instead)."""
+
     def quit(self) -> None:
         """Save the session and shut everything down."""

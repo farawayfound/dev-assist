@@ -31,13 +31,21 @@ plan wrote, leaving unrelated pending edits on other tabs alone), :meth:`Setting
 :meth:`SettingsDialog.widget_values` (fill / read widgets by path across tabs) and ``FieldForm.apply(only)``.
 ``apply()`` keeps its no-argument signature on purpose: it is connected straight to ``clicked(bool)`` and
 PySide would otherwise feed the ``checked`` flag into an optional parameter.
+
+2026-10-29 (Audio tab): a seventh field kind, ``device`` (:class:`_DeviceCombo`: an editable picker whose value
+is a device *spec* as ``exocortex.audio.capture.resolve_device`` reads one -- "default", a name, an index), for
+``[audio].system_device`` / ``mic_device``; ``FIELDS["Audio"]`` grew the device pickers and the voice-detection
+knobs; and, like Optimize, the Audio tab's PAGE is built by :class:`exocortex.ui.audio_panel.AudioPanel`
+(device list from a background scan, a Test button and level meter per source, what the running app has open)
+around the ordinary ``FieldForm``. The page builders are listed in :data:`SettingsDialog._PAGE_BUILDERS`; a
+panel that fails to build falls back to the plain form, so the tab always exists.
 """
 from __future__ import annotations
 
 import logging
 from collections.abc import Callable, Collection
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFontMetrics
@@ -61,16 +69,17 @@ from PySide6.QtWidgets import (
 )
 
 from exocortex.config import Config
-from exocortex.ui.audio_check import AudioCheckPanel
 from exocortex.ui.theme import COLORS, build_qss
+
+if TYPE_CHECKING:  # the UI never imports the capture module at run time; the panel does
+    from exocortex.audio.capture import DeviceInfo
 
 log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
 class Field:
-    """One editable config value. ``kind``: bool | int | float | choice | text | model |
-    mic_device | system_device."""
+    """One editable config value. ``kind``: bool | int | float | choice | text | model | device."""
 
     section: str
     key: str
@@ -339,25 +348,44 @@ FIELDS: dict[str, tuple[Field, ...]] = {
         Field("ui", "start_hidden", "Start hidden", "bool"),
         Field("ui", "font_size", "Font size (pt)", "int", 8, 18, restart=True),
     ),
-    # ---- 2026-10-21: device pickers (applied at once) + the Check panel below them ----
+    # 2026-10-29: the page is built by exocortex.ui.audio_check.CheckedAudioPanel (exo-cortex's
+    # AudioPanel -- device list, a Test per source, level meters -- plus this fork's Windows-mute and
+    # speaker-routing checks) around this form. The on/off switches, the devices and the keep-alive tone
+    # apply live (Engine.apply_settings -> SpeechPipeline.restart_source); the voice-detection knobs feed
+    # a segmenter that is built once per source, so they stay restart-only.
     "Audio": (
-        Field("audio", "mic_device", "Microphone (you)", "mic_device",
-              help="Everything this device hears is transcribed as Me and never clustered. default = the "
-                   "Windows default input, followed when it changes; or pick a device (part of a name, or a "
-                   "device number, works too). Applied at once. Test devices below shows whether it hears you."),
-        Field("audio", "system_device", "Output feed (everyone else)", "system_device",
+        Field("audio", "capture_system", "Capture system audio", "bool",
+              help="The other side of the call: a WASAPI loopback of an output device. Applies at once."),
+        Field("audio", "system_device", "System audio device", "device",
               help="The [Loopback] of the device your speakers or headset play through: what it plays is "
-                   "transcribed and clustered into Speaker 1, 2, ... default = the Windows default output, "
-                   "followed when it changes. Applied at once."),
-        Field("audio", "capture_mic", "Capture the microphone", "bool", restart=True),
-        Field("audio", "capture_system", "Capture system audio", "bool", restart=True),
+                   "transcribed and clustered into Speaker 1, 2, ... Default = the loopback of the Windows "
+                   "default output device, followed when it changes. Pick a device from the list (stored by "
+                   "name), or type part of a name or a device index. Test opens it for a moment and reports "
+                   "what arrives. Applies at once."),
+        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool",
+              help="A -80 dBFS tone on the default output keeps WASAPI loopback delivering audio while nothing "
+                   "plays (Windows idles the endpoint otherwise). Applies at once."),
+        Field("audio", "capture_mic", "Capture the microphone", "bool", help="You. Applies at once."),
+        Field("audio", "mic_device", "Microphone", "device",
+              help="Everything this device hears is transcribed as Me and never clustered. Default = the Windows "
+                   "default input device, followed when it changes. Pick a device from the list (stored by "
+                   "name), or type part of a name or a device index. Applies at once."),
         Field("audio", "mic_start_muted", "Start with the mic muted", "bool"),
         Field("audio", "echo_suppression", "Echo suppression (drop mic text that echoes the other side)", "bool",
               help="For a mic that hears the speakers (laptop speakers, no headset): a line that repeats what "
                    "the other feed said in the last 8 s is dropped. With clean routing (Check speaker routing "
                    "below) there is no echo to catch, and it can only drop real lines -- both sides saying "
                    "\"okay\"."),
-        Field("audio", "loopback_keepalive", "Loopback keep-alive tone", "bool", restart=True),
+        Field("audio", "vad_threshold", "Speech probability that counts as speech", "float", 0.1, 0.95, 0.05,
+              restart=True, help="Silero VAD threshold. Lower catches quieter speech and more noise; higher misses "
+                                 "soft starts."),
+        Field("audio", "min_silence_s", "Silence that ends an utterance (s)", "float", 0.1, 2.0, 0.05, restart=True,
+              help="Shorter gives finals sooner; 0.45 merges closely spoken sentences."),
+        Field("audio", "min_speech_s", "Shortest speech kept (s)", "float", 0.05, 2.0, 0.05, restart=True),
+        Field("audio", "max_utterance_s", "Longest utterance before a forced split (s)", "float", 5.0, 60.0, 1.0,
+              restart=True),
+        Field("audio", "pre_roll_s", "Audio kept from before speech starts (s)", "float", 0.0, 1.0, 0.05,
+              restart=True),
     ),
     # 2026-10-07 (Optimize tab): appended LAST on purpose ("Completion" must stay first). This tab's page is built
     # by exocortex.ui.optimize_panel.OptimizePanel, which re-parents these widgets into its own layout; the
@@ -479,72 +507,69 @@ def _widen_popup(combo: QComboBox) -> None:
     view.setMinimumWidth(max(combo.width(), min(widest + _LIST_CHROME_PX, cap)))
 
 
-def _list_audio_devices() -> list[Any]:
-    """Every WASAPI device PortAudio knows (imported lazily: pyaudiowpatch is Windows-only)."""
-    from exocortex.audio.capture import list_devices
-
-    return list_devices()
-
-
 class _DeviceCombo(QComboBox):
-    """Editable audio device picker for a ``mic_device`` / ``system_device`` field.
+    """Editable device picker for a ``device``-kind field (``[audio].system_device`` / ``mic_device``).
 
-    The items are values the config takes: ``default`` (the Windows default, which capture follows
-    when it changes), then every WASAPI device of that kind by its full name; part of a name or a
-    PortAudio index can be typed too, exactly as in config.toml. Like :class:`_ModelCombo`, the list
-    is re-read every time it drops down -- a headset plugged in while the dialog is open shows up on
-    the next click -- and widened to the longest name; each row's tool tip has its rate, channels
-    and whether Windows uses it by default. Nothing is enumerated until the first drop-down."""
+    Its value is a *spec* exactly as :func:`exocortex.audio.capture.resolve_device` reads one:
+    ``"default"``, a device name (matched as a case-insensitive substring) or a PortAudio index.
+    The rows are "Default" (with the device it resolves to appended once a scan has said) plus
+    every candidate device by its full name; a row's spec is its item data, so what is painted may
+    say more than what is stored. Text typed that matches no row is stored as typed (a substring,
+    an index), and a config value that matches no row is shown as typed rather than altered, so
+    loading never produces a phantom change. :class:`exocortex.ui.audio_panel.AudioPanel` fills the
+    rows from a background scan; the plain-form fallback leaves "Default" and the ability to type.
+    No completer: what is typed is what is stored.
+    """
 
-    def __init__(self, kind: str, help_text: str = "", parent: QWidget | None = None) -> None:
+    DEFAULT = "default"
+
+    def __init__(self, help_text: str = "", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setEditable(True)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)   # device names are long
-        self.kind = kind             # "mic" | "system"
-        self._help = help_text
-        self.addItem("default")
-        self.currentTextChanged.connect(lambda _text: self.sync_tooltip())
-        # a picked name shows from its start (the field is narrower than most names)
-        self.currentIndexChanged.connect(lambda _i: self.lineEdit().setCursorPosition(0))
-        self.sync_tooltip()
+        self.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.setCompleter(None)  # type: ignore[arg-type]
+        self.setMinimumContentsLength(18)
+        if help_text:
+            self.setToolTip(help_text)
+        self.set_devices([], None)
 
-    def refresh(self) -> None:
-        """Re-read the devices, keeping whatever is selected or typed."""
-        current = self.currentText().strip()
-        try:
-            devices = _list_audio_devices()
-        except Exception:  # noqa: BLE001 - keep the items there are
-            log.warning("audio device list unavailable", exc_info=True)
-            return
-        if self.kind == "system":
-            picks = [d for d in devices if d.is_loopback]
-        else:
-            picks = [d for d in devices if d.is_input and not d.is_loopback]
-        default = next((d for d in picks if d.is_default), None)
+    def set_devices(self, devices: "list[DeviceInfo]", default_name: str | None) -> None:
+        """Replace the rows, keeping the current spec (chosen or typed). Emits no signals."""
+        spec = self.spec()
         self.blockSignals(True)
-        self.clear()
-        self.addItem("default")
-        self.setItemData(0, "The Windows default" + (f": {default.name}" if default else "")
-                         + " -- followed when it changes", Qt.ItemDataRole.ToolTipRole)
-        for d in picks:
-            self.addItem(d.name)
-            tip = f"{d.name}\n{d.sample_rate} Hz, {d.channels} ch" + ("\nthe Windows default" if d.is_default else "")
-            self.setItemData(self.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
-        idx = self.findText(current)
-        if idx >= 0:
-            self.setCurrentIndex(idx)
-        else:
-            self.setEditText(current)
-        self.blockSignals(False)
-        self.sync_tooltip()
+        try:
+            self.clear()
+            self.addItem("Default" + (f"  ({default_name})" if default_name else ""), self.DEFAULT)
+            self.setItemData(0, "Follows the Windows default device", Qt.ItemDataRole.ToolTipRole)
+            for d in devices:
+                self.addItem(d.name, d.name)
+                tip = f"index {d.index} · {d.sample_rate} Hz · {d.channels} ch" + (" · Windows default" if d.is_default else "")
+                self.setItemData(self.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+            self.set_spec(spec)
+        finally:
+            self.blockSignals(False)
 
-    def sync_tooltip(self) -> None:
-        self.setToolTip("\n".join(t for t in (self.currentText().strip(), self._help) if t))
+    def spec(self) -> str:
+        """The stored value: the chosen row's spec, else the typed text ("" and "Default" -> "default")."""
+        text = self.currentText().strip()
+        idx = self.currentIndex()
+        if idx >= 0 and text == self.itemText(idx).strip():
+            return str(self.itemData(idx) or self.DEFAULT)
+        if not text or text.lower() == self.DEFAULT:
+            return self.DEFAULT
+        return text
 
-    def showPopup(self) -> None:  # noqa: N802 - Qt override
-        self.refresh()
-        _widen_popup(self)
-        super().showPopup()
+    def set_spec(self, spec: object) -> None:
+        """Select the row whose spec this is, or show it as typed text."""
+        text = str(spec if spec is not None else "").strip() or self.DEFAULT
+        if text.lower() == self.DEFAULT:
+            text = self.DEFAULT
+        for i in range(self.count()):
+            if str(self.itemData(i)) == text:
+                self.setCurrentIndex(i)
+                return
+        self.setCurrentIndex(-1)
+        self.setEditText(text)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -575,6 +600,8 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
         w = QComboBox(parent)
         w.addItems(list(f.choices))
         return w
+    if f.kind == "device":
+        return _DeviceCombo(f.help, parent)
     if f.kind == "model":
         w = _ModelCombo(refresh_models or (lambda: None), f.help, parent)
         if list_models is not None:
@@ -583,14 +610,14 @@ def make_field_widget(f: Field, parent: QWidget | None = None, *,
             except Exception:  # noqa: BLE001
                 log.exception("list_models() failed")
         return w
-    if f.kind in ("mic_device", "system_device"):
-        return _DeviceCombo("mic" if f.kind == "mic_device" else "system", f.help, parent)
     return QLineEdit(parent)
 
 
 def set_field_value(widget: QWidget, f: Field, value: Any) -> None:
     """Write ``value`` into ``widget`` (the inverse of :func:`get_field_value`)."""
-    if isinstance(widget, QCheckBox):
+    if isinstance(widget, _DeviceCombo):
+        widget.set_spec(value)
+    elif isinstance(widget, QCheckBox):
         widget.setChecked(bool(value))
     elif isinstance(widget, QDoubleSpinBox):
         widget.setValue(float(value))
@@ -611,6 +638,8 @@ def set_field_value(widget: QWidget, f: Field, value: Any) -> None:
 
 def get_field_value(widget: QWidget, f: Field) -> Any:
     """Read ``widget``'s current value back out, as the type ``f.kind`` implies."""
+    if isinstance(widget, _DeviceCombo):
+        return widget.spec()
     if isinstance(widget, QCheckBox):
         return widget.isChecked()
     if isinstance(widget, QDoubleSpinBox):
@@ -653,11 +682,6 @@ class FieldForm:
             form.addRow(label, widget)
         scroll.setWidget(inner)
         self.widget = scroll
-        self._layout = form
-
-    def add_row(self, widget: QWidget) -> None:
-        """Append a full-width widget below the fields (the Audio tab's Check panel)."""
-        self._layout.addRow(widget)
 
     def load(self) -> None:
         """Fill every widget from the current config."""
@@ -721,6 +745,10 @@ class SettingsDialog(QDialog):
 
     applied = Signal(dict)
 
+    #: Tab name -> the method that builds its page around the tab's FieldForm (2026-10-29). Every other
+    #: tab is the form's own scroll area. Each builder falls back to the plain form on any failure.
+    _PAGE_BUILDERS: dict[str, str] = {"Optimize": "_build_optimize_page", "Audio": "_build_audio_page"}
+
     def __init__(self, cfg: Config, list_models: Callable[[], list[str]] | None = None,
                  parent: QWidget | None = None, *, actions: Any = None) -> None:
         super().__init__(parent)
@@ -729,6 +757,7 @@ class SettingsDialog(QDialog):
         self._forms: dict[str, FieldForm] = {}    # no FIELDS entry is kind "model" any more.
         self._actions = _resolve_actions(actions, list_models, parent)   # None = Optimize tab degraded
         self._optimize_panel: Any = None
+        self._audio_panel: Any = None
         self.setWindowTitle("Settings")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
         self.setStyleSheet(build_qss(cfg.ui.font_size) + _DIALOG_QSS)
@@ -740,24 +769,18 @@ class SettingsDialog(QDialog):
         outer.setSpacing(8)
         self.tabs = QTabWidget(self)
         outer.addWidget(self.tabs, 1)
-        self.audio_check: AudioCheckPanel | None = None
         for name, group in FIELDS.items():
-            if name == "Optimize":
+            builder = self._PAGE_BUILDERS.get(name)
+            if builder is not None:
                 # parent None: the panel re-parents the widgets into its own layout, and the (then
                 # empty) scroll shell is never shown
                 form = FieldForm(group, cfg, None)
-                page = self._build_optimize_page(form)
+                page = getattr(self, builder)(form)
             else:
                 form = FieldForm(group, cfg, self.tabs)
                 page = form.widget
             self._forms[name] = form
             self.tabs.addTab(page, name)
-            if name == "Audio":
-                self.audio_check = AudioCheckPanel(
-                    form.widgets["audio.mic_device"], form.widgets["audio.system_device"],
-                    form.widgets["audio.echo_suppression"], form.widget,
-                )
-                form.add_row(self.audio_check)
 
         self.note = QLabel("", self)
         self.note.setObjectName("restart")
@@ -780,6 +803,12 @@ class SettingsDialog(QDialog):
             row.addWidget(b)
         outer.addLayout(row)
         self.load()
+
+    @property
+    def audio_check(self) -> Any:
+        """The Audio page's Check panel (:class:`~exocortex.ui.audio_check.AudioCheckPanel`), or None
+        when the page fell back to the plain form."""
+        return getattr(self._audio_panel, "check", None)
 
     # ---- merged view over every tab's FieldForm ------------------------------------------------
     @property
@@ -807,6 +836,23 @@ class SettingsDialog(QDialog):
         self._optimize_panel = panel
         return panel
 
+    def _build_audio_page(self, form: FieldForm) -> QWidget:
+        """The Audio tab's page (2026-10-29): an :class:`~exocortex.ui.audio_panel.AudioPanel` around
+        ``form``'s widgets -- device pickers filled from a background scan, a Test button and level
+        meter per source, what the running app has open -- with this fork's checks below it
+        (:class:`~exocortex.ui.audio_check.CheckedAudioPanel`: the Windows mute of a silent mic, the
+        speaker routing). Same guard as the Optimize page: on any failure the tab falls back to
+        ``form``'s plain scrollable form."""
+        try:
+            from exocortex.ui.audio_check import CheckedAudioPanel
+
+            panel = CheckedAudioPanel(self._cfg, self._actions, form, self, self.tabs)
+        except Exception:  # noqa: BLE001 - the tab must exist even if its panel cannot be built
+            log.exception("Audio panel unavailable; showing the plain form")
+            return form.widget
+        self._audio_panel = panel
+        return panel
+
     # ---- values --------------------------------------------------------------------------------
     def load(self) -> None:
         """Fill every widget from the current config."""
@@ -815,6 +861,8 @@ class SettingsDialog(QDialog):
         self.note.setText("")
         if self._optimize_panel is not None:
             self._optimize_panel.refresh()
+        if self._audio_panel is not None:
+            self._audio_panel.refresh()
 
     def show_tab(self, name: str) -> bool:
         """Bring the tab called `name` to the front (the Assist menu's "Assist settings…"); False

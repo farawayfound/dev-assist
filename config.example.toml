@@ -131,8 +131,13 @@ engine = "auto"
 sherpa_model = "parakeet-tdt-0.6b-v2-int8"
 
 [audio]
-capture_system = true
-capture_mic = true
+capture_system = true        # the other side of the call: a WASAPI loopback of an output device
+capture_mic = true           # you
+# Which device each source opens. "default" follows the Windows default output (system) / input (mic)
+# device, also when it changes while running. Otherwise part of a device name (case-insensitive) or a
+# PortAudio device index. Settings > Audio lists the devices that resolve, stores a pick by its full name
+# and has a Test button per source (opens the device for 1.5 s and reports what arrives); --doctor prints
+# the same list. These, the capture switches and loopback_keepalive apply live; the knobs below need a restart.
 system_device = "default"
 mic_device = "default"
 frame_ms = 32

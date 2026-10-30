@@ -554,12 +554,12 @@ def test_capture_watchdog_no_reenumeration_without_change(monkeypatch: pytest.Mo
     )
     cap.start()
     try:
-        # `_open()` itself always resolves fresh (spec: `_open`/`_reopen` are unchanged),
-        # so it alone builds two PyAudio hosts (one inside `resolve_device`, terminated
-        # immediately, plus the one kept open as `self._pa`); baseline against that rather
-        # than assuming a single call, and check that ticks add nothing further.
+        # `_open()` resolves fresh on the one PyAudio host it then opens the stream on and
+        # keeps as `self._pa` (2026-10-29: one host init per open, under _PA_LOCK; before, a
+        # second, immediately terminated host was built inside `resolve_device`); baseline
+        # against that and check that ticks add nothing further.
         baseline = len(mod.instances)
-        assert baseline == 2
+        assert baseline == 1
         time.sleep(0.02 * 15)  # several watchdog ticks
     finally:
         cap.stop()

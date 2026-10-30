@@ -110,6 +110,9 @@ and the collapsed done items; the Screen tab's OCR readout; the Assist tab's his
 the explanations switch; the Live tab's in-progress speech. Below them, the switches every view
 shares:
 
+- **Overlay strips** -- Tabs, Controls, Status, Monitor: which strips of the full overlay show
+  (`[ui].show_*`, from exo-cortex; see [SHORTCUTS.md](SHORTCUTS.md#view-menu--show-or-hide-parts-of-the-panel)).
+  On the board the tab strip stays hidden either way; Controls, Status and Monitor apply.
 - **Screen source** -- Off, the active window, one of the **monitors** (listed by number, size
   and position; `[screen].monitor`) or a region. The same thing as the Screen tab's mode row.
 - **Screen: pause/resume**.

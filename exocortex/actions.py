@@ -317,6 +317,46 @@ class EngineActions(Protocol):
     def optimize_undo(self) -> bool:
         """Restore the previous profile recorded by the last verified apply (the same transaction with
         a canary-only check). False = nothing to undo, or refused."""
+    # ---- capabilities (2026-10-07: the Models window's "Capabilities" tab) ----
+    # The engine owns an `exocortex.capabilities.ToolRunner`; the Assistant runs the tool loop
+    # with it. These six are the tab's surface. Every one returns at once; the maps report back
+    # through CapabilityMapEvent, an MCP tool listing through McpToolsEvent.
+    def capability_maps(self) -> list[dict[str, object]]:
+        """Every saved project map, as plain dicts: name, path, roots (list[str]), files, dirs,
+        indexed_at (ISO), truncated (bool), active (bool: the map loaded last), settings (the
+        map's narrowing settings snapshot, for the Load confirmation). Cached by the engine
+        (refreshed by the index thread and on first call); never blocks on a path."""
+
+    def index_capability_map(self, name: str) -> None:
+        """Build (or rebuild) the map `name` of the current readable folders in the background:
+        walk them (excludes honoured, junctions never followed), summarise every file on a basic
+        understanding (no model call), save <maps_dir>/<slug>.json together with the
+        [capabilities] settings as they stand, copy it into the session folder, hand its text to
+        the tool runner (the <map> block of every tool-enabled prompt) and make it the active
+        map. Publishes CapabilityMapEvent("indexing") at once, then "indexed" or "error: ..."."""
+
+    def load_capability_map(self, name: str) -> None:
+        """Make `name` the active map: apply the NARROWING subset of the settings it was saved
+        with (the five switches, the folders, the excludes, the allowed commands as a subset,
+        the domain lists, the limits -- never allow_all_commands, web_allow_local, the MCP server
+        specs or any folder of the app's own), save the config, refresh the runner, copy the map
+        into the session folder. Publishes CapabilityMapEvent("loaded"). The tab confirms with
+        the user BEFORE calling this."""
+
+    def delete_capability_map(self, name: str) -> None:
+        """Delete the map file; clears the active map when it was the one. Publishes
+        CapabilityMapEvent("deleted")."""
+
+    def mcp_server_tools(self, name: str, request_id: int) -> None:
+        """List the tools of the configured MCP server `name` (connecting in the background when
+        needed); answers with McpToolsEvent(request_id)."""
+
+    def capability_status(self) -> dict[str, object]:
+        """For the tab's status line: {"tools": [the tool names the ask box would get right now],
+        "read_roots": [the configured folders], "mcp": {server name: "idle" | "connecting" |
+        "connected" | "error: ..."}, "active_map": name, "notes": [human lines, e.g. "no readable
+        folder: the model gets no tools"]}. Synchronous; never touches the filesystem or the
+        network (a folder's existence is reported by the index thread, not here); never raises."""
 
     def quit(self) -> None:
         """Save the session and shut everything down."""

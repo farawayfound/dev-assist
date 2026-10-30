@@ -37,7 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from exocortex.bus import Source, TranscriptSegment
+from exocortex.bus import Source, ToolCallEvent, TranscriptSegment
 from exocortex.config import Config
 from exocortex.llm.prompts import (
     INSIGHT_SECTIONS,
@@ -415,6 +415,7 @@ class AssistView(QWidget):
         self.question_label = QLabel("Q: –", top)
         self.question_label.setObjectName("subtitle")
         self.question_label.setWordWrap(True)
+        self.question_label.setTextFormat(Qt.TextFormat.PlainText)   # the question is the user's / the transcript's text
         top_layout.addWidget(self.question_label)
 
         self.answer_browser = QTextBrowser(top)
@@ -433,6 +434,13 @@ class AssistView(QWidget):
 
         self.footer_label = QLabel("", top)
         self.footer_label.setObjectName("subtitle")
+        # Plain text: on_tool puts text the MODEL chose (a search query, a command, a url, an error
+        # reason) in here, and an AutoText label renders "<b>", "<div>" or "&lt;" as HTML -- the
+        # footer would stop showing what was actually asked.
+        self.footer_label.setTextFormat(Qt.TextFormat.PlainText)
+        # A tool call's line (on_tool) can run to ~150 characters; clipped, it must never push the
+        # panel's minimum width up (an explicit minimum overrides the label-wide minimumSizeHint).
+        self.footer_label.setMinimumWidth(1)
         top_layout.addWidget(self.footer_label)
 
         btn_row = QHBoxLayout()
@@ -679,6 +687,20 @@ class AssistView(QWidget):
             return
         self._buffer += delta
         self._dirty = True
+
+    def on_tool(self, ev: ToolCallEvent) -> None:
+        """A tool call of the current answer (2026-10-07, capabilities): the footer reads
+        ``<kind> - <tool> <what it was asked>...`` while the call runs, then
+        ``<kind> - <tool> <what> (<size hint or the reason>)`` once it is done / failed / refused,
+        until ``on_done`` (or ``on_error``) replaces it. A call of any other job -- or one that
+        arrives after this answer has finished -- is ignored."""
+        if ev.job_id != self._job_id or not self._streaming:
+            return
+        head = f"{self._kind} - {ev.name}" + (f" {ev.summary}" if ev.summary else "")
+        if ev.state == "running":
+            self.footer_label.setText(f"{head}…")
+        else:
+            self.footer_label.setText(f"{head} ({ev.detail})" if ev.detail else head)
 
     def on_done(
         self,

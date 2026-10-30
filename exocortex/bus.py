@@ -444,6 +444,52 @@ class OptimizeEvent(Event):
     detail: str = ""
 
 
+@dataclass(frozen=True)
+class ToolCallEvent(Event):
+    """One tool call made by an assist job (2026-10-07, capabilities): published "running" right
+    before the tool executes and once more with "done" / "error" / "denied" after. `index` is
+    1-based within the job; `name` is the tool ("read_file", "run_command", "fetch_url",
+    "mcp:<server>:<tool>", ...); `summary` the one line the call named (the path, the command,
+    the url, the query; at most 120 chars); `detail` a size hint when done ("3.2 KB") or the
+    reason when refused / failed. The Assist tab's footer shows the running one."""
+    job_id: int
+    index: int
+    name: str
+    summary: str
+    state: str                 # "running" | "done" | "error" | "denied"
+    detail: str = ""
+    elapsed_s: float = 0.0
+
+
+@dataclass(frozen=True)
+class CapabilityMapEvent(Event):
+    """A project map changed (2026-10-07, capabilities): re-read `capability_maps()`. `reason` is
+    "indexing" (the walk started), "indexed" (saved: `files` / `dirs` counted, `truncated` in
+    `detail` when the tree was cut), "loaded" (its settings were applied and it is the active
+    map), "deleted", or "error: ..." (nothing changed). `automatic` marks the launch-time refresh
+    of the active map (nobody asked for it); `changed`, with "indexed", says whether the set of
+    files and folders differs from the map stored before the pass (sizes and summaries aside; a
+    first index always counts as changed). 2026-10-29: the overlay keeps quiet about an automatic
+    pass over an unchanged tree -- "Map 'X': 28 files" at every launch read as 28 documents loaded."""
+    reason: str
+    name: str = ""
+    files: int = 0
+    dirs: int = 0
+    detail: str = ""
+    automatic: bool = False
+    changed: bool = True
+
+
+@dataclass(frozen=True)
+class McpToolsEvent(Event):
+    """The answer to `mcp_server_tools(name, request_id)` (2026-10-07, capabilities): the tools
+    the MCP server `server` offers, as plain dicts (name, description), or an `error`."""
+    request_id: int
+    server: str
+    tools: tuple[dict[str, Any], ...] = ()
+    error: str = ""
+
+
 class EventBus:
     """Fan-out bus: each subscriber owns a queue; publish copies the reference to all."""
 

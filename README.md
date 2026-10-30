@@ -9,7 +9,8 @@ worth asking** and **blind spots & follow-ups**, recaps the session on demand, n
 aimed at you and streams a concise answer into an always-on-top overlay. Tuned for coding
 sessions where you drive: see [Pair programming and team coding](docs/PAIR_PROGRAMMING.md).
 
-Nothing leaves the machine. No accounts, no cloud, no telemetry.
+Nothing leaves the machine unless you switch on Fetch web content or an MCP server over HTTP
+(both off by default; see "Capabilities" below). No accounts, no cloud, no telemetry.
 
 | Piece | What runs it |
 |---|---|
@@ -687,7 +688,7 @@ rather than a `Ctrl+Alt+…` combination, so it keeps working while your hands a
 ### Models: the library and the Models window
 
 **`⋯ › Models…`** (or `Context ▾ › Models…` in the slim bar) opens a tabbed model manager —
-**Library**, **Discover**, **Tuning**, **Server**, **Context**, **Hardware** — that replaces LM Studio's own UI
+**Library**, **Discover**, **Tuning**, **Server**, **Context**, **Capabilities**, **Hardware** — that replaces LM Studio's own UI
 for everything this app needs: what model is loaded, what else is on disk, and how each one is
 tuned. Opened automatically, on **Discover**, the first time the library holds nothing at all
 (the app publishes an "empty-library" event and the overlay reacts to it).
@@ -914,6 +915,201 @@ Whisper on CUDA in 0.11 s for 874 MiB; the 5090 is **power-capped** (115 W enfor
 fills the card to its last 57 MiB and thrashes, 131,072 loads at 20.7 GB; Windows OCR on the CPU
 and RapidOCR on the iGPU were already the right split, and nothing runs faster on the NPU than on
 the iGPU.
+### Capabilities: letting the model gather its own context
+
+**`⋯ › Models… › Capabilities`** (also `⋯ › Capabilities…`, or `Context ▾ › Capabilities…` in the
+slim bar) is where you let the model look things up for itself instead of you pasting them in.
+Added 2026-10-07 for questions about a project that is open on the machine ("where do we validate
+the token?"): the model lists a folder, reads the file and answers from what it read. The tab has
+five switches, each with its own scope, a **Pre-index scoped directories** button for the project
+maps (below) and a status line that says which tools the ask box is offered right now and why not,
+when none is ("no read folder: the model gets no tools"). The line names at most eight tools, then
+"+N more", and re-reads the MCP servers' states every two seconds while the tab is open, so a
+server that finishes connecting (or dies) shows up without pressing anything.
+
+- **The five switches** (`[capabilities]` in `config.toml`): **Read files** (on), **Edit files**
+  (off), **Execute commands** (on), **Fetch web content** (off), **MCP servers** (off). A switch
+  only matters once its scope exists: **with no readable folder configured nothing at all
+  happens**, no tool is offered (the web and MCP tools included) and no prompt changes by a byte,
+  so a fresh install behaves exactly as before whatever the defaults say. Edit also needs an
+  editable folder, Execute runs in a readable one and MCP needs a connected server.
+- **Trust tiers.** Only the ask box carries text *you* typed. Everything else answers somebody
+  else's words: auto and manual answers reply to what the **other speaker** said, screen answers
+  to what OCR read (and suggestions, solves, code and text to the screen as well), and a sentence
+  spoken on the call or a line in a shared document must never become the model's authority to
+  change a file, run a command or reach the web. So the **ask box gets everything** the switches
+  allow,
+  while answers to the other speaker or the screen get the **read tools only** (`read_file`,
+  `list_dir`, `find_files`, `search_text`). **Tools reach** picks which answers may use tools at
+  all: `questions` (default: the other speaker, screen questions and the ask box), `ask` (the ask
+  box only) or `all` (also suggestions, solves, code and text, read tools). Inline completions,
+  explanations, notes and the background summary / digest jobs never get tools. The rule is
+  enforced where the call is run, not only in the prompt: a forged edit or command in an auto
+  answer is refused as "tool not available for this kind of answer". The ask box may spend 4 calls,
+  6000 characters per result and 30 s for the whole loop; live answers 2 calls, 2500 characters and
+  10 s (somebody is waiting for them). Every limit is a setting. The time limit holds for every
+  tool, not just the model's turns: a fetch, a search, an MCP call or a command still running when
+  the answer's time is up is stopped.
+- **Read scope.** The folders the model may read, list and search, recursively (**Add folder…**).
+  With one folder the model sees paths relative to it, with several, full paths. A listed folder
+  that lies inside another listed folder is covered by the outer one and its exclusions. A name that
+  matches an **exclusion** (any component of the path; the default list covers `.git`,
+  `node_modules`, virtual environments, build output, `.env*`, keys and certificates, password
+  stores, `.ssh` / `.aws` / `.kube` / `.docker` / `.gnupg`, `credentials*`, `secrets*`, `*.sqlite`,
+  `*.db`) is never read, listed, searched or indexed, and the app's own `config.toml`, model,
+  context, map and session folders are off limits whatever the list says. Links and junctions are
+  never followed, an online-only cloud file is not opened, a UNC path, a `~` or a `..` is refused,
+  a binary file is not shown. A result is cut at the per-answer limit (6000 characters, whatever
+  `read_max_file_chars` allows), so the model reads a long file in line ranges. `search_text` is a
+  literal, case-insensitive search (60 hits, files over 1 MiB skipped), not a regex.
+- **Edit scope.** With **Edit files** on and an editable folder, the ask box gets `write_file` and
+  `edit_file` (one exact piece of text, which must occur exactly once). Only UTF-8 text is edited;
+  a BOM and the file's line ending are kept; the write is atomic; the original is copied to
+  `<session>/edits/` first (**Back up a file before editing it**; with no session folder yet a
+  change to an existing file is refused rather than made unbacked). Scripts and executables
+  (`*.bat`, `*.cmd`, `*.ps1`, `*.vbs`, `*.exe`, `*.dll`, `*.lnk`, `*.sys`) are excluded on top of
+  the read exclusions. **There is no delete tool.**
+- **Commands.** One allowed command per line, pre-filled with a safe list (**Restore safe list**
+  puts it back): the file listers (`dir`, `ls`, `tree`, `where`, `which`, `pwd`), a few info
+  commands (`hostname`, `whoami`, `ver`, `date`, `tasklist`, `systeminfo`), the read-only `git`
+  commands (`git status`, `log`, `diff`, `show`, `blame`, `branch`, `ls-files`, ...) and the
+  `--version` / `list` forms of `python`, `pip`, `node`, `npm`, `dotnet`, `cargo`, `go`, `java`,
+  `rustc`. **No content reader is on it** (`type`, `cat`, `head`, `tail`, `more`, `findstr`,
+  `grep`, `rg`, `wc`): each of them leaked around the read scope, through a wildcard, a switch or
+  a recursion flag, and `read_file` and `search_text` already do what they did, inside the scope
+  and with the exclusions. No interpreter and no test or build runner is on it either: `python -c`
+  is arbitrary code and `pytest` imports the repo's `conftest.py`. An entry allows that command
+  with arguments, but the arguments pass a gate: no chaining or redirection (`& | ; < > ^`,
+  backtick, `$(`, `%`) and no look-alike characters (a fullwidth `*` or an en dash that a Windows
+  program reads as `*` or `-`), every path-looking argument must resolve inside a readable folder
+  and not be excluded (so `dir .env` and `dir ..\other` are refused), a flag deny-list (output
+  files, recursion, external diff and textconv helpers, `-exec` / `-delete`), no wildcard except
+  for the listers and `git`, and nothing that can open a connection: the `/s` `/u` `/p` switches
+  of `tasklist` and `systeminfo` and any `pip` / `npm` option outside a short list (so
+  `--outdated`, `--index-url`, `--proxy` are refused). `git` runs with its hooks, pager, external
+  tools and optional lock files off, and `git diff`, `log`, `show`, `status` and `ls-files` stay
+  inside the folder the command runs in (`-- .`, unless the call names its own paths) and leave
+  out every name the exclusions match, history included. The listers (`dir`, `ls`, `tree`) still
+  list the NAMES of excluded files; their contents stay unreadable. If you add a content reader
+  back by hand it goes through the same gate, which was hardened for that: a wildcard is refused
+  (the search pattern of `grep`, `rg` and `findstr` is not one), `findstr`'s switches are read
+  letter by letter and `/s` is never allowed, the GNU recursion flags and their abbreviations
+  (`--recurs`) are refused, and `rg` gets the exclusions as globs. A command runs in the first
+  readable folder (or the `command_cwd` / the call's `cwd`, inside one), with no stdin, for at
+  most 15 s, its output cut to 6000 characters (the start and the end are kept), and a timeout, a
+  cancel or the answer's time limit kills the whole process tree. **All commands** lifts the list
+  *and* every one of those checks (the timeout and the output cap stay): it is labelled "runs
+  arbitrary code" in the tab and no map ever turns it on.
+- **Web.** With **Fetch web content** on, the ask box gets `fetch_url` and `web_search`
+  (DuckDuckGo's HTML results by default, `web_search_url`). **Allowed domains** (empty = any public
+  site; `example.com` also allows `docs.example.com`, not `notexample.com`) and **blocked
+  domains** (they win) apply to the page, to every redirect hop (at most 5) and to the hits of a
+  search; with a non-empty allowed list the search host has to be on it too. Unless **Allow local
+  / private network addresses** is on, the host is resolved and every address must be public:
+  loopback, private, link-local, multicast, reserved and carrier-grade NAT addresses are refused,
+  and so are numeric forms like `127.1` or `0x7f000001` and URLs carrying a user name or password.
+  Only http(s) addresses that answer with text are accepted (HTML is converted to plain text, JSON
+  kept); 2 MiB are read, 8000 characters kept, 10 s per request, 3 fetches and searches per
+  answer. A cancel or the answer's time limit stops a fetch within about a tenth of a second, even
+  while it is still connecting or a page drips in a byte at a time, and HTML is converted from its
+  first 512 KiB of markup. An address longer than 256 characters (or with a query string over 100)
+  is refused and a search query is cut to 120: a bandwidth limit on what an injected instruction
+  could carry out in a request, not a guarantee. And the one rule that keeps the switch from being
+  an exfiltration channel: **no web access after a local read in the same answer.** Once a file,
+  a listing, a search hit, a command's output or an MCP reply has entered the answer, `fetch_url`
+  and `web_search` are refused for the rest of it ("search first, read after").
+- **MCP servers.** A table of servers (**Add…**, **Edit…**, **Remove**, **Test**): a name
+  (letters, digits, `_ . -`), a transport and, per transport, either `command` + `args` + `env`
+  (**stdio**: started without a shell, with a minimal environment of `PATH` and the Windows
+  basics plus the variables you list, and stopped together with its child processes) or a `url`
+  (**http**: streamable HTTP; a `token=` / `key=` query value is hidden in the table, and the
+  session export also blanks every `env` value, a url's password and secret-named command-line
+  flags: put a secret in `env`, not in `args`). The enabled servers are connected on a background
+  thread when you apply, the status line shows each one's state, **Test** lists the tools a server
+  offers (it tests the applied settings, so Apply first), and a connected server's tools reach the
+  ask box as `mcp:<server>:<tool>`, with the same call limits and the same sanitising as
+  everything else. `mcp_timeout_s` (20 s) bounds the connect and every call. A server whose
+  process exits or whose connection drops is marked as an error at once and its tools stop being
+  offered; the next connect pass reconnects it (**Test** on it, an Apply that changes an MCP
+  setting, loading a map, the next start). Quitting closes all the servers at the same time.
+- **What a call looks like.** The model writes one line, `<tool>{"name": "read_file", "args":
+  {"path": "src/app.py"}}</tool>`, before any answer text (a call that follows a line of prose on
+  the same line runs too, the prose stays in the answer, and so does a complete call whose closing
+  tag is missing); the server stops the stream at the closing tag, the app runs the call, hands the
+  result back as a message of its own (the way chat models expect a tool's reply: a result written
+  into the model's own turn made it end the turn without answering, seen live on 2026-10-08) and
+  the same answer carries on, with llama.cpp's prefix cache still holding everything before the
+  result. A `</tool>` the model writes in its own prose cuts the answer there (the rule tells it
+  never to mention the tools). The Assist tab's footer shows
+  it while it happens, `ask - read_file src/app.py…`, and then `ask - read_file src/app.py
+  (3.2 KB)`, or the reason a call was refused or failed, until the answer is done (plain text: a
+  query containing `<b>` is shown as typed). The calls and results never reach the answer, the
+  history or the notes, only the answer text does. A result is text that went through a sanitiser
+  (ChatML special tokens, a forged `<tool>`, `<tools>`, `<map>` or `<result>` are defused) and the
+  model is told that a result is data, never instructions. A call that cannot be parsed is told
+  so (the first one is free; a Windows path whose `\n` or `\t` the JSON turned into control
+  characters gets its backslashes back in every argument that is not file text), an identical call
+  repeated is answered from memory at no cost (until a write, an edit, a command or an MCP call
+  has run: then every earlier result may be stale and the call is made again), a model whose
+  first words only *announce* a lookup ("Let me check the config file") without making it is asked
+  once to make the call (a finished answer such as "Looking at the transcript, Atlas ships
+  Friday." is left alone), an answer that is blank after the last result is asked for once more,
+  and once the last call is spent or the time is up it is told to write the answer.
+- **Maps: Pre-index scoped directories.** A map is a short overview of the readable folders so the
+  model knows which paths exist before it calls anything. The button asks for a name, applies the
+  tab and walks the folders on a background thread (exclusions honoured, 4000 files or 120 s at
+  most; a bigger tree is saved as cut). "A basic understanding" means no model call: for each file
+  the first 4 KiB give its kind (from the extension) and a one-line summary: a Markdown file's
+  first heading, a Python file's docstring line and up to six `class` / `def` names, a script's
+  first comment or exports, the top-level keys of a JSON / TOML / YAML file, otherwise the first
+  line. A file over 256 KiB or a known binary is listed by size only, a summary that reads like a
+  credential is dropped, and an excluded file is not in the map at all. The map is rendered into a
+  bounded `<map>` block (`map_tokens`, 800 tokens, turned into characters with the configured
+  `chars_per_token` and cut once, when the map is indexed, so the block is the same bytes in every
+  answer): README and docs first, folders as `src/ (12 files: python 9, markdown 3)` lines, files
+  as `name -- summary`, deeper folders collapsed to their count when the budget runs out. File
+  names and summaries pass the same sanitiser as tool results, and the prompt's own block tags
+  (`<map>`, `<earlier>`, ...) are defused in them, also when a map file is loaded. The active map
+  rides in the user turn of every tool-enabled prompt (after the earlier-summary, before the
+  transcript), so it changes only when you index or load one. Maps are saved as JSON under
+  `models/maps/` (`[capabilities].maps_dir`), keep across sessions, and are copied into the
+  session folder when indexed, loaded and at every new session. The table lists them (Name /
+  Roots / Files / Indexed / Active) with **Load**, **Re-index**, **Delete** and **Open folder**.
+  **Re-index** re-scans the folders the selected map was made from, with the settings it was
+  saved with (what the tab shows now is not used; a name you have excluded since is added to the
+  map's exclusions); Pre-index under a name that already exists asks before it replaces that map
+  with the folders in the tab. Changing the maps folder applies at once (the active map is read
+  again from the new folder; maps saved in the old folder are not moved). A map is a snapshot: the
+  active one is re-indexed in the background at every launch (the stored text serves until the
+  pass finishes; a toast reports the fresh count only when files or folders were added, removed or
+  renamed since -- a map lists paths and one-line summaries for the tools, it loads nothing into
+  the context), and when the model asks for a path that
+  no longer exists the error names the same-named files or folders found elsewhere ("Did you mean:
+  Research/R3.md?"), so a rename made since the map was built costs it one call, not a guess.
+- **Load re-applies the settings the map was made with**, but only the narrowing subset: the five
+  switches and **Tools reach**, the folders, the exclusions (a map can only *add* to them, never
+  remove one), the allowed commands (only entries already allowed or on the safe list), the domain
+  lists (blocked domains only grow; an empty allowed list does not widen a filled one), the limits,
+  and which *already configured* MCP servers are enabled. It never carries or applies
+  **All commands**, local web access, a server's definition, the working folder, the search URL,
+  the maps folder or a timeout. **Load asks first**: the dialog lists the switches it will flip and
+  the folders it will set, and notes that exclusions, commands, domains and limits are re-applied
+  as well and that unapplied edits on the tab are replaced.
+- **What this is not.** The allowed-command list is a guard against *accidents*, not a sandbox:
+  an allowed command does whatever its own arguments let it do inside the readable folders, and
+  **All commands runs arbitrary code** with your rights. The address check resolves a host and
+  then the HTTP client resolves it again to connect, so DNS rebinding is not prevented (the domain
+  lists are the control that matters). An **MCP server is third-party code you chose to run**: it
+  has its own scope, nothing above applies to what it reads or does, and an http server's URL is
+  not checked against the web lists. Uploaded context documents are not sanitised the way tool
+  results are. The full list, with the smaller ones, is under "Limitations & honesty notes".
+
+**Verified live once** (2026-10-08: Qwen3.8-27B through llama-server, the ask box, one readable
+folder): the first session surfaced three problems that are fixed above (a result inside the
+model's own turn ended the turn, the client-side cut at a call cost a full prompt re-evaluation per
+hop, a stale map sent the model to a renamed folder). Still unverified: a real MCP server, a real
+web fetch or search, the edit tools and the chat path (`thinking = "on"`); see "Limitations &
+honesty notes".
 
 ## Configuration
 
@@ -1048,6 +1244,25 @@ compaction = "summary"      # fold what fell out of the window into a running <e
 lane_share = 0.3            # with parallel = 2 the slots share one KV pool: this share is kept for the notes lane
 chars_per_token = 3.6       # starting estimate, calibrated live from the server's own counts
 
+[capabilities]
+# 2026-10-07: what the model may do on its own (Models > Capabilities). Defaults shown; config.example.toml
+# documents every key. Only the ask box gets the active tools; the other answers get read tools.
+read_files = true           # read / list / search the folders in read_roots
+edit_files = false          # create / edit files in edit_roots
+execute_commands = true     # run the commands in allowed_commands (a safe list by default)
+fetch_web = false           # fetch pages / search the web within the domain lists
+mcp_servers = false         # call the tools of the enabled servers in mcp
+apply_to = "questions"      # which answers may use tools: questions | ask | all
+read_roots = []             # e.g. ['C:\Repos\myapp']; EMPTY = no tools at all, whatever the switches say
+max_tool_calls = 4          # per answer in the ask box ...
+tool_time_s = 30.0          # ... and the time for the whole loop
+live_max_tool_calls = 2     # per answer to the other speaker / the screen (someone is waiting)
+live_tool_time_s = 10.0
+allow_all_commands = false  # RUNS ARBITRARY CODE: lifts the allowed list and every argument check
+web_allowed_domains = []    # empty = any public site; "example.com" also allows its subdomains
+mcp = []                    # [{ name = "fs", transport = "stdio", command = "npx", args = ["-y", "..."], env = {}, enabled = true }]
+map_tokens = 800            # budget of the <map> block (the pre-indexed project overview) in the prompt
+
 [ui]
 hide_from_capture = true
 hide_when_exposed = true   # see the capture note under "Limitations & honesty notes"
@@ -1123,6 +1338,9 @@ microphone ──────┘                         └─ Session recorder
 - `exocortex/audio/` capture + resampling · `exocortex/speech/` VAD, ASR, diarization, pipeline
 - `exocortex/llm/` server manager, HTTP client, prompts, question heuristics, assistant
 - `exocortex/ui/` overlay, widgets, Win32 helpers, global hotkeys · `exocortex/app.py` wiring
+- `exocortex/capabilities.py` the tool policy, the tools and the project maps · `exocortex/webfetch.py` page
+  fetch + web search (behind "Fetch web content") · `exocortex/mcp.py` MCP client, stdio and streamable HTTP
+  (behind "MCP servers"); Qt-free, the tool loop itself runs in `exocortex/llm/assistant.py`
 - `SPEC.md` holds the module contracts and every measured fact the design rests on.
 
 Run the tests with `.venv\Scripts\python.exe -m pytest` (offline) or `-m live` for the GPU / audio /
@@ -1225,6 +1443,37 @@ llama-server tests.
   branch); the port of this feature to the macOS fork (a separate follow-up, not part of this
   branch); and the Models window itself, which has only been driven through offscreen tests, never
   live.
+- **Capabilities (2026-10-07): driven live once, on 2026-10-08.** The runner, the maps, the web
+  fetcher, the MCP client (against a stub server it spawns itself), the Capabilities tab (offscreen)
+  and the loop (against a scripted client) are covered by offline tests; one live session
+  (Qwen3.8-27B, the ask box, the read tools) found three problems that are fixed (results come back
+  as a user turn, `</tool>` is the server's stop string, the active map is refreshed at launch). No
+  real MCP server was connected, no real page was fetched and no edit tool ran live,
+  so how a small local model copes with the `<tool>` protocol (how often it calls, how often it writes
+  a malformed call, the "Let me check ..." retry) is a design, not a measurement.
+- **The command allowlist is a guard against accidents, not a sandbox**, and `allow_all_commands` runs
+  arbitrary code with your rights. Excluded names are hidden from `git diff`, `log`, `show`, `status`
+  and `ls-files` (history included, by name) and their contents are never read, searched or indexed,
+  but the listers (`dir`, `ls`, `tree`, unlike the `list_dir` tool) list the NAMES of excluded
+  files, and the filter is by name only: a secret that was once committed in a file whose name is
+  not excluded is still printed by `git log -p`.
+- **Web access.** DNS rebinding between the address check and the connect is not prevented (the host
+  is resolved to check it, then resolved again by the HTTP client to connect), and `getaddrinfo` has no
+  timeout, so a DNS server that never answers is not bounded by `web_timeout_s`. The "no web after a
+  local read" guard covers what the tools read in the same answer; the transcript, the screen text and
+  the reference documents are already in the prompt, so a model that copies a line of them into a search
+  query sends it. The address and query limits (256 / 100 / 120 characters) bound how much one
+  request can carry, not whether a short line gets out. That is what the allowed-domain list is for.
+- **MCP servers** are third-party code you chose to run, outside the read / edit / command scopes; an
+  http server's URL is not checked against the web lists. A cold `npx -y` start can take longer than
+  `mcp_timeout_s` (20 s) while the package downloads: the server shows an error until you raise it and
+  press Test again.
+- **Trust.** Uploaded context documents are not sanitised (the text of a document you add in the
+  Context tab goes into the prompt as it is, unlike a tool result, a web page, a map summary or an MCP
+  reply, which have their control markers defused), and a map file is trusted input: loading one can
+  switch tools on and point the scopes at other folders (Load lists the switches and folders and asks
+  first). Only the ask box gets the active tools; answers to the other speaker and the screen get the
+  read tools. With no readable folder configured nothing changes about any prompt.
 
 ## Troubleshooting
 

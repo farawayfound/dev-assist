@@ -97,7 +97,7 @@ These work only in the place listed, not globally.
 | Live tab | Double-click a speaker name | Rename the speaker |
 | Title bar or slim bar | Drag | Move the overlay |
 | Window edges or bottom-right corner | Drag | Resize the overlay |
-| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots, recap and the dashboard now; the automatic switches; role; session context; Assist settings…), **View ▸** (switch the view; the current view's display options — the board's columns, the OCR readout, the history pane, partial speech; the **Overlay strips** — Tabs, Controls, Status, Monitor; **Screen source ▸** off / active window / a monitor / a region; **Screen: pause/resume**; **Repository ▸** auto-detected from Claude Code or a chosen folder), **Dashboard mode**, Export session, New session, Settings…, Models…, Context documents…, Compact context now, Rename speakers, Quit |
+| Anywhere on the panel except text | Right-click | The **⋯** menu: **Assist ▸** (questions, blind spots, recap and the dashboard now; the automatic switches; role; session context; Assist settings…), **View ▸** (switch the view; the current view's display options — the board's columns, the OCR readout, the history pane, partial speech; the **Overlay strips** — Tabs, Controls, Status, Monitor; **Screen source ▸** off / active window / a monitor / a region; **Screen: pause/resume**; **Repository ▸** auto-detected from Claude Code or a chosen folder), **Dashboard mode**, Export session, New session, Settings…, Models…, Context documents…, **Capabilities…**, Compact context now, Rename speakers, Quit |
 | Notes tab | **Questions** / **Blind spots** / **Recap** buttons | Refresh one insight section now, or recap the session |
 | Dashboard mode | **✓** / **✕** / **↺** / **⧉** / **＋** on a card, or right-click a card | Mark an item answered, done or met (with an optional note), dismiss it (a constraint: lift it), reopen it, copy a prompt, add a sub-task under a task; the menu also has **Edit…** and, on a task, **Add an acceptance criterion…** / **Add a prompt…** |
 | Dashboard mode | **+** / **↻** in a column header, **Refresh all** | Add an item by hand (a goal asks which task it is for); refresh that column, or everything (the items and the notes) |
@@ -111,7 +111,9 @@ These have a button or menu entry but no hotkey: **Read**, **Revert**, **Reset**
 **Compact** (fold the context window into a running summary now, like `/compact`; also in the
 **⋯** menu as "Compact context now"), switching tabs, the Notes tab's **Questions** / **Blind
 spots** buttons (`Ctrl+Alt+W` refreshes both), and the **⋯** menu's Assist switches, role and
-session context, Export session, New session, Settings…, Models… and Rename speakers.
+session context, Export session, New session, Settings…, Models…, Context documents…,
+**Capabilities…** (the Models window's Capabilities tab: what the model may read, edit, run,
+fetch and call on its own, and the project maps) and Rename speakers.
 
 ## View menu — show or hide parts of the panel
 

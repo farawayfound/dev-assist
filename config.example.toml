@@ -368,6 +368,122 @@ goal = "balanced"         # latency | balanced | context | quality
 reserve_vram_mb = 0       # GPU memory never planned into (MB); 0 = VRAM-guard floor + 256 MB + the goal's slack
 ctx_cap = 0               # longest context window to plan (tokens); 0 = the model's trained maximum
 asr_gpu = "auto"          # auto | never: "never" keeps Whisper off the display GPU whatever the goal
+[capabilities]
+# 2026-10-07: what the model may do on its own to gather context (the Models window's "Capabilities"
+# tab; README "Capabilities: letting the model gather its own context"). Five switches, each with its
+# scope below. TRUST TIERS: only the ask box carries text you typed, so only it gets the ACTIVE tools
+# (edit files, run commands, fetch / search the web, MCP); answers to the other speaker (auto, manual)
+# and to the screen get the READ tools only (read, list, find, search). The runner enforces this, not
+# just the prompt. With no folder in read_roots NO tool is offered at all, so a fresh install's prompts
+# are exactly what they were before this section existed. Windows paths: use single quotes
+# ('C:\Repos\app') or doubled backslashes. Every value is read live (Apply in the tab), maps_dir
+# included.
+read_files = true            # read, list and search the folders in read_roots
+edit_files = false           # create / edit files in edit_roots (ask box only; needs a folder below)
+execute_commands = true      # run the commands in allowed_commands (ask box only; runs in a read folder)
+fetch_web = false            # fetch pages and search the web within the domain lists (ask box only)
+mcp_servers = false          # call the tools of the enabled servers in mcp (ask box only)
+# Which answers may use tools at all. "questions" = the other speaker (auto / manual), screen
+# questions and the ask box (read tools for the first three, everything for the ask box); "ask" = the
+# ask box only; "all" = also suggestions, solves, code and text (read tools). Never inline completions
+# or explanations.
+apply_to = "questions"
+# Limits per answer. The ask box carries a question you typed, so a longer wait is fine ...
+max_tool_calls = 4           # a refused call and a malformed one (after the first) count too; a repeated call is free
+tool_result_chars = 6000     # one result is cut here before it joins the prompt
+tool_time_s = 30.0           # the WHOLE loop (tools + model hops) per answer; every tool honours it; then the model must answer
+# ... the live kinds (auto / manual / screen / suggest / solve / code / text) have someone waiting.
+live_max_tool_calls = 2
+live_tool_result_chars = 2500
+live_tool_time_s = 10.0
+
+# ---- read files ----
+read_roots = []              # folders readable recursively, e.g. ['C:\Repos\myapp']; EMPTY = no tools at all
+# Names the model never reads, lists, searches or indexes: fnmatch patterns, case-insensitive, matched
+# against EVERY component of a path below its folder ("docs/private" hides that subtree). The app's own
+# files (this config.toml, the model / context / maps / session folders) are always off limits too and
+# cannot be removed here. Links and junctions are never followed. git diff / log / show / status /
+# ls-files skip these names too (history included, by name); the listers (dir, ls, tree) still list the
+# NAMES of excluded files: see README "Limitations & honesty notes".
+read_exclude = [".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+                "dist", "build", "*.pyc", ".env", ".env.*", "*.pem", "*.key", "*.crt", "*.p12", "*.pfx", "*.kdbx",
+                "*.kdb", "id_rsa*", "id_ed25519*", "id_ecdsa*", "*.ppk", ".ssh", ".aws", ".kube", ".docker",
+                ".gnupg", ".npmrc", ".pypirc", ".netrc", ".git-credentials", "*.ovpn", "credentials*", "secrets*",
+                "*.token", "*.sqlite", "*.db"]
+read_max_file_chars = 20000  # a longer file is cut here (the model can ask for a line range)
+
+# ---- edit files ----
+edit_roots = []              # folders the ask box may write to; each change is atomic, there is no delete tool
+edit_exclude = [".git", "*.bat", "*.cmd", "*.ps1", "*.vbs", "*.exe", "*.dll", "*.lnk", "*.sys"]   # on top of read_exclude
+edit_backup = true           # copy the original to <session>/edits/<HHMMSS>_<n>_<name> before every change of an existing
+                             # file; with no session folder yet the change is refused rather than made without a backup
+
+# ---- execute commands ----
+# One entry allows that command with any arguments ("git log" allows "git log --oneline"), BUT the
+# arguments still pass a gate: no chaining or redirection (& | ; < > ^ ` $( ${ %), no look-alike
+# characters (fullwidth or dash variants a Windows program reads as * or -), every path must sit
+# inside a readable folder and not be excluded, no wildcard except for the listers (dir ls tree where
+# which ...) and git, a flag deny-list (output files, recursion, external diff / textconv tools, ...),
+# nothing that can open a connection (tasklist / systeminfo /s /u /p; pip / npm options outside a short
+# list, so --outdated, --index-url, --proxy are refused). git runs with hooks, pager and optional locks
+# off; diff / log / show / status / ls-files stay inside the folder the command runs in and skip the
+# names read_exclude lists (history included). The default list has NO content reader (type cat head
+# tail more findstr grep rg wc): each leaked around the read scope through a wildcard, a switch or a
+# recursion flag, and the read_file / search_text tools do what they did, inside the scope. Add one back
+# by hand if you must: it still goes through the gate (wildcards refused, findstr never gets /s, GNU
+# recursion flags and their abbreviations refused). The listers show the NAMES of excluded files, never
+# their content. No interpreter entry and no test / build runner on purpose (python -c is arbitrary
+# code, pytest imports the repo's conftest.py). This list is a guard against ACCIDENTS, not a sandbox.
+allowed_commands = ["dir", "ls", "tree", "where", "which", "pwd", "hostname", "whoami", "ver", "date",
+                    "tasklist", "systeminfo", "git status", "git log", "git diff", "git show", "git branch",
+                    "git blame", "git ls-files", "git remote -v", "git stash list", "git describe",
+                    "git rev-parse", "python --version", "pip list", "pip show", "pip --version",
+                    "node --version", "npm ls", "npm --version", "dotnet --version", "cargo --version",
+                    "go version", "java -version", "rustc --version"]
+allow_all_commands = false   # RUNS ARBITRARY CODE: lifts the list, the chaining filter, the path gate and the git
+                             # rewrite (the timeout and the output cap stay). No map ever turns this on.
+command_timeout_s = 15.0     # a command still running then is killed together with its child processes
+command_output_chars = 6000  # the start and the end of a longer output are kept
+command_cwd = ""             # "" = the first read folder; a value must sit inside one
+
+# ---- fetch web content ----
+web_allowed_domains = []     # empty = any public site; "example.com" also allows docs.example.com (not notexample.com).
+                             # With a non-empty list the search host (web_search_url) has to be on it too.
+web_blocked_domains = []     # wins over the allowed list
+web_allow_local = false      # false: loopback, private, link-local, multicast and CGNAT (100.64/10) addresses are refused,
+                             # for the page AND every redirect hop. No map ever turns this on.
+web_max_fetches = 3          # fetches + searches per answer
+web_page_chars = 8000        # page text kept (html is converted to plain text, from its first 512 KiB)
+web_timeout_s = 10.0         # per request; a whole fetch, redirects included, gets three times this
+web_search_url = "https://html.duckduckgo.com/html/?q={query}"   # GET; {query} is replaced (URL-encoded; the model's query is cut to 120 chars first)
+web_search_results = 5
+# The web tools are refused for the rest of an answer once a file, listing, search hit, command output
+# or MCP reply has entered it ("search first, read after"): data read locally in this answer cannot
+# leave in a later query or URL. A url longer than 256 characters (or with a query string over 100) is
+# refused and a search query is cut to 120: a bandwidth limit on what an injected instruction could
+# carry out, not a guarantee (the transcript, the screen text and reference documents are already in
+# the prompt; the domain lists are the control that matters). A cancel or the answer's time limit
+# stops a fetch within about 0.1 s.
+
+# ---- MCP servers ----
+# An ARRAY OF INLINE TABLES (one { ... } per server, all on one line). name: 1-64 of A-Z a-z 0-9 _ . -
+# (the model sees its tools as mcp:<name>:<tool>). transport "stdio": command + args, started WITHOUT a
+# shell with a minimal environment (PATH and the Windows basics) plus the env table. transport "http":
+# url (streamable HTTP). session.json redacts every env value, a url password, a token= / key= query
+# value and the value of a secret-named flag in args (best effort: put a secret in env, not in args).
+# An MCP server is third-party code you chose to run, outside the read / edit / command scope above.
+# A server whose process exits or whose connection drops shows an error at once and its tools stop
+# being offered; Test, an Apply that changes an MCP setting, loading a map or the next start reconnects it.
+# mcp = [{ name = "fs", transport = "stdio", command = "npx", args = ["-y", "@modelcontextprotocol/server-filesystem", 'C:\Repos\myapp'], env = {}, enabled = true }]
+# mcp = [{ name = "docs", transport = "http", url = "http://127.0.0.1:8123/mcp", enabled = true }]
+mcp = []
+mcp_timeout_s = 20.0         # connect and per-call wait; a cold `npx -y` start can need more: raise it
+
+# ---- maps (the tab's "Pre-index scoped directories") ----
+maps_dir = ""                # "" = <models_dir>/maps; each map is copied into the session folder too (maps in the old folder are not moved)
+active_map = ""              # the map loaded last (written by the tab); its overview rides in every tool-enabled prompt
+map_max_files = 4000         # a bigger tree is cut here (the rest is counted, not listed)
+map_tokens = 800             # budget of the <map> block in the prompt (x [context] chars_per_token characters, cut once when the map is indexed)
 
 [ui]
 opacity = 0.93

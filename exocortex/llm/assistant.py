@@ -56,6 +56,18 @@ Owns five daemon threads:
   server's real context -- see ``exocortex/context.py``); the Assistant publishes how that went as
   two :class:`~exocortex.bus.ContextUsageEvent` per job and feeds the server's own prompt-token
   count back so the estimate calibrates itself.
+- 2026-10-07 (capabilities): with a :class:`exocortex.capabilities.ToolRunner` (``tools=``) a job
+  whose kind it covers runs a **tool loop** on the assist worker (:meth:`Assistant._stream_answer`):
+  the system prompt ends with the ``<tools>`` list, the user turn carries the project ``<map>``,
+  and when the model writes ``<tool>{...}</tool>`` (on a line of its own, or after a line of
+  prose) the server stops the pass at the closing tag, the runner executes the call under the
+  ``[capabilities]`` policy, and the conversation is continued: the call closes the assistant
+  turn, its ``<result>`` block comes back as a USER turn and a fresh assistant turn is opened
+  (2026-10-08: every request a byte-for-byte extension of the previous one plus what the model
+  generated, so the KV prefix cache stays intact; the chat path appends two messages). Only the
+  visible text reaches the deltas, the history, the plan and ``AssistDoneEvent``; every call is
+  published as a :class:`~exocortex.bus.ToolCallEvent`. Never for "complete" / "explain", nor for
+  the notes lane's jobs.
 - ``bus-listener`` -- drains this instance's own bus subscription, watching for
   :class:`~exocortex.bus.FinalTranscriptEvent` to drive auto-answer mode and for
   :class:`~exocortex.bus.ScreenTextEvent` to drive screen-triggered questions and auto-suggest.
@@ -93,7 +105,7 @@ import threading
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Generic, TypeVar
+from typing import Any, Generic, NamedTuple, TypeVar
 
 from exocortex.bus import (
     AssistDeltaEvent,
@@ -113,13 +125,14 @@ from exocortex.bus import (
     NotesUpdatedEvent,
     ScreenTextEvent,
     Source,
+    ToolCallEvent,
     TranscriptSegment,
 )
 from exocortex.config import Config
 from exocortex.context import ContextBundle, ContextManager, ContextStore
 from exocortex.llm import prompts, questions
 from exocortex.llm.choices import ChoiceSet, annotate_choices, choices_block, finalize_answer, find_choices
-from exocortex.llm.client import LLMError, LMStudioClient
+from exocortex.llm.client import LLMError, LMStudioClient, StreamStats
 from exocortex.plan import PlanView, containment, split_plan, typed_fraction
 from exocortex.transcript import Transcript
 
@@ -275,6 +288,355 @@ def _normalize_line(text: str) -> str:
 def _normalized_line_set(lines: Sequence[str]) -> set[str]:
     """`lines`, normalised via `_normalize_line` and with blanks dropped, as a set."""
     return {norm for line in lines if (norm := _normalize_line(line))}
+
+
+# ---- the tool loop's pieces (2026-10-07, capabilities) -------------------------------------
+
+#: Kinds that never get tools, whatever the runner says (inline completions are ghost text typed
+#: into another app; an explanation answers a finished plan). dev-assist's own background kinds
+#: join them: their system prompts carry no <tools> block, and the dashboard builds its own.
+_NO_TOOL_KINDS = frozenset({"complete", "explain", "insights", "recap", "dashboard"})
+
+#: Appended to the result of the call that used the last one (or after the time budget ran out):
+#: the model's cue, repeated by `prompts._TOOL_RULE`, to write the answer now.
+_NO_CALLS_LEFT = "(no calls left: write the answer now)"
+
+#: What a result becomes when the server says the continuation did not fit its context.
+_RESULT_DROPPED = "(result dropped to fit the context)"
+
+#: A short narration that announces a lookup but makes none ("Let me check the config file."):
+#: the first stream of an answer that matches gets ONE retry with the call opened for it. The
+#: announcement must OPEN the text (after optional filler such as "Okay,") with a first-person
+#: lookup verb ("let me check", "I'll start by reading", "I need to look"), or be a bare
+#: "Checking / Reading / Looking at ..." clause that is the whole text -- so a complete answer
+#: that merely says "Looking at the transcript, Atlas ships Friday." or "Let me know if ..." is not
+#: one.
+_INTENT_RE = re.compile(
+    r"^\W*(?:(?:okay|ok|sure|alright|right|so|now|first|well)\b\W*)*"
+    r"(?:(?:let me|let['\u2019]s|i(?:'ll|\u2019ll| will)|i need to|i['\u2019]m going to)\s+"
+    r"(?:(?:first|just|now|quickly)\s+)*"
+    r"(?:check|look|read|open|search|find|verify|run|list|fetch|grep|pull|take a look|examine|inspect|review|browse"
+    r"|scan|load|start by|see (?:if|what|whether|how|which|where|the))\b"
+    r"|(?:checking|reading|searching|looking (?:up|at|in|through|for))\b"
+    r"(?:(?![,;:]|[.!?]\s+\S)[^\n]){0,80}$)",
+    re.IGNORECASE,
+)
+_INTENT_MAX_CHARS = 240
+#: ... and it only counts when it is unfinished (no full stop at its end) or names what it will
+#: look at -- a file, a folder, a command, a url -- because a finished sentence that names nothing
+#: ("Let me check that.") is as likely an answer as an announcement.
+_SENTENCE_END_RE = re.compile(r"[.!?\u2026][\"')\]\u201d]*\s*$")
+_INTENT_TARGET_RE = re.compile(
+    r"[`\"/\\]|\bhttps?:|\bwww\.|\b[\w-]+\.[A-Za-z]{1,6}\b"
+    r"|\b(?:files?|folders?|directory|directories|dir|repo|repository|project|codebase|command|commands|url|link|page|site"
+    r"|website|docs?|documentation|readme|config|configuration|settings|script|logs?|source|code|module|package|tests?)\b"
+    r"|\b(?:git|pip|npm|ls|tree|grep|rg|findstr|pytest|python|where|which|cat|type)\s+\S",
+    re.IGNORECASE,
+)
+
+
+def _announces_lookup(text: str) -> bool:
+    """Is `text` (the first stream of an answer) only an announcement of a lookup it never made?"""
+    if not text.strip() or len(text) >= _INTENT_MAX_CHARS or not _INTENT_RE.search(text):
+        return False
+    return _SENTENCE_END_RE.search(text) is None or _INTENT_TARGET_RE.search(text) is not None
+
+
+#: The chat path cannot prefill an assistant turn, so the two retries below ask in words instead.
+_CHAT_FORCE_CALL = '(make the tool call now: <tool>{"name": "...", "args": {...}}</tool>)'
+_CHAT_WRITE_ANSWER = "(write the answer now)"
+
+#: A call whose JSON object is complete but whose closing tag has not come after this many more
+#: characters was written by a model that forgot the tag: `_send_hop` stops reading there (the one
+#: client-side cut left, 2026-10-08) instead of paying for a made-up continuation.
+_CLOSE_GRACE_CHARS = 80
+
+
+def _forgot_closing_tag(held: str) -> bool:
+    """True when `held` (the text from a call's opening marker on) holds a complete JSON object
+    followed by `_CLOSE_GRACE_CHARS` characters or more without a closing tag."""
+    payload = prompts.find_tool_call(held)
+    if payload is None:
+        return False
+    at = held.find(prompts.TOOL_OPEN)
+    tail = held[at + len(prompts.TOOL_OPEN) + len(payload):]
+    return prompts.TOOL_CLOSE not in tail and len(tail) >= _CLOSE_GRACE_CHARS
+
+#: A call that may carry a file's content (ask with `write_file` / `edit_file`) needs more room
+#: than a one-line lookup: `max_tokens` of such hops is raised to at least this.
+_WRITE_HOP_MIN_TOKENS = 1200
+_WRITE_TOOLS = frozenset({"write_file", "edit_file"})
+
+#: Argument names that best say what a call is about, in order (the event's one-line summary).
+_SUMMARY_KEYS = ("query", "pattern", "command", "url", "path", "file", "name")
+
+
+class _NoAnswerError(Exception):
+    """The tool loop ended without an answer: the model called tools and then wrote nothing, even
+    when asked once more. Reported as an `AssistErrorEvent` (not as an LLM failure)."""
+
+
+class _Outcome(NamedTuple):
+    """What the loop needs of a runner's result (`exocortex.capabilities.ToolResult`, or any
+    object with the same four attributes)."""
+
+    text: str
+    state: str
+    detail: str
+    summary: str
+
+
+def _outcome(result: Any) -> _Outcome:
+    """`result` as an `_Outcome`: missing attributes read as empty, an unknown state as "done"."""
+    state = str(getattr(result, "state", "") or "done")
+    if state not in ("done", "error", "denied"):
+        state = "done"
+    return _Outcome(
+        str(getattr(result, "text", "") or ""), state,
+        str(getattr(result, "detail", "") or ""), str(getattr(result, "summary", "") or ""),
+    )
+
+
+def _call_summary(args: dict[str, Any]) -> str:
+    """One line (<= 120 chars) naming what a call is about, from its arguments: the query, the
+    pattern, the command, the url or the path, else the first scalar value."""
+    text = ""
+    for key in _SUMMARY_KEYS:
+        value = args.get(key)
+        if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+            text = str(value)
+            break
+    else:
+        for value in args.values():
+            if isinstance(value, (str, int, float)) and not isinstance(value, bool) and str(value).strip():
+                text = str(value)
+                break
+    return " ".join(text.split())[:120]
+
+
+def _one_line(text: str, limit: int = 160) -> str:
+    """The first non-empty line of `text`, cut to `limit` characters."""
+    for line in (text or "").splitlines():
+        if line.strip():
+            return line.strip()[:limit]
+    return ""
+
+
+@dataclass
+class _JobTools:
+    """Everything the tool loop needs of ONE job, resolved once (`Assistant._job_tools`): the
+    runner's per-answer budget (its `calls_left` is what the system prompt announced), the specs it
+    listed, the rendered ``<tools>`` block and the project map cut to `[capabilities].map_tokens`."""
+
+    budget: Any
+    specs: list[Any]
+    block: str
+    map_text: str
+
+
+@dataclass
+class _ToolStep:
+    """One call of the loop as the continuation carries it: the visible text the model wrote
+    before it (`text`), the call's payload, the tool's name and its result. `note` is the loop's
+    own trailing line inside the result block; `sanitize` is False for the loop's own notices
+    (a malformed call's, which names ``<tool>`` on purpose); `dropped` replaces the result's body
+    by a placeholder when the server ran out of context."""
+
+    text: str
+    payload: str
+    name: str
+    result: str
+    note: str = ""
+    sanitize: bool = True
+    dropped: bool = False
+
+    def block(self, *, nudge: str = "") -> str:
+        """The ``<result>`` block of this step; `nudge` is the answer retry's trailing line."""
+        body = _RESULT_DROPPED if self.dropped else self.result
+        if self.note:
+            body = f"{body.rstrip()}\n{self.note}"
+        if nudge:
+            body = f"{body.rstrip()}\n{nudge}"
+        return prompts.tool_result_block(self.name, body, sanitize=self.sanitize)
+
+    def call_text(self) -> str:
+        """What the assistant wrote: the visible lead and the call. A ChatML special token the
+        model managed to write (``<|...``) is defused, as in a result: this text goes back into the
+        prompt verbatim."""
+        text = f"{self.text}{prompts.TOOL_OPEN}{self.payload}{prompts.TOOL_CLOSE}"
+        return text.replace("<|", "<¦")
+
+
+class _ToolSplitter:
+    """Splits the stream of one tool-loop request into the visible answer and the held-back call
+    (the shape of ``client._ThinkSplitter``: feed arbitrary chunks, tags may straddle them).
+
+    Text goes to `emit` (the job's ``on_delta``) unless it starts a call: a ``<tool>`` that opens a
+    LINE -- after indentation and an optional bullet / quote marker (``prompts.CALL_LEAD_RE``) --
+    switches to holding everything from there on, in `held`. A ``<tool>`` in the middle of a line
+    of prose is a call too when what follows it is a complete JSON object that spells out its
+    arguments (`prompts.is_explicit_call`): the prose before it stays visible, the call is held
+    and the raw JSON is never published; any other mid-line ``<tool>`` (a name-only object, ``{}``,
+    plain words) is ordinary text, and one whose object is still being written waits for its
+    end. A line that might still turn into a call (``<too``, ``- ``, ``1.``) waits
+    for its next characters, and a code-fence line is withheld until the line after it shows
+    whether a call follows (then the fence is swallowed). Decided text is not published at once
+    either: it waits for a newline or `PUBLISH_CHARS` characters, so a call at the very start of the
+    answer never leaks a partial ``<too`` and a tiny stream does not become a flurry of deltas.
+
+    `visible` is every character decided visible; `held` is None while no call has started. A
+    splitter made with `held=TOOL_OPEN` is already inside a call (the loop forced one open).
+    """
+
+    PUBLISH_CHARS = 120
+    #: How much of an unfinished mid-line ``<tool>{...`` is waited for before it is called text.
+    MID_CALL_WAIT_CHARS = 20_000
+
+    #: A line that is (or may become) a code-fence line: ```` ``` ```` / ``~~~`` plus an info string.
+    _FENCE_LINE = re.compile(r"[ \t]*(?:`{3,}|~{3,})[^`\n]*")
+    _FENCE_START = re.compile(r"[ \t]*(?:`{1,2}|~{1,2})?$|[ \t]*(?:`{3,}|~{3,})[^\n]*$")
+
+    def __init__(self, emit: Callable[[str], None], *, held: str | None = None) -> None:
+        self._emit = emit
+        self.visible = ""
+        self.held: str | None = held
+        #: True once a delta went out (a request that failed before that may be retried).
+        self.published = False
+        self._pending = ""        # decided visible, not yet published
+        self._buf = ""            # the line being read, not decided yet
+        self._fence = ""          # a fence line withheld in case a call follows it
+        self._mid_line = False    # the current line is prose: pass it on, watching for a mid-line <tool>
+
+    def feed(self, text: str) -> None:
+        """Take the next chunk of the stream."""
+        if not text:
+            return
+        if self.held is not None:
+            self.held += text
+            return
+        self._buf += text
+        self._drain(final=False)
+
+    def finish(self) -> None:
+        """The stream ended: decide whatever is still ambiguous and publish the rest."""
+        if self.held is None:
+            self._drain(final=True)
+        self._release_fence()
+        self._flush()
+
+    # ---- internals
+    def _visible(self, text: str) -> None:
+        if not text:
+            return
+        self.visible += text
+        self._pending += text
+        if "\n" in self._pending or len(self._pending) >= self.PUBLISH_CHARS:
+            self._flush()
+
+    def _flush(self) -> None:
+        if self._pending:
+            out, self._pending = self._pending, ""
+            self.published = True
+            self._emit(out)
+
+    def _release_fence(self) -> None:
+        if self._fence:
+            fence, self._fence = self._fence, ""
+            self._visible(fence)
+
+    def _begin_call(self, at: int) -> None:
+        """A call starts at index `at` of the buffer: hold it and everything after; swallow a
+        fence line that was withheld right before it."""
+        self._fence = ""
+        self.held = self._buf[at:]
+        self._buf = ""
+
+    @staticmethod
+    def _open_prefix_len(text: str) -> int:
+        """Length of the longest suffix of `text` that is a proper prefix of ``<tool>`` (0 = none)."""
+        for k in range(min(len(prompts.TOOL_OPEN) - 1, len(text)), 0, -1):
+            if prompts.TOOL_OPEN.startswith(text[-k:]):
+                return k
+        return 0
+
+    def _judge_mid_call(self, tail: str) -> str:
+        """What the text after a mid-line ``<tool>`` makes of it: "call" (a complete JSON object
+        that spells out its arguments), "text" (it cannot become one, or it is complete but is not a
+        call: ``{}``, a name with no arguments) or "wait" (nothing yet, an object still open, or a
+        code-fence opener), the last for at most `MID_CALL_WAIT_CHARS` characters."""
+        stripped = tail.lstrip()
+        if not stripped:
+            return "wait"
+        end = prompts._json_object_end(tail)
+        if end is None:
+            if stripped.startswith("{") or prompts._FENCE_PREFIX_RE.fullmatch(stripped):
+                return "wait" if len(tail) < self.MID_CALL_WAIT_CHARS else "text"
+            return "text"
+        return "call" if prompts.is_explicit_call(tail[:end]) else "text"
+
+    def _scan_prose(self, nl: int, final: bool) -> bool:
+        """Pass the prose line being read on to `_visible`, looking for a ``<tool>`` that opens a
+        call in the middle of it (`nl` = index of the line's newline in the buffer, -1 for none yet).
+        True = stop draining: a call began, or the next characters decide what is held back (a
+        partial ``<tool>`` at the end of the buffer, or a ``<tool>`` whose object is not complete)."""
+        buf = self._buf
+        at = buf.find(prompts.TOOL_OPEN)
+        if at >= 0 and (nl < 0 or at < nl):
+            if at:
+                self._visible(buf[:at])
+                self._buf = buf = buf[at:]
+            verdict = self._judge_mid_call(buf[len(prompts.TOOL_OPEN):])
+            if verdict == "call":
+                self._begin_call(0)
+                return True
+            if verdict == "wait" and not final:
+                return True
+            self._visible(prompts.TOOL_OPEN)                    # ordinary text: go on after the marker
+            self._buf = buf[len(prompts.TOOL_OPEN):]
+            return False
+        end = len(buf) if nl < 0 else nl + 1
+        keep = self._open_prefix_len(buf[:end]) if nl < 0 and not final else 0
+        if end > keep:
+            self._visible(buf[:end - keep])
+            self._buf = buf[end - keep:]
+        if nl >= 0:
+            self._mid_line = False
+            return False
+        return keep > 0
+
+    def _drain(self, *, final: bool) -> None:
+        while self._buf and self.held is None:
+            nl = self._buf.find("\n")
+            if self._mid_line:
+                if self._scan_prose(nl, final):
+                    return
+                continue
+            complete = nl >= 0
+            line = self._buf[:nl] if complete else self._buf
+            lead = prompts.CALL_LEAD_RE.match(line).end()      # always matches (possibly empty)
+            rest = line[lead:]
+            if rest.startswith(prompts.TOOL_OPEN):
+                self._begin_call(lead)
+                return
+            partial_tag = bool(rest) and prompts.TOOL_OPEN.startswith(rest)
+            ambiguous = (
+                partial_tag or prompts.CALL_LEAD_PARTIAL_RE.fullmatch(line) is not None
+                or self._FENCE_START.fullmatch(line) is not None
+            )
+            if ambiguous and not complete and not final:
+                return                                          # wait for the next characters
+            if complete and self._FENCE_LINE.fullmatch(line):
+                fence, self._buf = self._buf[:nl + 1], self._buf[nl + 1:]
+                self._release_fence()
+                self._fence = fence                             # withheld: a call may follow
+                continue
+            if final and not complete and partial_tag:
+                self._begin_call(lead)                          # the stream stopped inside "<too"
+                return
+            # An ordinary line (or the start of one): prose. `_scan_prose` passes it on, a long one
+            # flowing through, and watches it for a ``<tool>`` in the middle.
+            self._release_fence()
+            self._mid_line = True
 
 
 class _JobSlot(Generic[_T]):
@@ -436,6 +798,14 @@ class _AssistJob:
     sections: tuple[str, ...] = ()
     auto: bool = False
     started: float = 0.0
+    #: 2026-10-07 (capabilities): the tool loop's state for this job, resolved ONCE by
+    #: `Assistant._job_tools` (None = no tools for it) so the system prompt, the user turn, the
+    #: prompt rebuilt by the overflow retry and the loop itself all agree on one budget.
+    tool_ctx: "_JobTools | None" = None
+    tool_ctx_resolved: bool = False
+    #: Calls handed to the runner so far: once any ran, the outer overflow retry stays off (a tool
+    #: must never execute twice for one answer).
+    tools_used: int = 0
 
 
 @dataclass
@@ -512,12 +882,17 @@ class Assistant:
         transcript: Transcript,
         clock: Callable[[], float],
         context: ContextManager | None = None,
+        tools: Any = None,
     ) -> None:
         self._cfg = cfg
         self._bus = bus
         self._client = client
         self._transcript = transcript
         self._clock = clock
+        #: 2026-10-07 (capabilities): the `exocortex.capabilities.ToolRunner` (duck-typed: `wants`,
+        #: `specs`, `budget`, `run`, `map_text`). `None` -> no job ever gets tools, and every prompt
+        #: and request is exactly what it was before the capabilities existed.
+        self._tools = tools
         #: 2026-10-06: the context library + dynamic window. `None` -> a private, in-memory
         #: manager (no documents, the anchored window only), so every pre-existing caller and test
         #: that builds an `Assistant` with the old five arguments keeps working.
@@ -1622,18 +1997,12 @@ class Assistant:
         retried = False
         while True:
             try:
-                extra = None
-                if job.kind == "complete" and self._cfg.completion.repeat_penalty and self._cfg.completion.repeat_penalty != 1.0:
-                    extra = {"repeat_penalty": float(self._cfg.completion.repeat_penalty)}
-                text = self._stream_text(
-                    prepared.system, prepared.user, max_tokens=prepared.max_tokens, cancel=job.cancel,
-                    on_delta=on_delta, assistant_prefix=prepared.assistant_prefix,
-                    temperature=prepared.temperature, extra_body=extra,
-                )
+                text, sent_chars, stats = self._stream_answer(job, prepared, on_delta)
                 break
             except LLMError as exc:
                 if (
                     not retried and prepared.bundle is not None and delta_count == 0
+                    and job.tools_used == 0      # a tool that already ran must never run twice
                     and not job.cancel.is_set() and _OVERFLOW_RE.search(str(exc))
                 ):
                     # 2026-10-06: the server says the prompt did not fit its context -- the
@@ -1665,6 +2034,12 @@ class Assistant:
                 self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
                 self._bus.publish(ComponentStatusEvent(component="llm", state="error", detail=str(exc)))
                 return
+            except _NoAnswerError as exc:
+                # The tool loop's own verdict (not a server failure): the calls ran, nothing was written.
+                log.warning("assist job %d (%s): %s", job.id, job.kind, exc)
+                self._settle_plan_state(job, is_plan, "", keep=False)
+                self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
+                return
             except Exception as exc:  # noqa: BLE001 - surface any bug as a job error, never kill the worker
                 log.error("assist job %d (%s) failed unexpectedly: %s", job.id, job.kind, exc, exc_info=True)
                 self._settle_plan_state(job, is_plan, "", keep=False)
@@ -1673,8 +2048,7 @@ class Assistant:
                 self._bus.publish(AssistErrorEvent(job_id=job.id, message=str(exc)))
                 return
 
-        stats = self._client.last_stats
-        self._finish_usage(job, prepared, stats)
+        self._finish_usage(job, prepared, stats, sent_chars)
         self._queue_compaction(prepared.bundle)
 
         if not job.cancel.is_set() and prompts.is_skip(text):
@@ -1759,13 +2133,18 @@ class Assistant:
         except Exception:  # noqa: BLE001 - calibration must never break a job
             log.exception("assistant: calibrating the token estimate failed")
 
-    def _finish_usage(self, job: _AssistJob, prepared: _Prepared, stats: Any) -> None:
+    def _finish_usage(
+        self, job: _AssistJob, prepared: _Prepared, stats: Any, sent_chars: int | None = None,
+    ) -> None:
         """After the stream: calibrate from the server's count and publish the second
         `ContextUsageEvent` of the job -- the same estimates plus `prompt_tokens` / `cached_tokens`
         as the server reported them (None when it did not) and the post-calibration
         chars-per-token -- and hand it to the manager (`record_usage`, what the Models window's
-        usage panel reads back)."""
-        self._observe_prompt(self._sent_chars(prepared.system, prepared.user, prepared.assistant_prefix), stats)
+        usage panel reads back). `sent_chars` (the tool loop's) is the size of the LAST request
+        sent -- the one `stats.prompt_tokens` counts; None = the prepared prompt, as before."""
+        if sent_chars is None:
+            sent_chars = self._sent_chars(prepared.system, prepared.user, prepared.assistant_prefix)
+        self._observe_prompt(sent_chars, stats)
         bundle = prepared.bundle
         if bundle is None:
             return
@@ -1909,6 +2288,11 @@ class Assistant:
         # rest): the ask / question / focus, the <choices> block, the <previous> code (or the
         # insights' lists, the recap's notes), the project lookups, the tags.
         fixed = 200 + len(block) + len(previous) + len(prompt_question if spoken else job.focus) + len(extra)
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is not None:
+            # The room one tool result may take, and the <map> block: the transcript window is cut
+            # to leave them, so a result appended mid-answer still fits the server's context.
+            fixed += int(tool_ctx.budget.chars) + len(tool_ctx.map_text)
         bundle = self._build_context(
             job, question=self._lookup_question(job), screen_text=prompt_screen, since_id=since_id,
             until_id=until_id, max_tokens=max_tokens, system=system, fixed_chars=fixed,
@@ -1970,8 +2354,12 @@ class Assistant:
         `[assist].session_context` joins every one of them (config-only text, just as stable)."""
         persona = self._cfg.assist.persona
         context = self._cfg.assist.session_context
+        # 2026-10-07 (capabilities): with tools for this job the rule + the <tools> block end the
+        # prompt; without, no keyword is passed and the builders render exactly what they always did.
+        tool_ctx = self._job_tools(job)
+        extra: dict[str, str] = {"tools": tool_ctx.block} if tool_ctx is not None else {}
         if job.kind == "ask":
-            return prompts.system_ask(persona, context)
+            return prompts.system_ask(persona, context, **extra)
         if job.kind in ("solve", "code"):
             ex = self._cfg.explain
             level = prompts.normalize_comment_level(self._cfg.assist.comments)
@@ -1979,14 +2367,14 @@ class Assistant:
             return builder(
                 persona, explain=ex.enabled, comments=level,
                 language=self._cfg.assist.primary_language, libraries=self._cfg.assist.libraries,
-                context=context,
+                context=context, **extra,
             )
         if job.kind == "text":
-            return prompts.system_text(persona, context)
+            return prompts.system_text(persona, context, **extra)
         if job.kind == "explain":
             return prompts.system_explain(persona, context)
         if job.kind == "suggest":
-            return prompts.system_suggest(persona, context)
+            return prompts.system_suggest(persona, context, **extra)
         if job.kind == "insights":
             a = self._cfg.assist
             secs = job.sections or prompts.INSIGHT_SECTIONS
@@ -1994,7 +2382,56 @@ class Assistant:
         if job.kind == "recap":
             return prompts.system_recap(persona, context)
         # "auto", "manual", "screen"
-        return prompts.system_assist(persona, self._cfg.assist.style, context)
+        return prompts.system_assist(persona, self._cfg.assist.style, context, **extra)
+
+    def _job_tools(self, job: _AssistJob) -> _JobTools | None:
+        """The tool loop's state for `job`, resolved on first use and kept on the job (None = this
+        job gets no tools): the runner must `wants` the kind, list at least one tool and allow at
+        least one call. The budget is taken ONCE, so the "At most N calls" line of the system
+        prompt, the prompt rebuilt by the overflow retry and the loop all see the same one. Never
+        for "complete" / "explain". A runner that raises means no tools, not a failed job."""
+        if job.tool_ctx_resolved:
+            return job.tool_ctx
+        job.tool_ctx_resolved = True
+        runner = self._tools
+        if runner is None or job.kind in _NO_TOOL_KINDS:
+            return None
+        try:
+            if not runner.wants(job.kind):
+                return None
+            specs = list(runner.specs(job.kind))
+            budget = runner.budget(job.kind)
+            block = prompts.tools_block(specs, max_calls=budget.calls_left)
+            if not block or budget.calls_left <= 0:
+                return None
+            map_text = self._map_for_prompt(runner.map_text())
+        except Exception:  # noqa: BLE001 - tools are an extra: a broken runner must not break an answer
+            log.exception("assist job %d (%s): the tool runner failed; answering without tools", job.id, job.kind)
+            return None
+        job.tool_ctx = _JobTools(budget=budget, specs=specs, block=block, map_text=map_text)
+        return job.tool_ctx
+
+    def _map_for_prompt(self, text: str) -> str:
+        """The runner's map text for the ``<map>`` block, "" for no map (or `map_tokens` = 0).
+
+        The Engine already cut the text ONCE when it rendered the map, to
+        `[capabilities].map_tokens` x `[context].chars_per_token` characters -- the CONFIGURED
+        ratio, never the calibrated estimator -- so it is used verbatim here and the block is
+        byte-identical across jobs (the cached prefix of the user turn reaches into the transcript).
+        The cut below is only a safety net, at four times that figure, for a map file indexed under
+        a much larger `map_tokens`; it too uses the configured ratio, so it is just as stable."""
+        text = (text or "").strip()
+        if not text:
+            return ""
+        tokens = max(0, int(self._cfg.capabilities.map_tokens))
+        if tokens <= 0:
+            return ""
+        try:
+            ratio = float(self._cfg.context.chars_per_token)
+        except (TypeError, ValueError):
+            ratio = 4.0
+        limit = 4 * max(1, int(tokens * ratio))
+        return _head_lines(text, limit).strip() if len(text) > limit else text
 
     def _max_tokens_for(self, job: _AssistJob, choices: ChoiceSet | None = None) -> int:
         """The answer budget (`max_tokens`) of `job`; `choices` adds `CHOICES_TOKEN_HEADROOM` to the
@@ -2049,6 +2486,9 @@ class Assistant:
         block = choices_block(choices) if choices is not None else ""
         q = job.question if question is None else question
         ctx = {"reference": reference, "earlier": earlier, "lookup": lookup}
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is not None and tool_ctx.map_text:
+            ctx["map_text"] = tool_ctx.map_text         # 2026-10-07: the project map, after <earlier>
         if job.kind == "ask":
             return prompts.user_ask(window, q, screen_text, block, extra=extra, **ctx)
         if job.kind == "solve":
@@ -2617,6 +3057,327 @@ class Assistant:
                     if on_delta is not None:
                         on_delta(piece)
         return "".join(parts)
+
+    # ---- the tool loop (2026-10-07, capabilities) --------------------------------------
+
+    def _stream_answer(
+        self, job: _AssistJob, prepared: _Prepared, on_delta: Callable[[str], None],
+    ) -> tuple[str, int, StreamStats | None]:
+        """Stream one assist job's answer: `(visible text, characters of the LAST request sent,
+        stats of the stream)` -- the last request is what `stats.prompt_tokens` counts, so it is
+        what `_finish_usage` / `_observe_prompt` pair it with.
+
+        A job without tools (no runner, a kind the runner does not cover, "complete" / "explain")
+        gets the plain `_stream_text` call, the very request it always sent. A job with tools runs
+        the loop (`_run_tool_loop`): the visible text is all that reaches `on_delta`, the history,
+        the plan and `AssistDoneEvent`; the calls and their results live in the continuation only."""
+        tool_ctx = self._job_tools(job)
+        if tool_ctx is None or prepared.assistant_prefix is not None:
+            extra = None
+            if job.kind == "complete" and self._cfg.completion.repeat_penalty and self._cfg.completion.repeat_penalty != 1.0:
+                extra = {"repeat_penalty": float(self._cfg.completion.repeat_penalty)}
+            text = self._stream_text(
+                prepared.system, prepared.user, max_tokens=prepared.max_tokens, cancel=job.cancel,
+                on_delta=on_delta, assistant_prefix=prepared.assistant_prefix,
+                temperature=prepared.temperature, extra_body=extra,
+            )
+            sent = self._sent_chars(prepared.system, prepared.user, prepared.assistant_prefix)
+            return text, sent, self._client.last_stats
+        return self._run_tool_loop(job, prepared, tool_ctx, on_delta)
+
+    def _run_tool_loop(
+        self, job: _AssistJob, prepared: _Prepared, tool_ctx: _JobTools, on_delta: Callable[[str], None],
+    ) -> tuple[str, int, StreamStats | None]:
+        """The tool loop. Each pass streams one request: a `_ToolSplitter` publishes the visible
+        text and holds back a call; when the stream ends with a call (`<tool>` opening a line, or
+        following prose on its line with a complete JSON object; the server stops the pass at
+        the closing tag, `</tool>` being a stop string of every call pass) it is parsed, run by the
+        runner under the policy and appended to the conversation as a USER turn carrying its
+        `<result>` block, after which a fresh assistant turn is opened and the model continues
+        (raw path: `_raw_prompt`, every request a byte-for-byte extension of the previous one plus
+        the text the model generated, so the server's KV cache holds all but the new turn; chat
+        path: two messages appended). It ends when a pass writes no call:
+
+        - a malformed call is told so (the first is free, later ones cost a call);
+        - the call that spends the last one (or the time budget) gets "(no calls left ...)" and the
+          next pass runs without the call stop, so a call it still writes is cut there;
+        - a first pass that only SAYS it will look something up ("Let me check ...", `_announces_lookup`)
+          is re-streamed once with the call opened for it, the narration dropped from the answer;
+        - a pass that writes nothing after tools ran (whatever lead-in came before its call) gets one
+          more pass, then an error."""
+        from exocortex.capabilities import ToolCall      # lazy: the loop is the only user
+
+        runner = self._tools
+        budget = tool_ctx.budget
+        raw = self._cfg.llm.thinking != "on"
+        initial_calls = max(1, int(budget.calls_left))
+        hard_cap = 2 * initial_calls + 2        # a net under a runner that never charges a repeated call
+        write_hops = job.kind == "ask" and bool(_WRITE_TOOLS & set(budget.allowed))
+        steps: list[_ToolStep] = []
+        answer = ""
+        all_stats: list[StreamStats] = []
+        sent_chars = 0
+        calls = 0                               # ToolCallEvents published (their 1-based index)
+        malformed = 0
+        forced_used = blank_used = False
+        forced_lead: str | None = None          # next pass: the narration the call is forced after
+        blank = False                           # next pass: the "write the answer" retry
+        final = False                           # no more calls: the next pass has no call stop
+        hop = 0
+        while not job.cancel.is_set():
+            hop += 1
+            if not final and (budget.calls_left <= 0 or time.monotonic() >= budget.deadline):
+                final = True
+            # The SERVER stops a call pass at the closing tag: the tag's tokens stay in the slot's
+            # cache, the request completes normally, and the continuation (an extension of this
+            # very text) lands on the same slot. The answer pass, which may make no call, stops at
+            # an opening tag instead. 2026-10-08, from the owner's first live session: the client-
+            # side cut this replaces turned every hop into a cancelled request -- the server
+            # noticed the dropped connection only after the NEXT request had been handed the other
+            # slot, which re-evaluated the whole prompt (2998 tokens, 3 s on the 27B) every hop.
+            # A `</tool>` the model writes in its own prose now cuts the answer there: accepted,
+            # the rule tells it never to mention the tools.
+            stop = list(prompts.STOP) + [prompts.TOOL_OPEN if final else prompts.TOOL_CLOSE]
+            max_tokens = prepared.max_tokens
+            if write_hops and not final:
+                max_tokens = max(max_tokens, _WRITE_HOP_MIN_TOKENS)      # a write_file call carries a body
+            forced, forced_lead = forced_lead, None
+            was_blank, blank = blank, False
+            splitter, stats, sent = self._stream_hop(
+                job, prepared, steps, on_delta, raw=raw, stop=stop, max_tokens=max_tokens,
+                cut_on_call=final, forced_lead=forced, blank=was_blank,
+            )
+            sent_chars = sent
+            if stats is not None:
+                all_stats.append(stats)
+            visible, held = splitter.visible, splitter.held
+            reason = str(getattr(stats, "finish_reason", "") or "")
+            if job.cancel.is_set():
+                answer += visible if forced is None else ""
+                break
+
+            if held is None or final:
+                # No call (or one when none may be made: the stream was cut at it, its visible part kept).
+                if (
+                    held is None and hop == 1 and not forced_used and not steps and not final
+                    and _announces_lookup(visible)
+                ):
+                    forced_used = True
+                    forced_lead = visible if visible.endswith("\n") else visible + "\n"
+                    log.info("assist job %d (%s): narration without a tool call; forcing one", job.id, job.kind)
+                    continue
+                if steps and not visible.strip():      # judge THIS pass: `answer` already holds the lead-ins
+                    if blank_used:
+                        raise _NoAnswerError(f"the model made {calls} tool call(s) but wrote no answer")
+                    blank_used = blank = final = True      # (a blank pass's text is dropped: the retry lacks it)
+                    log.info("assist job %d (%s): blank answer after %d call(s); asking once more", job.id, job.kind, calls)
+                    continue
+                answer += visible
+                if forced is not None and not answer.strip():
+                    answer = forced.rstrip("\n")       # the loop forced a call it could not get: keep the narration
+                break
+
+            # ---- the pass ended with a call
+            if forced is not None and not held[len(prompts.TOOL_OPEN):].strip():
+                answer += forced.rstrip("\n")          # asked for a call, the model declined: the narration is its answer
+                break
+            lead = forced if forced is not None else visible
+            if forced is None:
+                answer += visible
+            payload: str | None
+            parsed: tuple[str, dict[str, Any]] | str
+            if reason == "length":
+                payload, parsed = None, "the call was cut off by the length limit"
+            else:
+                # The stream was abandoned at the closing tag or at the end of the JSON object; a
+                # call with no complete object is read as written: whatever follows the marker.
+                payload = prompts.find_tool_call(held)
+                if payload is None:
+                    payload = held[len(prompts.TOOL_OPEN):]
+                parsed = prompts.parse_tool_call(payload)
+            if isinstance(parsed, str):
+                malformed += 1
+                shown = (payload if payload is not None else held[len(prompts.TOOL_OPEN):]).strip()[:300]
+                step = _ToolStep(
+                    lead, shown, "tool",
+                    f'(the call could not be parsed: {parsed}. Write exactly: '
+                    f'<tool>{{"name": ..., "args": {{...}}}}</tool>)',
+                    sanitize=False,
+                )
+                if malformed > 1:
+                    budget.calls_left -= 1             # the first malformed call is free, the others count
+                if budget.calls_left <= 0:
+                    step.note = _NO_CALLS_LEFT
+                    final = True
+                steps.append(step)
+                log.info("assist job %d (%s): malformed tool call #%d: %s", job.id, job.kind, malformed, parsed)
+                continue
+
+            name, args = parsed
+            calls += 1
+            summary = _call_summary(args)
+            self._bus.publish(ToolCallEvent(job_id=job.id, index=calls, name=name, summary=summary, state="running"))
+            if job.cancel.is_set():                    # last look before anything runs
+                self._bus.publish(ToolCallEvent(
+                    job_id=job.id, index=calls, name=name, summary=summary, state="error", detail="cancelled"))
+                break
+            started = time.monotonic()
+            if started >= budget.deadline:
+                out = _Outcome("denied: the time for tool calls in this answer is used up", "denied",
+                               "time budget used up", summary)
+            else:
+                job.tools_used += 1
+                try:
+                    out = _outcome(runner.run(
+                        ToolCall(name=name, args=args, raw=payload or ""), budget=budget, cancel=job.cancel))
+                except Exception as exc:  # noqa: BLE001 - `run` never raises; a fake or a bug must not kill the answer
+                    log.exception("assist job %d (%s): tool %s raised", job.id, job.kind, name)
+                    out = _Outcome(f"error: {exc}", "error", str(exc)[:120], summary)
+            elapsed = time.monotonic() - started
+            detail = out.detail or (_one_line(out.text) if out.state != "done" else "")
+            self._bus.publish(ToolCallEvent(
+                job_id=job.id, index=calls, name=name, summary=_one_line(out.summary, 120) or summary,
+                state=out.state, detail=detail[:200], elapsed_s=elapsed))
+            log.info("assist job %d (%s): tool %s %s (%s) in %.2fs", job.id, job.kind, name, out.state, summary, elapsed)
+            step = _ToolStep(lead, (payload or "").strip(), name, out.text)
+            if budget.calls_left <= 0 or time.monotonic() >= budget.deadline or calls >= hard_cap:
+                step.note = _NO_CALLS_LEFT
+                final = True
+            steps.append(step)
+        return answer, sent_chars, self._merge_stats(all_stats)
+
+    def _stream_hop(
+        self, job: _AssistJob, prepared: _Prepared, steps: list[_ToolStep], on_delta: Callable[[str], None], *,
+        raw: bool, stop: list[str], max_tokens: int, cut_on_call: bool, forced_lead: str | None, blank: bool,
+    ) -> tuple[_ToolSplitter, StreamStats | None, int]:
+        """One request of the loop, streamed through a fresh `_ToolSplitter`: returns the splitter
+        (`visible` / `held`), the stream's stats and the characters sent. A pass after a tool ran
+        whose request the server rejects as too long is retried ONCE with the oldest result's body
+        dropped (`_RESULT_DROPPED`); the first pass has no result to drop -- its overflow goes to
+        `_run_assist_job`'s own retry, which only ever runs when no tool has."""
+        retried = False
+        while True:
+            splitter = _ToolSplitter(on_delta, held=prompts.TOOL_OPEN if forced_lead is not None else None)
+            try:
+                stats, sent = self._send_hop(
+                    job, prepared, steps, splitter, raw=raw, stop=stop, max_tokens=max_tokens,
+                    cut_on_call=cut_on_call, forced_lead=forced_lead, blank=blank,
+                )
+                return splitter, stats, sent
+            except LLMError as exc:
+                droppable = next((s for s in steps if not s.dropped), None)
+                if (
+                    steps and droppable is not None and not retried and not splitter.published
+                    and not job.cancel.is_set() and _OVERFLOW_RE.search(str(exc))
+                ):
+                    droppable.dropped = True
+                    retried = True
+                    log.warning("assist job %d (%s): the continuation overflowed the server's context (%s); "
+                                "dropping the oldest tool result and retrying the pass once", job.id, job.kind, exc)
+                    self._note_overflow()
+                    continue
+                raise
+
+    def _send_hop(
+        self, job: _AssistJob, prepared: _Prepared, steps: list[_ToolStep], splitter: _ToolSplitter, *,
+        raw: bool, stop: list[str], max_tokens: int, cut_on_call: bool, forced_lead: str | None, blank: bool,
+    ) -> tuple[StreamStats | None, int]:
+        """Send the continuation as it stands and feed the splitter; `(stats, characters sent)`.
+        The server's stop strings end a pass (`_run_tool_loop`); the stream is abandoned client-side
+        only as a fallback: a server that ignored the stop string (`</tool>` seen in the held text),
+        a model that forgot the closing tag and wrote on past its JSON object
+        (`_forgot_closing_tag`), or, with `cut_on_call` (no calls left), a call that starts anyway."""
+        if raw:
+            prompt = self._raw_prompt(prepared, steps, forced_lead, blank)
+            sent = len(prompt)
+            stream = self._client.stream_completion(prompt, max_tokens=max_tokens, stop=stop, cancel=job.cancel)
+        else:
+            messages = self._chat_messages(prepared, steps, forced_lead, blank)
+            sent = sum(len(m["content"]) for m in messages)
+            stream = self._client.stream_chat(messages, max_tokens=max_tokens, cancel=job.cancel, stop=stop)
+        try:
+            for item in stream:
+                piece = item if raw else item.content
+                if not piece:
+                    continue
+                splitter.feed(piece)
+                if splitter.held is not None and (
+                    cut_on_call or prompts.TOOL_CLOSE in splitter.held or _forgot_closing_tag(splitter.held)
+                ):
+                    break
+        finally:
+            close = getattr(stream, "close", None)
+            if callable(close):
+                close()                    # lets the client's stream finish (and record its stats) now
+        splitter.finish()
+        return self._client.last_stats, sent
+
+    @staticmethod
+    def _raw_prompt(prepared: _Prepared, steps: list[_ToolStep], forced_lead: str | None, blank: bool) -> str:
+        """The raw-path prompt of a pass. The first assistant turn carries `NO_THINK_PREFIX` and
+        the text + call the model wrote; each result then comes back as a USER turn (its <result>
+        block) and a fresh assistant turn, again with `NO_THINK_PREFIX`, is opened for the model to
+        continue in -- the shape chat models are trained on: a tool's reply is a message TO the
+        model, never text inside its own turn. 2026-10-08, the owner's first live session: results
+        appended inside the assistant turn made the Qwen model end its turn right after them (one
+        token, end of text, on the continuation AND on the retry) -- the "made 1 tool call(s) but
+        wrote no answer" failure. Every prompt is a byte-for-byte extension of the previous request
+        plus what the model generated, so the server's KV cache holds all but the new turn.
+        `forced_lead` opens a call after the narration it follows (a first pass without a call);
+        `blank` is the answer retry: a nudge inside the last result block."""
+        prompt = prompts.render_chatml(prepared.system, prepared.user, prompts.NO_THINK_PREFIX)
+        last = len(steps) - 1
+        for i, s in enumerate(steps):
+            block = s.block(nudge=_CHAT_WRITE_ANSWER if blank and i == last else "")
+            prompt += (
+                f"{s.call_text()}{prompts.IM_END}\n"
+                f"{prompts.IM_START}user\n{block.strip(chr(10))}{prompts.IM_END}\n"
+                f"{prompts.IM_START}assistant\n{prompts.NO_THINK_PREFIX}"
+            )
+        if forced_lead is not None:
+            prompt += forced_lead + prompts.TOOL_OPEN
+        return prompt
+
+    @staticmethod
+    def _chat_messages(
+        prepared: _Prepared, steps: list[_ToolStep], forced_lead: str | None, blank: bool,
+    ) -> list[dict[str, str]]:
+        """The chat-path messages of a pass: system, user, then per call an assistant message (the
+        visible lead and the call) and a user message (the result block) -- the same turns the raw
+        path renders. A chat API cannot prefill an assistant turn, so the two retries ask in words:
+        the forced call as a user message of its own, the answer nudge inside the last result block
+        (roles must keep alternating for strict templates)."""
+        messages = [
+            {"role": "system", "content": prepared.system},
+            {"role": "user", "content": prepared.user},
+        ]
+        last = len(steps) - 1
+        for i, s in enumerate(steps):
+            messages.append({"role": "assistant", "content": s.call_text()})
+            block = s.block(nudge=_CHAT_WRITE_ANSWER if blank and i == last else "")
+            messages.append({"role": "user", "content": block.strip("\n")})
+        if forced_lead is not None:
+            messages.append({"role": "assistant", "content": forced_lead.rstrip()})
+            messages.append({"role": "user", "content": _CHAT_FORCE_CALL})
+        return messages
+
+    @staticmethod
+    def _merge_stats(stats: list[StreamStats]) -> StreamStats | None:
+        """One `StreamStats` for a whole loop: the FIRST stream's time to first token (what the
+        reader waited for), the tokens and times of every stream summed, and the LAST stream's
+        prompt / cached tokens, finish reason and cancelled flag. One stream is returned as is."""
+        if not stats:
+            return None
+        if len(stats) == 1:
+            return stats[0]
+        first, last = stats[0], stats[-1]
+        tokens = sum(s.tokens for s in stats)
+        elapsed = sum(s.elapsed_s for s in stats)
+        gen_time = sum(max(s.elapsed_s - s.ttft_s, 0.0) if s.tokens > 1 else s.elapsed_s for s in stats)
+        return dataclasses.replace(
+            last, ttft_s=first.ttft_s, tokens=tokens, elapsed_s=elapsed,
+            tok_per_s=tokens / gen_time if gen_time > 0 else 0.0,
+        )
 
     # ---- auto mode (bus-listener + coalesce timer) --------------------------------
 

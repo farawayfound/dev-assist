@@ -15,6 +15,7 @@ from __future__ import annotations
 import dataclasses
 import logging
 import os
+import re
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
@@ -596,6 +597,123 @@ class ContextConfig:
     auto_calibrate: bool = True
 
 
+#: 2026-10-07 (capabilities): the commands the model may run by default
+#: (``[capabilities].allowed_commands`` and the Capabilities tab's "Restore safe list"). Read-only
+#: by construction, or taking no path at all. An entry matches the whole command or the command's
+#: first words (``entry + " "``); the ARGUMENTS still pass the runner's argument gate
+#: (``exocortex.capabilities``: every path must sit inside a readable folder, no chaining /
+#: redirection, a flag deny-list, no wildcard for anything but a lister, git run with hooks and
+#: external tools off and limited to the folder it runs in). Deliberately absent: the content
+#: readers (``type`` ``cat`` ``head`` ``tail`` ``more`` ``findstr`` ``grep`` ``rg`` ``wc``), which
+#: leaked around the read scope through wildcards, switches and recursion -- the scoped
+#: ``read_file`` / ``search_text`` tools do what they did; a user can still add one by hand and the
+#: gate stays on. Also absent: any interpreter entry (``python -c`` is arbitrary code that passes
+#: every character filter) and every test / build runner (``pytest`` imports the repo's
+#: ``conftest.py``). The listers may list the NAMES of excluded files. The list is a guard against
+#: accidents, not a sandbox; ``allow_all_commands`` is the explicit opt-in that lifts it.
+SAFE_COMMANDS: tuple[str, ...] = (
+    "dir", "ls", "tree", "where", "which", "pwd", "hostname", "whoami", "ver", "date", "tasklist", "systeminfo",
+    "git status", "git log", "git diff", "git show", "git branch", "git blame", "git ls-files",
+    "git remote -v", "git stash list", "git describe", "git rev-parse",
+    "python --version", "pip list", "pip show", "pip --version", "node --version", "npm ls",
+    "npm --version", "dotnet --version", "cargo --version", "go version", "java -version",
+    "rustc --version",
+)
+
+#: Names / patterns (fnmatch, case-insensitive, matched against every component of a path
+#: relative to its readable folder) the model never reads, lists, searches or indexes.
+DEFAULT_READ_EXCLUDE: tuple[str, ...] = (
+    ".git", "node_modules", "__pycache__", ".venv", "venv", ".tox", ".mypy_cache", ".pytest_cache",
+    "dist", "build", "*.pyc", ".env", ".env.*", "*.pem", "*.key", "*.crt", "*.p12", "*.pfx", "*.kdbx",
+    "*.kdb", "id_rsa*", "id_ed25519*", "id_ecdsa*", "*.ppk", ".ssh", ".aws", ".kube", ".docker",
+    ".gnupg", ".npmrc", ".pypirc", ".netrc", ".git-credentials", "*.ovpn", "credentials*", "secrets*",
+    "*.token", "*.sqlite", "*.db",
+)
+
+#: Patterns the model never writes, on top of ``read_exclude`` and the app's own folders
+#: (config.toml, the model library, the context library, the maps, the sessions -- those are
+#: protected by the runner and cannot be removed here).
+DEFAULT_EDIT_EXCLUDE: tuple[str, ...] = (
+    ".git", "*.bat", "*.cmd", "*.ps1", "*.vbs", "*.exe", "*.dll", "*.lnk", "*.sys",
+)
+
+
+@dataclass
+class CapabilitiesConfig:
+    """What the model may do on its own to gather context (2026-10-07, the Models window's
+    "Capabilities" tab -- see SPEC.md "Capabilities: tool use, scoped file / command / web / MCP
+    access, project maps").
+
+    Five switches, each with its scope: **read files** (the folders below, recursively), **edit
+    files** (the edit folders), **execute commands** (the allowed list, or everything), **fetch
+    web content** (search + fetch within the domain lists) and **MCP servers** (the configured
+    servers' tools). When a job's kind is covered (``apply_to``) its system prompt lists the tools
+    it may call and the prompt runs a tool loop: the model writes a one-line call, the app runs it
+    under this policy, appends the result and the model continues (``exocortex.llm.assistant``).
+
+    **Trust tiers.** Only the ask box carries text the user typed; every other kind answers the
+    OTHER speaker (auto, manual) or the screen's OCR (screen, suggest, solve, code, text). So the
+    read tools (``read_file`` / ``list_dir`` / ``find_files`` / ``search_text``) serve every
+    covered kind, while the active tools (``write_file`` / ``edit_file`` / ``run_command`` /
+    ``fetch_url`` / ``web_search`` / the MCP tools) serve the ask box ONLY -- enforced by the
+    runner, not just the prompt. With no readable folder configured no tool is offered at all (a
+    fresh install's prompts are byte-identical to before this section existed).
+
+    Every value is read live. The ``mcp`` entries are an array of inline tables:
+    ``[{ name = "fs", transport = "stdio", command = "npx", args = ["-y", "..."], env = {},
+    enabled = true }]`` (``transport = "http"`` uses ``url`` instead of ``command`` / ``args``).
+    """
+    read_files: bool = True
+    edit_files: bool = False
+    execute_commands: bool = True
+    fetch_web: bool = False
+    mcp_servers: bool = False
+    # Which kinds may use tools at all: "questions" = auto / manual / ask / screen (read tools for
+    # the first three, everything for ask); "ask" = the ask box only; "all" = also suggest / solve
+    # / code / text (read tools). Never inline completions or explanations.
+    apply_to: str = "questions"
+    # Limits for the ask box (the user typed it; a longer wait is acceptable) ...
+    max_tool_calls: int = 4            # per answer
+    tool_result_chars: int = 6000      # one result is cut here before it joins the prompt
+    tool_time_s: float = 30.0          # the WHOLE loop (tools + model hops) per answer; after it, the answer
+    # ... and for the live kinds (auto / manual / screen / suggest / solve / code / text), where
+    # every tool hop delays an answer someone is waiting for.
+    live_max_tool_calls: int = 2
+    live_tool_result_chars: int = 2500
+    live_tool_time_s: float = 10.0
+    # ---- read files ----
+    read_roots: list[str] = field(default_factory=list)       # folders readable recursively; empty = no tools
+    read_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_READ_EXCLUDE))
+    read_max_file_chars: int = 20000   # a longer file is cut (the rest dropped, with a note)
+    # ---- edit files ----
+    edit_roots: list[str] = field(default_factory=list)
+    edit_exclude: list[str] = field(default_factory=lambda: list(DEFAULT_EDIT_EXCLUDE))
+    edit_backup: bool = True           # copy the original into <session>/edits/ before every change
+    # ---- execute commands ----
+    allowed_commands: list[str] = field(default_factory=lambda: list(SAFE_COMMANDS))
+    allow_all_commands: bool = False   # explicit opt-in: lifts the allowlist, the chaining filter and the path gate
+    command_timeout_s: float = 15.0
+    command_output_chars: int = 6000
+    command_cwd: str = ""              # "" = the first readable folder (a command needs one; must sit inside one)
+    # ---- fetch web content ----
+    web_allowed_domains: list[str] = field(default_factory=list)   # empty = any public host; "example.com" matches its subdomains
+    web_blocked_domains: list[str] = field(default_factory=list)
+    web_allow_local: bool = False      # loopback / private / link-local / CGNAT addresses are refused unless on
+    web_max_fetches: int = 3           # fetches + searches per answer
+    web_page_chars: int = 8000
+    web_timeout_s: float = 10.0
+    web_search_url: str = "https://html.duckduckgo.com/html/?q={query}"
+    web_search_results: int = 5
+    # ---- MCP servers ----
+    mcp: list[dict[str, Any]] = field(default_factory=list)
+    mcp_timeout_s: float = 20.0
+    # ---- maps ----
+    maps_dir: str = ""                 # "" = <models_dir>/maps
+    active_map: str = ""               # the map loaded last (its name); "" = none
+    map_max_files: int = 4000          # a bigger tree is cut (files beyond this are counted, not listed)
+    map_tokens: int = 800              # budget of the <map> block in the prompt
+
+
 @dataclass
 class UIConfig:
     opacity: float = 0.93
@@ -832,6 +950,7 @@ class Config:
     context: ContextConfig = field(default_factory=ContextConfig)
     monitor: MonitorConfig = field(default_factory=MonitorConfig)
     optimize: OptimizeConfig = field(default_factory=OptimizeConfig)
+    capabilities: CapabilitiesConfig = field(default_factory=CapabilitiesConfig)
     ui: UIConfig = field(default_factory=UIConfig)
     hotkeys: HotkeysConfig = field(default_factory=HotkeysConfig)
     paths: PathsConfig = field(default_factory=PathsConfig)
@@ -854,6 +973,13 @@ class Config:
         if self.context.dir:
             return Path(self.context.dir).expanduser()
         return self.models_dir() / "context"
+
+    def maps_dir(self) -> Path:
+        """Where the project maps the Capabilities tab indexes live (``[capabilities].maps_dir``,
+        empty = ``<models_dir>/maps``) -- persists across sessions like the model library."""
+        if self.capabilities.maps_dir:
+            return Path(self.capabilities.maps_dir).expanduser()
+        return self.models_dir() / "maps"
 
 
 def project_root() -> Path:
@@ -880,11 +1006,27 @@ def _apply(section_obj: Any, data: dict[str, Any], section_name: str) -> None:
             continue
         cur = getattr(section_obj, k)
         if isinstance(cur, bool):
-            v = bool(v)
+            # 2026-10-07 (capabilities): bool("false") is True -- a wrong type here used to fail
+            # OPEN (e.g. allow_all_commands = "false" switching the allowlist off). Only a real
+            # bool (or 0 / 1) is accepted; anything else keeps the default and warns.
+            if isinstance(v, bool):
+                pass
+            elif isinstance(v, int) and v in (0, 1):
+                v = bool(v)
+            else:
+                log.warning("config: [%s].%s expects true/false, got %r; default kept", section_name, k, v)
+                continue
         elif isinstance(cur, int) and isinstance(v, (int, float)):
             v = int(v)
         elif isinstance(cur, float) and isinstance(v, (int, float)):
             v = float(v)
+        elif isinstance(cur, list) and not isinstance(v, list):
+            # a str would be iterated character by character by anything that walks the list
+            log.warning("config: [%s].%s expects a list, got %r; default kept", section_name, k, v)
+            continue
+        elif isinstance(cur, dict) and not isinstance(v, dict):
+            log.warning("config: [%s].%s expects a table, got %r; default kept", section_name, k, v)
+            continue
         setattr(section_obj, k, v)
 
 
@@ -1021,17 +1163,52 @@ def load_config(path: str | os.PathLike[str] | None = None) -> Config:
     return cfg
 
 
+_BARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _toml_string(s: str) -> str:
+    """A TOML basic string: backslash and quote escaped, and (2026-10-07) every control character
+    too -- a raw newline, CR or DEL inside a value (an MCP env value, a command, a map name) used
+    to write a file ``tomllib`` refuses, which bricked the next launch."""
+    out: list[str] = []
+    for ch in s:
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif ch == "\n":
+            out.append("\\n")
+        elif ch == "\r":
+            out.append("\\r")
+        elif ch == "\t":
+            out.append("\\t")
+        elif ord(ch) < 0x20 or ch == "\x7f":
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _toml_key(k: Any) -> str:
+    """A table key: bare when it can be, quoted otherwise (``ProgramFiles(x86)``, ``a.b``, ``A B``
+    are all legal env-variable names that a bare key would mis-write or split)."""
+    key = str(k)
+    return key if _BARE_KEY_RE.match(key) else _toml_string(key)
+
+
 def _toml_value(v: Any) -> str:
+    if v is None:
+        return '""'
     if isinstance(v, bool):
         return "true" if v else "false"
     if isinstance(v, (int, float)):
         return repr(v)
     if isinstance(v, str):
-        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+        return _toml_string(v)
     if isinstance(v, (list, tuple)):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     if isinstance(v, dict):
-        return "{ " + ", ".join(f"{k} = {_toml_value(x)}" for k, x in v.items()) + " }"
+        return "{ " + ", ".join(f"{_toml_key(k)} = {_toml_value(x)}" for k, x in v.items()) + " }"
     raise TypeError(f"unsupported TOML value: {v!r}")
 
 
@@ -1060,7 +1237,71 @@ def save_config(cfg: Config, path: str | os.PathLike[str] | None = None) -> Path
     return p
 
 
+_SECRET_WORD = r"(?:token|key|secret|passw(?:or)?d|passwd|pwd|auth|bearer|credential)"
+_SECRET_QUERY_RE = re.compile(rf"(?i)([?&][^=&#]*{_SECRET_WORD}[^=&#]*=)[^&#]*")
+_USERINFO_RE = re.compile(r"(?i)\b([a-z][a-z0-9+.\-]*://[^/\s:@?#]*:)[^/\s@?#]+(@)")      # scheme://user:PASS@host
+_SECRET_FLAG_RE = re.compile(rf"(?i)^-{{1,2}}[^=\s]*{_SECRET_WORD}[^=\s]*$")             # --api-key  (the value is the NEXT argument)
+_SECRET_FLAG_EQ_RE = re.compile(rf"(?i)^(-{{1,2}}[^=\s]*{_SECRET_WORD}[^=\s]*=).*$", re.S)   # --token=VALUE
+
+
+def _redact_text(s: str) -> str:
+    """`s` with the secret parts of a url / connection string blanked: the password of
+    ``scheme://user:PASS@host`` and the value of a ``?token=...`` style query parameter. Best
+    effort (2026-10-07, capabilities); shared by ``session.json`` and the Capabilities tab."""
+    return _SECRET_QUERY_RE.sub(r"\1***", _USERINFO_RE.sub(r"\1***\2", s))
+
+
+def _redact_args(args: Any) -> list[str]:
+    """A command's arguments with the secrets blanked: the value of ``--api-key VALUE`` (the next
+    argument) and of ``--token=VALUE``, and the secret parts of any url / connection string. Only
+    the secret is replaced (by ``***``), never the whole argument, so the rest stays readable."""
+    out: list[str] = []
+    mask_next = False
+    for a in map(str, args):
+        if mask_next:
+            out.append("***")
+            mask_next = False
+        elif _SECRET_FLAG_EQ_RE.match(a):
+            out.append(_SECRET_FLAG_EQ_RE.sub(r"\1***", a))
+        elif _SECRET_FLAG_RE.match(a):
+            out.append(a)
+            mask_next = True
+        else:
+            out.append(_redact_text(a))
+    return out
+
+
+def _redact_mcp_spec(spec: dict[str, Any]) -> dict[str, Any]:
+    """An MCP server entry with its secrets blanked: every ``env`` (and ``headers``) value becomes
+    ``"***"``, the url's userinfo password and token-like query values likewise, and so do the
+    values of secret-named command-line flags and the secret parts of url-like arguments (2026-10-07,
+    capabilities). Best effort -- put a secret in ``env``, not in ``args``."""
+    out = dict(spec)
+    for table in ("env", "headers"):
+        val = out.get(table)
+        if isinstance(val, dict):
+            out[table] = {str(k): "***" for k in val}
+    url = out.get("url")
+    if isinstance(url, str) and url:
+        out["url"] = _redact_text(url)
+    args = out.get("args")
+    if isinstance(args, (list, tuple)):
+        out["args"] = _redact_args(args)
+    return out
+
+
 def config_as_dict(cfg: Config) -> dict[str, Any]:
+    """The whole config as plain data -- what ``session.json`` records. 2026-10-07: the MCP
+    server entries are redacted (their ``env`` values, url passwords and tokens, secret-named
+    flag values and url-like arguments) and so is the web search url's query, so an exported
+    session does not carry an API key (best effort); ``to_toml`` (the config file itself) is
+    unaffected."""
     d = dataclasses.asdict(cfg)
     d.pop("path", None)
+    caps = d.get("capabilities")
+    if isinstance(caps, dict):
+        if isinstance(caps.get("mcp"), list):
+            caps["mcp"] = [_redact_mcp_spec(s) if isinstance(s, dict) else s for s in caps["mcp"]]
+        if isinstance(caps.get("web_search_url"), str):
+            caps["web_search_url"] = _redact_text(caps["web_search_url"])
     return d

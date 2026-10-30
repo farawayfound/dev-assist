@@ -245,17 +245,32 @@ class _HTMLText(html.parser.HTMLParser):
         self.parts.append(data if self._pre_depth else re.sub(r"\s+", " ", data))
 
 
+#: ``HTMLParser.close()`` rescans an unterminated tag from every later position (quadratic: a 32 KiB
+#: run of ``<a `` takes half a minute), while ``feed()`` is linear. A tail this long is one tag or
+#: comment that never ended, which HTML5 drops at the end of the input too, so ``close()`` is skipped.
+_MAX_OPEN_TAIL = 4096
+
+
 def _html_to_text(raw: str) -> str:
     parser = _HTMLText()
     try:
         parser.feed(raw)
-        parser.close()
+        if len(parser.rawdata) <= _MAX_OPEN_TAIL:
+            parser.close()
     except Exception as exc:  # noqa: BLE001 - html.parser is lenient; a crash must still surface as ContextError
         raise ContextError(f"could not parse the HTML: {exc}") from exc
     text = "".join(parser.parts)
     lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in text.split("\n")]
     lines = [re.sub(r"^\|\s*", "", ln) for ln in lines]  # a table row starts with its first cell's " | "
     return "\n".join(lines)
+
+
+def html_to_text(raw: str) -> str:
+    """HTML -> readable markdown-ish text (headings, list items, table cells kept; scripts and
+    styles dropped). The public name of :func:`_html_to_text` (2026-10-07, capabilities:
+    ``exocortex.webfetch`` turns a fetched page into text with it). Raises
+    :class:`ContextError` when the parser fails."""
+    return _html_to_text(raw)
 
 
 _W = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"

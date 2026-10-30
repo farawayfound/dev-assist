@@ -56,6 +56,7 @@ from exocortex.bus import (
     AssistStartedEvent,
     AudioLevelEvent,
     AutoAssistChangedEvent,
+    CapabilityMapEvent,
     CheckpointEvent,
     CompletionEvent,
     CompletionModeEvent,
@@ -70,6 +71,7 @@ from exocortex.bus import (
     HandsFreeEvent,
     InsightsUpdatedEvent,
     ManualAdvanceEvent,
+    McpToolsEvent,
     ModelInfoEvent,
     ModelLibraryEvent,
     ModelPullEvent,
@@ -81,6 +83,7 @@ from exocortex.bus import (
     ScreenTextEvent,
     SessionEvent,
     SpeakerRenamedEvent,
+    ToolCallEvent,
     drain,
 )
 from exocortex.config import Config
@@ -739,6 +742,7 @@ class OverlayWindow(QWidget):
 
         self.toast = QLabel("", self)
         self.toast.setObjectName("toast")
+        self.toast.setTextFormat(Qt.TextFormat.PlainText)   # a map's name / an engine error is not markup
         self.toast.hide()
 
         self._edge_grips = [
@@ -993,6 +997,8 @@ class OverlayWindow(QWidget):
         menu.addAction("Models…").triggered.connect(lambda: self.open_models())
         # 2026-10-06: the reference-document library lives on the Models window's Context tab.
         menu.addAction("Context documents…").triggered.connect(lambda: self.open_models("Context"))
+        # 2026-10-07: what the model may do on its own (files / commands / web / MCP) and the maps.
+        menu.addAction("Capabilities…").triggered.connect(lambda: self.open_models("Capabilities"))
 
     # ---------------------------------------------------------------- settings ---------
     def open_settings(self, tab: str | None = None) -> None:
@@ -1015,7 +1021,8 @@ class OverlayWindow(QWidget):
 
     def open_models(self, tab: str | None = None) -> None:
         """Show the (non-modal) Models window, reusing it if it is already open. ``tab`` jumps
-        straight to one of its tabs (Library / Discover / Tuning / Server / Context / Hardware)."""
+        straight to one of its tabs (Library / Discover / Tuning / Server / Context / Capabilities /
+        Hardware)."""
         if ModelsDialog is None:
             self.show_toast("Models window unavailable")
             return
@@ -2026,6 +2033,8 @@ class OverlayWindow(QWidget):
         models_action.triggered.connect(lambda: self.open_models())
         context_action = self._menu.addAction("Context documents…")   # 2026-10-06: the Context tab
         context_action.triggered.connect(lambda: self.open_models("Context"))
+        capabilities_action = self._menu.addAction("Capabilities…")   # 2026-10-07: the Capabilities tab
+        capabilities_action.triggered.connect(lambda: self.open_models("Capabilities"))
 
         self._menu.addSeparator()
         compact_action = self._menu.addAction("Compact context now")
@@ -2854,6 +2863,11 @@ class OverlayWindow(QWidget):
             # the usage panel from ContextUsageEvent; like the model events, they only matter
             # while the Models window exists.
             self._forward_to_models_dialog(ev)
+        elif isinstance(ev, ToolCallEvent):
+            # 2026-10-07 (capabilities): the Assist tab's footer shows the tool call in flight.
+            self.assist_view.on_tool(ev)
+        elif isinstance(ev, (CapabilityMapEvent, McpToolsEvent)):
+            self._on_capability_event(ev)
         else:
             log.debug("overlay: unhandled event type %s", type(ev).__name__)
 
@@ -2862,6 +2876,23 @@ class OverlayWindow(QWidget):
         window; dropped on the floor while it has never been opened."""
         if self._models_dialog is not None:
             self._models_dialog.on_event(ev)
+
+    def _on_capability_event(self, ev: CapabilityMapEvent | McpToolsEvent) -> None:
+        """The Capabilities tab re-reads its map list / MCP tools on these (only while the Models
+        window exists); a map that finished indexing, or failed to, also says so in a toast, since
+        the index runs in the background and the window may be closed by then. The toast names the
+        feature, and the launch-time refresh (`automatic`) raises one only when the tree changed:
+        2026-10-29, "Map 'BloomingHealth': 28 files" at every launch read as 28 documents loaded
+        into the context, while a map only lists paths for the tools."""
+        self._forward_to_models_dialog(ev)
+        if isinstance(ev, CapabilityMapEvent):
+            if ev.reason == "indexed":
+                if ev.automatic and not ev.changed:
+                    return
+                verb = "refreshed" if ev.automatic else "indexed"
+                self.show_toast(f"Capabilities map '{ev.name}' {verb}: {ev.files} files")
+            elif ev.reason.startswith("error"):
+                self.show_toast(f"Capabilities map {ev.reason}")
 
     def _on_model_library_event(self, ev: ModelLibraryEvent) -> None:
         self._forward_to_models_dialog(ev)

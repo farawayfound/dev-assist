@@ -21,28 +21,48 @@ library folder; a read-only panel shows how the last answer's prompt filled the 
 window (``actions.context_usage()`` on open, every ``ContextUsageEvent`` afterwards); and a
 ``FieldForm`` over the whole ``[context]`` section applies like the Server tab does (``applied``
 carries only the changed ``context.*`` keys). ``ContextLibraryEvent`` re-reads the document list.
+
+2026-10-07 (capabilities): a seventh tab, "Capabilities", sits between Context and Hardware. It is
+where the owner decides what the model may do on its own to gather context: five switches (read
+files, edit files, execute commands, fetch web content, MCP servers), the scope of each (readable /
+editable folders and their exclusions, the allowed commands, the allowed / blocked web domains, the
+MCP server list), the scalar limits (a ``FieldForm`` over ``[capabilities]``) and the project maps
+(``Pre-index scoped directories...``, load / re-index / delete). ``Apply`` writes the switches, the
+lists and the form into ``cfg.capabilities`` and emits ``applied`` with the changed
+``capabilities.*`` keys; ``CapabilityMapEvent`` re-reads the map list and ``McpToolsEvent`` fills
+the MCP table's Tools column. Nothing here touches the filesystem or the network: the engine does.
 """
 from __future__ import annotations
 
+import copy
 import logging
 import math
+import os
+import re
 import shlex
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from PySide6.QtCore import QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices
+from PySide6.QtCore import QEvent, QObject, QPoint, QRect, QSize, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFontDatabase
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QAbstractSpinBox,
     QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
+    QLayout,
+    QLayoutItem,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -56,15 +76,17 @@ from PySide6.QtWidgets import (
 )
 
 from exocortex.bus import (
+    CapabilityMapEvent,
     ComponentStatusEvent,
     ContextLibraryEvent,
     ContextUsageEvent,
+    McpToolsEvent,
     ModelInfoEvent,
     ModelLibraryEvent,
     ModelPullEvent,
     ModelSearchEvent,
 )
-from exocortex.config import Config
+from exocortex.config import SAFE_COMMANDS, Config
 from exocortex.ui.theme import COLORS, build_qss
 
 log = logging.getLogger(__name__)
@@ -213,6 +235,10 @@ QTableWidget {{ background: {COLORS['panel']}; border: 1px solid {COLORS['border
                 gridline-color: {COLORS['border']}; }}
 QHeaderView::section {{ background: {COLORS['bg_solid']}; color: {COLORS['text_dim']};
                         border: none; padding: 4px 6px; }}
+QGroupBox {{ border: 1px solid {COLORS['border']}; border-radius: 6px; margin-top: 12px; padding: 10px 8px 8px 8px; }}
+QGroupBox::title {{ subcontrol-origin: margin; left: 10px; padding: 0 4px; color: {COLORS['text_dim']}; }}
+QListWidget {{ background: {COLORS['panel']}; border: 1px solid {COLORS['border']}; border-radius: 4px; }}
+QListWidget::item:selected {{ background: {COLORS['accent_dim']}; color: {COLORS['text']}; }}
 """
 
 
@@ -396,18 +422,170 @@ def _status_color(state: str) -> str:
     return COLORS["text_dim"]
 
 
+# ---------------------------------------------------------------------------------------------
+# Capabilities tab helpers (2026-10-07)
+# ---------------------------------------------------------------------------------------------
+#: A valid MCP server name: the same shape the engine's config reader accepts (the runner names a
+#: server's tools ``mcp:<server>:<tool>`` and splits on the first two colons).
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+#: ``token=`` / ``key=`` style query values of an MCP url, hidden in the table (the same shape the
+#: engine redacts in ``session.json``): the table is on screen, possibly shared.
+_SECRET_QUERY_RE = re.compile(r"(?i)([?&][^=&#]*(?:token|key)[^=&#]*=)[^&#]*")
+
+
+def _redact_url(url: str) -> str:
+    """``url`` with every ``token=`` / ``key=`` query value replaced by ``***``."""
+    return _SECRET_QUERY_RE.sub(r"\1***", url)
+
+
+def _split_lines(text: str) -> list[str]:
+    """The non-blank lines of a plain-text box, whitespace stripped (a list compares as a list)."""
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
+def _folder_name(path: str) -> str:
+    """The last component of a folder path ("C:/work/app" -> "app"); the drive letter for a drive root."""
+    p = Path(path)
+    return p.name or p.drive.rstrip(":") or "project"
+
+
+def _mcp_kind(spec: dict[str, Any]) -> str:
+    """The transport of an MCP entry, read exactly as the runner reads it (``McpServer.__init__``):
+    an explicit ``transport`` (stripped, lower-cased), else "http" for an entry with a ``url`` and
+    no ``command``, else "stdio". Kept in step with ``exocortex.mcp`` by a test."""
+    return str(spec.get("transport") or ("http" if spec.get("url") and not spec.get("command") else "stdio")
+               ).strip().lower()
+
+
+def _mcp_enabled(spec: dict[str, Any]) -> bool:
+    """Whether the runner would use an MCP entry (``capabilities._spec_enabled``): ``enabled`` absent,
+    or a bool / int that is true. Anything else ("false" the string, a float) counts as disabled."""
+    val = spec.get("enabled", True)
+    return bool(val) if isinstance(val, (bool, int)) else False
+
+
+#: The status line names at most this many tools; the built-in ones always come first and are never cut.
+_STATUS_MAX_TOOLS = 8
+
+
+def _format_capability_status(status: object) -> tuple[str, str]:
+    """The Capabilities tab's one-paragraph status line from ``actions.capability_status()``'s dict:
+    the tools the ask box would get right now (at most ``_STATUS_MAX_TOOLS`` names, then "+N more":
+    the built-in tools first and in full, a big MCP server's ``mcp:`` tools fill what is left),
+    the MCP servers' states, the active map and the engine's own notes (one per line). Returns
+    ``(text, state)``; ``None`` / ``{}`` -> ``("", "")``."""
+    if not isinstance(status, dict) or not status:
+        return "", ""
+    tools_raw = status.get("tools")
+    tools = [str(t) for t in tools_raw] if isinstance(tools_raw, (list, tuple)) else []
+    builtin = [t for t in tools if not t.startswith("mcp:")]
+    external = [t for t in tools if t.startswith("mcp:")]
+    room = max(0, _STATUS_MAX_TOOLS - len(builtin))
+    shown = builtin + external[:room]
+    more = len(external) - room
+    listing = ", ".join(shown) + (f" +{more} more" if more > 0 else "")
+    parts = ["Offered to the ask box: " + listing if tools else "No tools are offered right now"]
+    mcp = status.get("mcp")
+    if isinstance(mcp, dict) and mcp:
+        parts.append("MCP: " + ", ".join(f"{name} {state}" for name, state in mcp.items()))
+    active = str(status.get("active_map") or "")
+    if active:
+        parts.append(f"Active map: {active}")
+    lines = [" · ".join(parts)]
+    notes = status.get("notes")
+    if isinstance(notes, (list, tuple)):
+        lines += [str(n) for n in notes if str(n).strip()]
+    return "\n".join(lines), ("" if tools else "loading")
+
+
+class _FlowLayout(QLayout):
+    """Left-to-right layout that wraps onto a new line when the width runs out (Qt's "Flow Layout"
+    example): the Capabilities tab's row of five switches stays one row at the window's usual width
+    and wraps instead of being clipped at its 640 px minimum."""
+
+    def __init__(self, parent: QWidget | None = None, *, h_spacing: int = 14, v_spacing: int = 4) -> None:
+        super().__init__(parent)
+        self._items: list[QLayoutItem] = []
+        self._h = h_spacing
+        self._v = v_spacing
+
+    def addItem(self, item: QLayoutItem) -> None:  # noqa: N802 - Qt override
+        self._items.append(item)
+
+    def count(self) -> int:
+        return len(self._items)
+
+    def itemAt(self, index: int) -> QLayoutItem | None:  # noqa: N802 - Qt override
+        return self._items[index] if 0 <= index < len(self._items) else None
+
+    def takeAt(self, index: int) -> QLayoutItem | None:  # noqa: N802 - Qt override
+        return self._items.pop(index) if 0 <= index < len(self._items) else None
+
+    def expandingDirections(self) -> Qt.Orientation:  # noqa: N802 - Qt override
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self) -> bool:  # noqa: N802 - Qt override
+        return True
+
+    def heightForWidth(self, width: int) -> int:  # noqa: N802 - Qt override
+        return self._arrange(QRect(0, 0, width, 0), apply=False)
+
+    def setGeometry(self, rect: QRect) -> None:  # noqa: N802 - Qt override
+        super().setGeometry(rect)
+        self._arrange(rect, apply=True)
+
+    def sizeHint(self) -> QSize:  # noqa: N802 - Qt override
+        return self.minimumSize()
+
+    def minimumSize(self) -> QSize:  # noqa: N802 - Qt override
+        size = QSize()
+        for item in self._items:
+            size = size.expandedTo(item.minimumSize())
+        margins = self.contentsMargins()
+        return size + QSize(margins.left() + margins.right(), margins.top() + margins.bottom())
+
+    def _arrange(self, rect: QRect, *, apply: bool) -> int:
+        """Lay the items out inside ``rect`` (or just measure); returns the height used."""
+        margins = self.contentsMargins()
+        area = rect.adjusted(margins.left(), margins.top(), -margins.right(), -margins.bottom())
+        x, y, line_h = area.x(), area.y(), 0
+        for item in self._items:
+            hint = item.sizeHint()
+            if line_h and x + hint.width() > area.right() + 1:
+                x, y, line_h = area.x(), y + line_h + self._v, 0
+            if apply:
+                item.setGeometry(QRect(QPoint(x, y), hint))
+            x += hint.width() + self._h
+            line_h = max(line_h, hint.height())
+        return y + line_h - rect.y() + margins.bottom()
+
+
+class _WheelGuard(QObject):
+    """Event filter for the Capabilities tab's spin boxes and combos: a wheel turn over one that
+    does not have the keyboard focus scrolls the page instead of silently changing the value (the
+    tab is a long scroll area full of them)."""
+
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:  # noqa: N802 - Qt override
+        if event.type() == QEvent.Type.Wheel and isinstance(obj, QWidget) and not obj.hasFocus():
+            event.ignore()
+            return True
+        return False
+
+
 _PULL_ACTIVE_STATES = ("queued", "downloading", "verifying")
 
 
 class ModelsDialog(QDialog):
-    """Tabbed model manager: Library / Discover / Tuning / Server / Context / Hardware.
+    """Tabbed model manager: Library / Discover / Tuning / Server / Context / Capabilities / Hardware.
 
     ``applied`` carries Server-tab changes as ``{"section.key": new_value}``, the same shape as
     ``SettingsDialog.applied``; the overlay routes it to ``actions.apply_settings`` exactly like
-    the settings dialog does.
+    the settings dialog does. The Context and Capabilities tabs emit it the same way (only their
+    own ``context.*`` / ``capabilities.*`` keys).
     """
 
-    TABS: tuple[str, ...] = ("Library", "Discover", "Tuning", "Server", "Context", "Hardware")
+    TABS: tuple[str, ...] = ("Library", "Discover", "Tuning", "Server", "Context", "Capabilities", "Hardware")
     applied = Signal(dict)
 
     _LIBRARY_COLUMNS: tuple[str, ...] = ("Model", "Quant", "Size", "Source", "Context", "Status")
@@ -541,6 +719,79 @@ class ModelsDialog(QDialog):
         "*.h *.hpp *.cs *.sql *.sh *.ps1 *.bat *.rb *.php *.kt *.swift *.m);;All files (*)"
     )
 
+    #: The scalar part of ``[capabilities]`` (Capabilities tab; 2026-10-07). One ``FieldForm`` over
+    #: ``cfg.capabilities``; the five switches, the folder / command / domain lists and the MCP
+    #: server table are custom widgets (``_CAPABILITY_LIST_KEYS`` and ``cap_*_cb`` below) that
+    #: Apply treats exactly like form fields. The ranges sit inside the ones a map's settings are
+    #: validated against (``exocortex.capabilities.apply_snapshot``), so a value the tab can write
+    #: is a value a map can carry.
+    _CAPABILITY_FIELDS: tuple[Field, ...] = (
+        Field("capabilities", "apply_to", "Tools reach", "choice", choices=("questions", "ask", "all"),
+              help='"questions" = the other speaker (auto / manual), screen questions and the ask box '
+                   '(read tools for the first three, everything for the ask box); "ask" = the ask box '
+                   'only; "all" = also suggestions, solves, code and text (read tools). Never inline '
+                   'completions or explanations.'),
+        Field("capabilities", "max_tool_calls", "Ask box: tool calls per answer", "int", 0, 20, 1,
+              help="The ask box carries text you typed, so a longer wait is acceptable."),
+        Field("capabilities", "tool_result_chars", "Ask box: one result is cut at (chars)", "int", 200, 100000, 500),
+        Field("capabilities", "tool_time_s", "Ask box: time for the whole loop (s)", "float", 1.0, 600.0, 5.0,
+              help="Tools and model hops together, per answer; after it the model must answer."),
+        Field("capabilities", "live_max_tool_calls", "Live answers: tool calls per answer", "int", 0, 20, 1,
+              help="Auto / manual / screen answers, suggestions, solves, code and text: every hop "
+                   "delays an answer someone is waiting for."),
+        Field("capabilities", "live_tool_result_chars", "Live answers: one result is cut at (chars)", "int",
+              200, 100000, 250),
+        Field("capabilities", "live_tool_time_s", "Live answers: time for the whole loop (s)", "float", 1.0, 600.0, 1.0),
+        Field("capabilities", "read_max_file_chars", "Longest file read at once (chars)", "int", 200, 1000000, 1000,
+              help="A longer file is cut here (the model can ask for a line range)."),
+        Field("capabilities", "edit_backup", "Back up a file before editing it", "bool",
+              help="The original goes to <session>/edits/ before every change."),
+        Field("capabilities", "allow_all_commands", "All commands -- runs arbitrary code: lifts every other scope",
+              "bool", help="Lifts the allowed-command list, the chaining filter, the path check and the git "
+                           "rewrite. Timeouts and output caps stay. A map never turns this on."),
+        Field("capabilities", "command_timeout_s", "Command timeout (s)", "float", 1.0, 600.0, 1.0),
+        Field("capabilities", "command_output_chars", "Command output kept (chars)", "int", 200, 100000, 500),
+        Field("capabilities", "command_cwd", "Command working folder (empty = the first readable folder)", "text",
+              help="Must sit inside a readable folder."),
+        Field("capabilities", "web_allow_local", "Allow local / private network addresses", "bool",
+              help="Off: loopback, private, link-local and CGNAT addresses are refused. A map never turns this on."),
+        Field("capabilities", "web_max_fetches", "Web fetches + searches per answer", "int", 0, 10, 1),
+        Field("capabilities", "web_page_chars", "Web page text kept (chars)", "int", 200, 100000, 500),
+        Field("capabilities", "web_timeout_s", "Web timeout (s)", "float", 1.0, 120.0, 1.0),
+        Field("capabilities", "web_search_url", "Web search URL ({query} is replaced)", "text",
+              help="GET request; DuckDuckGo's HTML results page by default."),
+        Field("capabilities", "web_search_results", "Web search results", "int", 1, 20, 1),
+        Field("capabilities", "mcp_timeout_s", "MCP call timeout (s)", "float", 1.0, 300.0, 1.0),
+        Field("capabilities", "maps_dir", "Maps folder (empty = <models>/maps)", "text",
+              help="Where the project maps are saved; they persist across sessions. Applies at once; "
+                   "maps saved in the old folder are not moved."),
+        Field("capabilities", "map_max_files", "Map: most files listed", "int", 100, 50000, 500,
+              help="A bigger tree is cut here (the rest is counted, not listed)."),
+        Field("capabilities", "map_tokens", "Map: size in the prompt (tokens)", "int", 100, 4000, 50,
+              help="Budget of the <map> block every tool-enabled prompt carries."),
+    )
+
+    #: The ``[capabilities]`` list values the tab edits through a list / text box, by config key.
+    _CAPABILITY_LIST_KEYS: tuple[str, ...] = (
+        "read_roots", "read_exclude", "edit_roots", "edit_exclude", "allowed_commands",
+        "web_allowed_domains", "web_blocked_domains",
+    )
+
+    #: Label of each switch, in the order of the switch row (also the Load confirmation's wording).
+    _CAPABILITY_SWITCHES: tuple[tuple[str, str], ...] = (
+        ("read_files", "Read files"),
+        ("edit_files", "Edit files"),
+        ("execute_commands", "Execute commands"),
+        ("fetch_web", "Fetch web content"),
+        ("mcp_servers", "MCP servers"),
+    )
+
+    #: How often (ms) the status line re-reads the MCP states while the Capabilities tab is visible.
+    _CAP_POLL_MS = 2000
+
+    _MCP_COLUMNS: tuple[str, ...] = ("Name", "Transport", "Command or URL", "Enabled", "Tools")
+    _MAP_COLUMNS: tuple[str, ...] = ("Name", "Roots", "Files", "Indexed", "Active")
+
     def __init__(self, cfg: Config, actions: "EngineActions", parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self._cfg = cfg
@@ -555,6 +806,19 @@ class ModelsDialog(QDialog):
         self._any_loaded = False
         self._llm_busy = False  # review round two, 2026-09-27 (D4): explicit, not a getattr default
         self._context_rows: list[dict[str, object]] = []  # 2026-10-06: the Context tab's documents
+        # 2026-10-07 (capabilities): the Capabilities tab's working copies and request bookkeeping.
+        self._mcp_specs: list[dict[str, Any]] = []        # the MCP table's rows; written to cfg on Apply only
+        self._mcp_tools_text: dict[str, str] = {}         # server name -> the Tools column's text
+        self._mcp_requests: dict[str, int] = {}           # server name -> the id of its latest Test
+        self._mcp_request_id = 0                          # the counter handed to mcp_server_tools()
+        self._map_rows: list[dict[str, object]] = []      # actions.capability_maps(), as shown
+        self._cap_status_state: str | None = None         # the status line's colour state as last drawn
+        # the status line's MCP states change on the engine's own threads (a connect pass ends, a
+        # server dies) without any event: while the Capabilities tab is on screen, re-read them
+        self._cap_poll_timer = QTimer(self)
+        self._cap_poll_timer.setInterval(self._CAP_POLL_MS)
+        self._cap_poll_timer.timeout.connect(self._poll_capability_status)
+        self._wheel_guard = _WheelGuard(self)
 
         self.setWindowTitle("Models")
         self.setWindowFlags(Qt.WindowType.Dialog | Qt.WindowType.Tool | Qt.WindowType.WindowStaysOnTopHint)
@@ -573,7 +837,9 @@ class ModelsDialog(QDialog):
         self.tabs.addTab(self._build_tuning_tab(), "Tuning")
         self.tabs.addTab(self._build_server_tab(), "Server")
         self.tabs.addTab(self._build_context_tab(), "Context")
+        self.tabs.addTab(self._build_capabilities_tab(), "Capabilities")
         self.tabs.addTab(self._build_hardware_tab(), "Hardware")
+        self.tabs.currentChanged.connect(lambda _i: self._sync_capability_poll())
 
         self.load()
 
@@ -589,14 +855,23 @@ class ModelsDialog(QDialog):
         self.context_status.setText("")
         self._refresh_context()
         self._render_usage(self._fetch_context_usage())
+        self._load_capabilities()
 
     def show_tab(self, name: str) -> None:
         if name in self.TABS:
             self.tabs.setCurrentIndex(self.TABS.index(name))
 
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt override
+        super().showEvent(event)
+        self._sync_capability_poll()
+
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt override
+        super().hideEvent(event)
+        self._sync_capability_poll()
+
     def on_event(self, ev: object) -> None:
-        """Forwarded by the overlay: the five model events, ComponentStatusEvent("llm") and (2026-10-06)
-        the two context events."""
+        """Forwarded by the overlay: the five model events, ComponentStatusEvent("llm"), (2026-10-06)
+        the two context events and (2026-10-07) the two capability events."""
         try:
             if isinstance(ev, ModelPullEvent):
                 self._on_model_pull_event(ev)
@@ -616,6 +891,10 @@ class ModelsDialog(QDialog):
                 self._on_context_library_event(ev)
             elif isinstance(ev, ContextUsageEvent):
                 self._render_usage(ev, snapshot=self._fetch_context_usage())
+            elif isinstance(ev, CapabilityMapEvent):
+                self._on_capability_map_event(ev)
+            elif isinstance(ev, McpToolsEvent):
+                self._on_mcp_tools_event(ev)
             elif isinstance(ev, ComponentStatusEvent) and ev.component == "llm":
                 self._set_library_status(ev.detail or ev.state, ev.state)
                 # review round two, 2026-09-27 (D4): busy is driven by "loading" / "ready" /
@@ -1642,6 +1921,993 @@ class ModelsDialog(QDialog):
         if changed:
             log.info("context settings changed: %s", ", ".join(f"{k}={v!r}" for k, v in changed.items()))
             self.applied.emit(changed)
+
+    # ============================================================================== Capabilities
+    def _build_capabilities_tab(self) -> QWidget:
+        """The Capabilities tab (2026-10-07): one scroll area with the groups Switches (+ the scalar
+        limits), Read scope, Edit scope, Commands, Web, MCP servers and Maps, top to bottom; the
+        status line and the Apply / Restore defaults row stay pinned under it so Apply is never a
+        scroll away."""
+        w = QWidget(self)
+        outer = QVBoxLayout(w)
+        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setSpacing(8)
+
+        scroll = QScrollArea(w)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body = QWidget(scroll)
+        col = QVBoxLayout(body)
+        col.setContentsMargins(2, 2, 8, 2)
+        col.setSpacing(8)
+        scroll.setWidget(body)
+        outer.addWidget(scroll, 1)
+        self.cap_scroll = scroll
+
+        # config key -> the widget holding that list (QListWidget for folders, QPlainTextEdit for
+        # one-entry-per-line boxes); read and written through _cap_read_list / _cap_write_list.
+        self._cap_list_widgets: dict[str, QListWidget | QPlainTextEdit] = {}
+
+        col.addWidget(self._build_cap_switches_group(body))
+        col.addWidget(self._build_cap_read_group(body))
+        col.addWidget(self._build_cap_edit_group(body))
+        col.addWidget(self._build_cap_commands_group(body))
+        col.addWidget(self._build_cap_web_group(body))
+        col.addWidget(self._build_cap_mcp_group(body))
+        col.addWidget(self._build_cap_maps_group(body))
+        col.addStretch(1)
+
+        self.cap_status = QLabel("", w)
+        self.cap_status.setWordWrap(True)
+        self.cap_status.setTextFormat(Qt.TextFormat.PlainText)
+        self.cap_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.cap_status.setStyleSheet(f"color: {COLORS['text_dim']};")
+        outer.addWidget(self.cap_status)
+
+        self.cap_note = QLabel("", w)
+        self.cap_note.setWordWrap(True)
+        self.cap_note.setTextFormat(Qt.TextFormat.PlainText)
+        outer.addWidget(self.cap_note)
+
+        apply_row = QHBoxLayout()
+        self.cap_restore_btn = QPushButton("Restore defaults", w)
+        self.cap_restore_btn.clicked.connect(self._on_capabilities_restore)
+        self.cap_apply_btn = QPushButton("Apply", w)
+        self.cap_apply_btn.setObjectName("primary")
+        self.cap_apply_btn.clicked.connect(self._on_capabilities_apply)
+        apply_row.addWidget(self.cap_restore_btn)
+        apply_row.addStretch(1)
+        apply_row.addWidget(self.cap_apply_btn)
+        outer.addLayout(apply_row)
+        return w
+
+    # ---- tab construction helpers
+    @staticmethod
+    def _cap_group(title: str, parent: QWidget) -> tuple[QGroupBox, QVBoxLayout]:
+        """A titled group box with a vertical layout, the unit the tab is stacked from."""
+        group = QGroupBox(title, parent)
+        lay = QVBoxLayout(group)
+        lay.setSpacing(6)
+        return group, lay
+
+    @staticmethod
+    def _cap_hint(text: str, parent: QWidget) -> QLabel:
+        """A dim, wrapped explanatory line."""
+        label = QLabel(text, parent)
+        label.setWordWrap(True)
+        label.setTextFormat(Qt.TextFormat.PlainText)
+        label.setStyleSheet(f"color: {COLORS['text_dim']};")
+        return label
+
+    @staticmethod
+    def _cap_lines_edit(parent: QWidget, height: int, placeholder: str = "") -> QPlainTextEdit:
+        """A plain-text box for one entry per line (patterns, commands, domains)."""
+        edit = QPlainTextEdit(parent)
+        edit.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        edit.setTabChangesFocus(True)
+        edit.setMinimumHeight(height)
+        edit.setMaximumHeight(max(height, 220))
+        edit.setPlaceholderText(placeholder)
+        return edit
+
+    def _build_cap_switches_group(self, parent: QWidget) -> QGroupBox:
+        group, lay = self._cap_group("Switches", parent)
+        tips = {
+            "read_files": "The model may read, list and search the readable folders below (recursively).",
+            "edit_files": "The ask box may create and edit files in the editable folders below.",
+            "execute_commands": "The ask box may run the allowed commands (below) in a readable folder.",
+            "fetch_web": "The ask box may search the web and fetch pages within the domain lists below.",
+            "mcp_servers": "The ask box may call the tools of the enabled MCP servers below.",
+        }
+        row = _FlowLayout()          # one row; wraps only when the window is narrower than the five
+        self._cap_switches: dict[str, QCheckBox] = {}
+        for key, label in self._CAPABILITY_SWITCHES:
+            cb = QCheckBox(label, group)
+            cb.setToolTip(tips[key])
+            row.addWidget(cb)
+            self._cap_switches[key] = cb
+        lay.addLayout(row)
+        self.cap_read_cb = self._cap_switches["read_files"]
+        self.cap_edit_cb = self._cap_switches["edit_files"]
+        self.cap_exec_cb = self._cap_switches["execute_commands"]
+        self.cap_web_cb = self._cap_switches["fetch_web"]
+        self.cap_mcp_cb = self._cap_switches["mcp_servers"]
+
+        lay.addWidget(self._cap_hint(
+            "Only the ask box can run commands, edit files or reach the web; answers to the other "
+            "speaker or the screen get read-only tools. With no readable folder no tool is offered at all.",
+            group))
+
+        # The FieldForm builds its own scroll area; this group sits inside the tab's one scroll
+        # area, so only the form's inner widget is kept (a nested scroll area would trap the wheel).
+        self._capabilities_form = FieldForm(self._CAPABILITY_FIELDS, self._cfg)
+        form_scroll = self._capabilities_form.widget
+        inner = form_scroll.takeWidget()
+        lay.addWidget(inner)
+        form_scroll.deleteLater()
+        form_layout = inner.layout()
+        if isinstance(form_layout, QFormLayout):
+            form_layout.setRowWrapPolicy(QFormLayout.RowWrapPolicy.WrapLongRows)
+        for widget in self._capabilities_form.widgets.values():
+            if isinstance(widget, (QAbstractSpinBox, QComboBox)):
+                widget.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+                widget.installEventFilter(self._wheel_guard)
+        return group
+
+    def _build_cap_scope_group(
+        self, parent: QWidget, title: str, hint: str, roots_key: str, exclude_key: str,
+    ) -> tuple[QGroupBox, QListWidget, QPushButton, QPushButton, QPlainTextEdit]:
+        """A folder list with Add folder... / Remove and an exclusion box; shared by Read / Edit scope."""
+        group, lay = self._cap_group(title, parent)
+        lay.addWidget(self._cap_hint(hint, group))
+        row = QHBoxLayout()
+        roots = QListWidget(group)
+        roots.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        roots.setMinimumHeight(64)
+        roots.setMaximumHeight(120)
+        row.addWidget(roots, 1)
+        buttons = QVBoxLayout()
+        add_btn = QPushButton("Add folder…", group)
+        remove_btn = QPushButton("Remove", group)
+        remove_btn.setEnabled(False)
+        buttons.addWidget(add_btn)
+        buttons.addWidget(remove_btn)
+        buttons.addStretch(1)
+        row.addLayout(buttons)
+        lay.addLayout(row)
+        lay.addWidget(QLabel("Excluded (one pattern per line)", group))
+        exclude = self._cap_lines_edit(group, 70, ".git\nnode_modules\n*.pem")
+        lay.addWidget(exclude)
+
+        add_btn.clicked.connect(lambda: self._on_cap_add_root(roots))
+        remove_btn.clicked.connect(lambda: self._on_cap_remove_roots(roots))
+        roots.itemSelectionChanged.connect(
+            lambda: remove_btn.setEnabled(bool(roots.selectedItems()) or roots.currentRow() >= 0))
+        roots.currentRowChanged.connect(
+            lambda _row: remove_btn.setEnabled(bool(roots.selectedItems()) or roots.currentRow() >= 0))
+        self._cap_list_widgets[roots_key] = roots
+        self._cap_list_widgets[exclude_key] = exclude
+        return group, roots, add_btn, remove_btn, exclude
+
+    def _build_cap_read_group(self, parent: QWidget) -> QGroupBox:
+        group, self.cap_read_roots, self.cap_read_add_btn, self.cap_read_remove_btn, self.cap_read_exclude = (
+            self._build_cap_scope_group(
+                parent, "Read scope",
+                "The folders the model may read, list and search, recursively. Without one, no tool is "
+                "offered at all. Names matching an exclusion (any path component) are never read, "
+                "listed, searched or indexed; the app's own config, models, sessions and maps folders "
+                "are always off limits.",
+                "read_roots", "read_exclude"))
+        return group
+
+    def _build_cap_edit_group(self, parent: QWidget) -> QGroupBox:
+        group, self.cap_edit_roots, self.cap_edit_add_btn, self.cap_edit_remove_btn, self.cap_edit_exclude = (
+            self._build_cap_scope_group(
+                parent, "Edit scope",
+                "The folders the ask box may write to (needs the Edit files switch). Only files that "
+                "match no exclusion; each change is atomic and, with the backup option, the original "
+                "is kept in the session folder. There is no delete tool.",
+                "edit_roots", "edit_exclude"))
+        return group
+
+    def _build_cap_commands_group(self, parent: QWidget) -> QGroupBox:
+        group, lay = self._cap_group("Commands", parent)
+        lay.addWidget(self._cap_hint(
+            "One allowed command per line; an entry allows that command and its arguments "
+            "(\"git log\" allows \"git log --oneline\"). Needs the Execute commands switch and a "
+            "readable folder to run in.", group))
+        self.cap_commands = self._cap_lines_edit(group, 130)
+        lay.addWidget(self.cap_commands)
+        row = QHBoxLayout()
+        self.cap_commands_restore_btn = QPushButton("Restore safe list", group)
+        self.cap_commands_restore_btn.clicked.connect(self._on_cap_restore_safe_commands)
+        row.addWidget(self.cap_commands_restore_btn)
+        row.addStretch(1)
+        lay.addLayout(row)
+        lay.addWidget(self._cap_hint(
+            "This list is a guard against accidents, not a sandbox: an allowed command can still do "
+            "whatever its own arguments let it. File readers and listers only see the readable "
+            "folders. \"All commands\" (above) lifts the list and every other check.", group))
+        self._cap_list_widgets["allowed_commands"] = self.cap_commands
+        return group
+
+    def _build_cap_web_group(self, parent: QWidget) -> QGroupBox:
+        group, lay = self._cap_group("Web", parent)
+        lay.addWidget(self._cap_hint(
+            "Needs the Fetch web content switch. Allowed domains: one per line, empty = any public "
+            "site; \"example.com\" also allows its subdomains. Blocked domains win. Local and "
+            "private addresses are refused unless allowed above.", group))
+        lay.addWidget(QLabel("Allowed domains", group))
+        self.cap_web_allowed = self._cap_lines_edit(group, 60, "docs.python.org")
+        lay.addWidget(self.cap_web_allowed)
+        lay.addWidget(QLabel("Blocked domains", group))
+        self.cap_web_blocked = self._cap_lines_edit(group, 60)
+        lay.addWidget(self.cap_web_blocked)
+        self._cap_list_widgets["web_allowed_domains"] = self.cap_web_allowed
+        self._cap_list_widgets["web_blocked_domains"] = self.cap_web_blocked
+        return group
+
+    def _build_cap_mcp_group(self, parent: QWidget) -> QGroupBox:
+        group, lay = self._cap_group("MCP servers", parent)
+        lay.addWidget(self._cap_hint(
+            "Needs the MCP servers switch. A stdio server is started as a child process with a "
+            "minimal environment plus the variables you give it; an http server is called with POST. "
+            "Its tools are offered to the ask box as mcp:<server>:<tool>. Apply, then Test.", group))
+        self.cap_mcp_table = QTableWidget(0, len(self._MCP_COLUMNS), group)
+        self.cap_mcp_table.setHorizontalHeaderLabels(list(self._MCP_COLUMNS))
+        self.cap_mcp_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.cap_mcp_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cap_mcp_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cap_mcp_table.setMinimumHeight(100)
+        self.cap_mcp_table.itemSelectionChanged.connect(self._update_mcp_buttons)
+        lay.addWidget(self.cap_mcp_table)
+        row = QHBoxLayout()
+        self.cap_mcp_add_btn = QPushButton("Add…", group)
+        self.cap_mcp_add_btn.clicked.connect(self._on_mcp_add)
+        self.cap_mcp_edit_btn = QPushButton("Edit…", group)
+        self.cap_mcp_edit_btn.clicked.connect(self._on_mcp_edit)
+        self.cap_mcp_remove_btn = QPushButton("Remove", group)
+        self.cap_mcp_remove_btn.clicked.connect(self._on_mcp_remove)
+        self.cap_mcp_test_btn = QPushButton("Test", group)
+        self.cap_mcp_test_btn.clicked.connect(self._on_mcp_test)
+        for b in (self.cap_mcp_add_btn, self.cap_mcp_edit_btn, self.cap_mcp_remove_btn, self.cap_mcp_test_btn):
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        return group
+
+    def _build_cap_maps_group(self, parent: QWidget) -> QGroupBox:
+        group, lay = self._cap_group("Maps", parent)
+        lay.addWidget(self._cap_hint(
+            "A map is a short overview of the readable folders (what each file is, on a basic "
+            "understanding: no model call). It is saved with the settings it was made with and kept "
+            "in the project; the active map rides along in every tool-enabled prompt, so the model "
+            "knows which paths exist. Loading a map re-applies its settings; Re-index re-scans a map's "
+            "own folders, Pre-index maps the folders listed above.", group))
+        self.cap_maps_table = QTableWidget(0, len(self._MAP_COLUMNS), group)
+        self.cap_maps_table.setHorizontalHeaderLabels(list(self._MAP_COLUMNS))
+        self.cap_maps_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.cap_maps_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.cap_maps_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.cap_maps_table.setMinimumHeight(90)
+        self.cap_maps_table.itemSelectionChanged.connect(self._update_map_buttons)
+        lay.addWidget(self.cap_maps_table)
+        row = QHBoxLayout()
+        self.cap_index_btn = QPushButton("Pre-index scoped directories…", group)
+        self.cap_index_btn.clicked.connect(self._on_map_index)
+        self.cap_map_load_btn = QPushButton("Load", group)
+        self.cap_map_load_btn.clicked.connect(self._on_map_load)
+        self.cap_map_reindex_btn = QPushButton("Re-index", group)
+        self.cap_map_reindex_btn.setToolTip(
+            "Re-scan the folders this map was made from, with the settings it was saved with. "
+            "What the tab shows now is not used.")
+        self.cap_map_reindex_btn.clicked.connect(self._on_map_reindex)
+        self.cap_map_delete_btn = QPushButton("Delete", group)
+        self.cap_map_delete_btn.clicked.connect(self._on_map_delete)
+        self.cap_map_open_btn = QPushButton("Open folder", group)
+        self.cap_map_open_btn.clicked.connect(self._on_map_open_folder)
+        for b in (self.cap_index_btn, self.cap_map_load_btn, self.cap_map_reindex_btn,
+                  self.cap_map_delete_btn, self.cap_map_open_btn):
+            row.addWidget(b)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.cap_map_status = QLabel("", group)
+        self.cap_map_status.setWordWrap(True)
+        self.cap_map_status.setTextFormat(Qt.TextFormat.PlainText)
+        lay.addWidget(self.cap_map_status)
+        return group
+
+    # ---- load / read back
+    def _load_capabilities(self) -> None:
+        """Fill the whole tab from ``cfg.capabilities`` and re-read the maps and the status (every
+        open; ``actions`` may return ``None`` or raise for any of them)."""
+        self._mcp_tools_text.clear()
+        self._mcp_requests.clear()
+        self._fill_capabilities_from_cfg()
+        self.cap_note.setText("")
+        self.cap_map_status.setText("")
+        self._refresh_maps()
+        self._refresh_capability_status()
+
+    def _fill_capabilities_from_cfg(self) -> None:
+        """The form, the five switches, the lists and the MCP table from ``cfg.capabilities`` (also
+        after a map was loaded: the engine rewrote the settings it carries)."""
+        cc = self._cfg.capabilities
+        self._capabilities_form.load()
+        for key, cb in self._cap_switches.items():
+            cb.setChecked(bool(getattr(cc, key)))
+        for key in self._CAPABILITY_LIST_KEYS:
+            self._cap_write_list(key, getattr(cc, key))
+        self._mcp_specs = [copy.deepcopy(s) for s in cc.mcp if isinstance(s, dict)]
+        self._refresh_mcp_table()
+
+    def _cap_read_list(self, key: str) -> list[str]:
+        """The entries of one list as the tab shows them: blank lines dropped, whitespace stripped."""
+        widget = self._cap_list_widgets[key]
+        if isinstance(widget, QListWidget):
+            return [t for t in (widget.item(i).text().strip() for i in range(widget.count())) if t]
+        return _split_lines(widget.toPlainText())
+
+    def _cap_write_list(self, key: str, values: object) -> None:
+        widget = self._cap_list_widgets[key]
+        items = [str(v) for v in values] if isinstance(values, (list, tuple)) else []
+        if isinstance(widget, QListWidget):
+            widget.clear()
+            widget.addItems(items)
+        else:
+            widget.setPlainText("\n".join(items))
+
+    # ---- folders
+    def _pick_directory(self) -> str:
+        """The "Add folder..." picker ("" when cancelled); factored out so tests replace it on the instance."""
+        try:
+            return str(QFileDialog.getExistingDirectory(self, "Add a folder") or "")
+        except Exception:  # noqa: BLE001
+            log.exception("folder picker failed")
+            return ""
+
+    def _on_cap_add_root(self, widget: QListWidget) -> None:
+        try:
+            path = str(self._pick_directory() or "").strip()
+        except Exception:  # noqa: BLE001
+            log.exception("_pick_directory failed")
+            path = ""
+        if not path:
+            return
+        wanted = os.path.normcase(os.path.normpath(path))
+        for i in range(widget.count()):
+            if os.path.normcase(os.path.normpath(widget.item(i).text())) == wanted:
+                widget.setCurrentRow(i)   # already listed
+                return
+        widget.addItem(QListWidgetItem(path))
+        widget.setCurrentRow(widget.count() - 1)
+
+    @staticmethod
+    def _on_cap_remove_roots(widget: QListWidget) -> None:
+        items = widget.selectedItems() or ([widget.currentItem()] if widget.currentItem() is not None else [])
+        for item in items:
+            widget.takeItem(widget.row(item))
+
+    def _on_cap_restore_safe_commands(self) -> None:
+        """Fill the commands box with ``SAFE_COMMANDS`` (nothing is applied until Apply)."""
+        self.cap_commands.setPlainText("\n".join(SAFE_COMMANDS))
+
+    # ---- apply / restore
+    def _set_cap_note(self, text: str, state: str = "") -> None:
+        self.cap_note.setText(text)
+        self.cap_note.setStyleSheet(f"color: {_status_color(state)};" if state else "")
+
+    def _capabilities_changes(self) -> dict[str, Any]:
+        """``{"capabilities.key": new_value}`` for everything on the tab that differs from the
+        config: the form's scalars, the five switches and the lists (compared as lists)."""
+        cc = self._cfg.capabilities
+        changes: dict[str, Any] = dict(self._capabilities_form.changes())
+        for key, cb in self._cap_switches.items():
+            if cb.isChecked() != bool(getattr(cc, key)):
+                changes[f"capabilities.{key}"] = cb.isChecked()
+        for key in self._CAPABILITY_LIST_KEYS:
+            new = self._cap_read_list(key)
+            if new != [str(v) for v in getattr(cc, key)]:
+                changes[f"capabilities.{key}"] = new
+        if self._mcp_specs != [s for s in cc.mcp if isinstance(s, dict)]:
+            changes["capabilities.mcp"] = copy.deepcopy(self._mcp_specs)
+        return changes
+
+    def _apply_capabilities(self) -> dict[str, Any]:
+        """Write what differs into ``cfg.capabilities`` and emit ``applied`` with those keys; returns them."""
+        changed = self._capabilities_changes()
+        cc = self._cfg.capabilities
+        for path, value in changed.items():
+            setattr(cc, path.split(".", 1)[1], copy.deepcopy(value))
+        restart = [f.label for f in self._CAPABILITY_FIELDS if f.restart and f.path in changed]
+        if restart:
+            self._set_cap_note("Takes effect at the next launch: " + ", ".join(restart))
+        elif changed:
+            self._set_cap_note("Applied.")
+        else:
+            self._set_cap_note("")
+        if changed:
+            # keys only: an MCP server's env may hold a token, which never goes into the log
+            log.info("capability settings changed: %s", ", ".join(sorted(changed)))
+            self.applied.emit(changed)
+            if "capabilities.maps_dir" in changed:
+                # applied is a direct signal: the engine already switched folders, so the table must
+                # list the new one's maps (the dialog otherwise re-reads them on events only)
+                self._refresh_maps()
+        self._refresh_capability_status()
+        return changed
+
+    def _on_capabilities_apply(self) -> None:
+        self._apply_capabilities()
+
+    def _on_capabilities_restore(self) -> None:
+        """Reset the form, the switches and every list to ``Config().capabilities`` -- on screen
+        only; nothing is written or applied until Apply."""
+        defaults = Config().capabilities
+        self._capabilities_form.restore_defaults()
+        for key, cb in self._cap_switches.items():
+            cb.setChecked(bool(getattr(defaults, key)))
+        for key in self._CAPABILITY_LIST_KEYS:
+            self._cap_write_list(key, getattr(defaults, key))
+        self._mcp_specs = [copy.deepcopy(s) for s in defaults.mcp]
+        self._refresh_mcp_table()
+        self._set_cap_note("Defaults restored -- Apply to keep them.")
+
+    # ---- status line
+    def _fetch_capability_status(self) -> object:
+        try:
+            return self._actions.capability_status()
+        except Exception:  # noqa: BLE001
+            log.exception("actions.capability_status() failed")
+            return None
+
+    def _refresh_capability_status(self) -> None:
+        text, state = _format_capability_status(self._fetch_capability_status())
+        if text != self.cap_status.text():       # a poll that finds nothing new must not drop a text selection
+            self.cap_status.setText(text)
+        if state != self._cap_status_state:
+            self._cap_status_state = state
+            self.cap_status.setStyleSheet(f"color: {_status_color(state)};")
+
+    def _cap_tab_on_screen(self) -> bool:
+        return self.isVisible() and self.tabs.currentIndex() == self.TABS.index("Capabilities")
+
+    def _sync_capability_poll(self) -> None:
+        """Run the 2 s status poll exactly while the Capabilities tab is on screen."""
+        if self._cap_tab_on_screen():
+            if not self._cap_poll_timer.isActive():
+                self._cap_poll_timer.start()
+        else:
+            self._cap_poll_timer.stop()
+
+    def _poll_capability_status(self) -> None:
+        if not self._cap_tab_on_screen():
+            self._cap_poll_timer.stop()
+            return
+        self._refresh_capability_status()
+
+    # ---- MCP servers
+    @staticmethod
+    def _mcp_target(spec: dict[str, Any]) -> str:
+        """The "Command or URL" cell: the url (secret query values hidden) or ``command args``."""
+        if _mcp_kind(spec) == "http":
+            return _redact_url(str(spec.get("url") or ""))
+        args = spec.get("args")
+        parts = [str(spec.get("command") or "")] + ([str(a) for a in args] if isinstance(args, (list, tuple)) else [])
+        return " ".join(p for p in parts if p)
+
+    def _refresh_mcp_table(self, select: int | None = None) -> None:
+        """Re-draw the MCP table from the working copy, keeping the selected row (or ``select``)."""
+        keep = self.cap_mcp_table.currentRow() if select is None else select
+        specs = self._mcp_specs
+        self.cap_mcp_table.setRowCount(len(specs))
+        for i, spec in enumerate(specs):
+            name = str(spec.get("name") or "")
+            enabled = _mcp_enabled(spec)
+            tools_text = self._mcp_tools_text.get(name, "")
+            values = (name, _mcp_kind(spec), self._mcp_target(spec),
+                      "yes" if enabled else "no", tools_text)
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setToolTip(value)
+                if not enabled:
+                    item.setForeground(QColor(COLORS["text_dim"]))
+                elif col == 4 and tools_text.startswith("error"):
+                    item.setForeground(QColor(COLORS["err"]))
+                self.cap_mcp_table.setItem(i, col, item)
+        self.cap_mcp_table.resizeColumnsToContents()
+        self.cap_mcp_table.horizontalHeader().setStretchLastSection(True)
+        if specs and 0 <= keep < len(specs):
+            self.cap_mcp_table.setCurrentCell(keep, 0)
+        else:
+            self.cap_mcp_table.setCurrentCell(-1, -1)
+        self._update_mcp_buttons()
+
+    def _selected_mcp_index(self) -> int | None:
+        idx = self.cap_mcp_table.currentRow()
+        return idx if 0 <= idx < len(self._mcp_specs) else None
+
+    def _update_mcp_buttons(self) -> None:
+        has_row = self._selected_mcp_index() is not None
+        for b in (self.cap_mcp_edit_btn, self.cap_mcp_remove_btn, self.cap_mcp_test_btn):
+            b.setEnabled(has_row)
+
+    def _prompt_mcp_server(self, existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        """The Add / Edit dialog of one MCP server: name, transport, command + arguments (stdio),
+        url (http), environment as ``KEY=VALUE`` lines and the enabled flag. Returns the server's
+        spec, or ``None`` when cancelled; factored out so tests replace it on the instance."""
+        old: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit MCP server" if existing else "Add MCP server")
+        form = QFormLayout(dlg)
+        name_edit = QLineEdit(str(old.get("name") or ""), dlg)
+        name_edit.setPlaceholderText("filesystem")
+        transport_box = QComboBox(dlg)
+        transport_box.addItems(["stdio", "http"])
+        transport_box.setCurrentText("http" if _mcp_kind(old) == "http" else "stdio")
+        command_edit = QLineEdit(str(old.get("command") or ""), dlg)
+        command_edit.setPlaceholderText("npx")
+        args = old.get("args")
+        args_edit = self._cap_lines_edit(dlg, 70, "-y\n@modelcontextprotocol/server-filesystem\nD:/work")
+        args_edit.setPlainText("\n".join(str(a) for a in args) if isinstance(args, (list, tuple)) else "")
+        url_edit = QLineEdit(str(old.get("url") or ""), dlg)
+        url_edit.setPlaceholderText("https://host/mcp")
+        env = old.get("env")
+        env_edit = self._cap_lines_edit(dlg, 60, "API_KEY=...")
+        env_edit.setPlainText("\n".join(f"{k}={v}" for k, v in env.items()) if isinstance(env, dict) else "")
+        enabled_cb = QCheckBox("Enabled", dlg)
+        enabled_cb.setChecked(_mcp_enabled(old))
+        form.addRow("Name", name_edit)
+        form.addRow("Transport", transport_box)
+        form.addRow("Command (stdio)", command_edit)
+        form.addRow("Arguments (stdio, one per line)", args_edit)
+        form.addRow("URL (http)", url_edit)
+        form.addRow("Environment (KEY=VALUE per line)", env_edit)
+        form.addRow("", enabled_cb)
+
+        def sync_transport() -> None:
+            stdio = transport_box.currentText() == "stdio"
+            command_edit.setEnabled(stdio)
+            args_edit.setEnabled(stdio)
+            url_edit.setEnabled(not stdio)
+
+        transport_box.currentTextChanged.connect(lambda _t: sync_transport())
+        sync_transport()
+
+        result: list[dict[str, Any]] = []
+
+        def refuse(message: str) -> None:
+            QMessageBox.warning(dlg, "MCP server", message)
+
+        def accept() -> None:
+            name = name_edit.text().strip()
+            if not _MCP_NAME_RE.match(name):
+                refuse("The name must be 1 to 64 letters, digits, '_', '.' or '-'.")
+                return
+            transport = transport_box.currentText()
+            env_out: dict[str, str] = {}
+            for line in _split_lines(env_edit.toPlainText()):
+                key, sep, value = line.partition("=")
+                if not sep or not key.strip():
+                    refuse(f"'{line}' is not KEY=VALUE.")
+                    return
+                env_out[key.strip()] = value.strip()
+            spec: dict[str, Any] = {"name": name}
+            args_out: list[str] = []
+            if transport == "stdio":
+                command = command_edit.text().strip()
+                if not command:
+                    refuse("A stdio server needs a command.")
+                    return
+                spec["command"] = command
+                args_out = _split_lines(args_edit.toPlainText())
+            else:
+                url = url_edit.text().strip()
+                if not re.match(r"(?i)^https?://\S+$", url):
+                    refuse("An http server needs an http:// or https:// URL.")
+                    return
+                spec["url"] = url
+            enabled = enabled_cb.isChecked()
+            if not old:                 # a new server gets the full shape
+                spec["transport"], spec["env"], spec["enabled"] = transport, env_out, enabled
+                if transport == "stdio":
+                    spec["args"] = args_out
+            else:
+                # An edit leaves a hand-written entry as it was wherever the meaning is unchanged: a key
+                # the entry never had stays out (unless it now differs from the default), and a value
+                # that reads the same ("HTTP", "false", 1) is not rewritten. Otherwise opening Edit and
+                # pressing OK would mark capabilities.mcp changed -- or flip a server the runner had
+                # fail-closed to enabled.
+                if "transport" in old and _mcp_kind(old) == transport:
+                    spec["transport"] = old["transport"]
+                elif "transport" in old or transport != _mcp_kind(old):
+                    spec["transport"] = transport
+                if transport == "stdio":
+                    old_args = old.get("args")
+                    if "args" in old and isinstance(old_args, (list, tuple)) and [str(a) for a in old_args] == args_out:
+                        spec["args"] = old["args"]
+                    elif "args" in old or args_out:
+                        spec["args"] = args_out
+                old_env = old.get("env")
+                if "env" in old and isinstance(old_env, dict) and {str(k): str(v) for k, v in old_env.items()} == env_out:
+                    spec["env"] = old["env"]
+                elif "env" in old or env_out:
+                    spec["env"] = env_out
+                if "enabled" in old and _mcp_enabled(old) == enabled:
+                    spec["enabled"] = old["enabled"]
+                elif "enabled" in old or not enabled:
+                    spec["enabled"] = enabled
+            for k, v in old.items():   # a key this dialog does not edit is kept as the config had it
+                if k not in ("name", "transport", "command", "args", "url", "env", "enabled"):
+                    spec[k] = v
+            result.append(spec)
+            dlg.accept()
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dlg)
+        buttons.accepted.connect(accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        dlg.setMinimumWidth(480)
+        if dlg.exec() != QDialog.DialogCode.Accepted or not result:
+            return None
+        return result[0]
+
+    def _ask_mcp_server(self, existing: dict[str, Any] | None) -> dict[str, Any] | None:
+        try:
+            spec = self._prompt_mcp_server(existing)
+        except Exception:  # noqa: BLE001
+            log.exception("_prompt_mcp_server failed")
+            return None
+        return dict(spec) if isinstance(spec, dict) else None
+
+    def _mcp_name_taken(self, name: str, *, except_index: int | None = None) -> bool:
+        return any(i != except_index and str(s.get("name") or "") == name for i, s in enumerate(self._mcp_specs))
+
+    def _on_mcp_add(self) -> None:
+        spec = self._ask_mcp_server(None)
+        if not spec:
+            return
+        name = str(spec.get("name") or "")
+        if self._mcp_name_taken(name):
+            self._set_cap_note(f"A server named '{name}' is already listed.", "error")
+            return
+        self._mcp_specs.append(spec)
+        self._set_cap_note("")
+        self._refresh_mcp_table(select=len(self._mcp_specs) - 1)
+
+    def _on_mcp_edit(self) -> None:
+        idx = self._selected_mcp_index()
+        if idx is None:
+            return
+        before = self._mcp_specs[idx]
+        old_name = str(before.get("name") or "")
+        spec = self._ask_mcp_server(copy.deepcopy(before))
+        if not spec:
+            return
+        name = str(spec.get("name") or "")
+        if self._mcp_name_taken(name, except_index=idx):
+            self._set_cap_note(f"A server named '{name}' is already listed.", "error")
+            return
+        self._mcp_specs[idx] = spec
+        if spec != before:
+            self._forget_mcp_test(old_name)     # a tool list of the old definition no longer applies
+        self._set_cap_note("")
+        self._refresh_mcp_table(select=idx)
+
+    def _cfg_mcp_spec(self, name: str) -> dict[str, Any] | None:
+        return next((s for s in self._cfg.capabilities.mcp if isinstance(s, dict) and s.get("name") == name), None)
+
+    def _forget_mcp_test(self, name: str) -> None:
+        self._mcp_tools_text.pop(name, None)
+        self._mcp_requests.pop(name, None)
+
+    def _on_mcp_remove(self) -> None:
+        idx = self._selected_mcp_index()
+        if idx is None:
+            return
+        self._forget_mcp_test(str(self._mcp_specs[idx].get("name") or ""))
+        del self._mcp_specs[idx]
+        self._refresh_mcp_table(select=min(idx, len(self._mcp_specs) - 1))
+
+    def _on_mcp_test(self) -> None:
+        """Ask the engine for the selected server's tools; the answer comes back as ``McpToolsEvent``
+        and fills the row's Tools column (an answer to an older Test of the same row is ignored)."""
+        idx = self._selected_mcp_index()
+        if idx is None:
+            return
+        name = str(self._mcp_specs[idx].get("name") or "")
+        if not name:
+            return
+        self._mcp_request_id += 1
+        request_id = self._mcp_request_id
+        self._mcp_requests[name] = request_id
+        self._mcp_tools_text[name] = "testing…"
+        self._refresh_mcp_table(select=idx)
+        try:
+            self._actions.mcp_server_tools(name, request_id)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.mcp_server_tools(%r) failed", name)
+            self._mcp_requests.pop(name, None)
+            self._mcp_tools_text[name] = "error: could not start the test"
+            self._refresh_mcp_table(select=idx)
+
+    def _on_mcp_tools_event(self, ev: McpToolsEvent) -> None:
+        try:
+            self._record_mcp_tools(ev)
+        finally:
+            # a Test connects (and caches) the server, so its state changed even for an answer the
+            # table ignores; the status line is the one place that shows it
+            self._refresh_capability_status()
+
+    def _record_mcp_tools(self, ev: McpToolsEvent) -> None:
+        if self._mcp_requests.get(ev.server) != ev.request_id:
+            return   # a stale answer (the row was tested again, edited or removed since)
+        del self._mcp_requests[ev.server]
+        tools = [t for t in ev.tools if isinstance(t, dict)]
+        if ev.error:
+            text = f"error: {ev.error}"
+            spec = next((s for s in self._mcp_specs if s.get("name") == ev.server), None)
+            if spec is not None and spec != self._cfg_mcp_spec(ev.server):
+                text += " (Apply first: the engine tests the applied settings)"
+        else:
+            names = [str(t.get("name") or "") for t in tools]
+            text = f"{len(tools)} tool{'' if len(tools) == 1 else 's'}"
+            if names:
+                text += ": " + ", ".join(names[:8]) + (", …" if len(names) > 8 else "")
+        self._mcp_tools_text[ev.server] = text
+        self._refresh_mcp_table()
+
+    # ---- maps
+    def _refresh_maps(self) -> None:
+        """Re-read ``actions.capability_maps()`` into the table, keeping the selected row by name."""
+        selected = self._selected_map_row()
+        selected_name = selected.get("name") if selected else None
+        try:
+            result = self._actions.capability_maps()
+        except Exception:  # noqa: BLE001
+            log.exception("actions.capability_maps() failed")
+            self._set_map_status("failed to read the maps", "error")
+            result = None
+        rows = [dict(r) for r in result if isinstance(r, dict)] if isinstance(result, (list, tuple)) else []
+        self._map_rows = rows
+        self.cap_maps_table.setRowCount(len(rows))
+        for i, r in enumerate(rows):
+            self._set_map_row(i, r)
+        self.cap_maps_table.resizeColumnsToContents()
+        self.cap_maps_table.horizontalHeader().setStretchLastSection(True)
+        if selected_name is not None:
+            for i, r in enumerate(rows):
+                if r.get("name") == selected_name:
+                    self.cap_maps_table.setCurrentCell(i, 0)
+                    break
+        self._update_map_buttons()
+
+    def _set_map_row(self, i: int, r: dict[str, object]) -> None:
+        """One map row: name, roots, file count ("(cut)" when the tree was cut at the limit), when
+        it was indexed and whether it is the active one; the folder count is in the tool tip."""
+        roots = r.get("roots")
+        root_list = [str(x) for x in roots] if isinstance(roots, (list, tuple)) else ([str(roots)] if roots else [])
+        files = _as_int(r.get("files")) or 0
+        dirs = _as_int(r.get("dirs")) or 0
+        truncated = bool(r.get("truncated"))
+        active = bool(r.get("active"))
+        values = (
+            str(r.get("name") or ""),
+            "; ".join(root_list),
+            f"{files} (cut)" if truncated else str(files),
+            str(r.get("indexed_at") or "")[:16].replace("T", " "),
+            "active" if active else "",
+        )
+        tip = "\n".join(root_list) + f"\n{files} files in {dirs} folders" + ("\ncut at the file limit" if truncated else "")
+        for col, value in enumerate(values):
+            item = QTableWidgetItem(value)
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            item.setToolTip(tip.strip())
+            if active:
+                item.setForeground(QColor(COLORS["accent"]))
+            self.cap_maps_table.setItem(i, col, item)
+
+    def _selected_map_row(self) -> dict[str, object] | None:
+        idx = self.cap_maps_table.currentRow()
+        if 0 <= idx < len(self._map_rows):
+            return self._map_rows[idx]
+        return None
+
+    def _update_map_buttons(self) -> None:
+        has_row = self._selected_map_row() is not None
+        for b in (self.cap_map_load_btn, self.cap_map_reindex_btn, self.cap_map_delete_btn):
+            b.setEnabled(has_row)
+
+    def _set_map_status(self, text: str, state: str = "") -> None:
+        self.cap_map_status.setText(text)
+        self.cap_map_status.setStyleSheet(f"color: {_status_color(state)};")
+
+    def _on_capability_map_event(self, ev: CapabilityMapEvent) -> None:
+        """A map was indexed / loaded / deleted (or the engine refused): re-read the list and say
+        what happened. A loaded map rewrote the settings it carries, so the tab is re-filled from
+        the config -- otherwise its next Apply would put the old values back."""
+        reason = ev.reason or ""
+        name = ev.name
+        if reason == "loaded":
+            self._fill_capabilities_from_cfg()
+            self._set_cap_note("")
+        self._refresh_maps()
+        if reason == "indexing":
+            self._set_map_status(f"Indexing {name}…", "loading")
+        elif reason == "indexed":
+            text = f"Map '{name}': {ev.files} files, {ev.dirs} folders"
+            self._set_map_status(text + (f" ({ev.detail})" if ev.detail else ""), "done")
+        elif reason == "loaded":
+            self._set_map_status(f"Loaded '{name}'", "done")
+        elif reason == "deleted":
+            self._set_map_status(f"Deleted '{name}'", "done")
+        elif reason.startswith("error"):
+            self._set_map_status(reason, "error")
+        else:
+            self._set_map_status(reason, "")
+        self._refresh_capability_status()
+
+    def _prompt_map_name(self, default: str) -> str | None:
+        """Ask for the new map's name (``None`` when cancelled or empty); factored out so tests
+        replace it on the instance."""
+        text, ok = QInputDialog.getText(
+            self, "Pre-index scoped directories", "Name of the map:", QLineEdit.EchoMode.Normal, default)
+        text = str(text).strip()
+        return text if ok and text else None
+
+    def _confirm(self, title: str, text: str) -> bool:
+        """A Yes / No question (default No); factored out so tests replace it on the instance."""
+        answer = QMessageBox.question(
+            self, title, text, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        return answer == QMessageBox.StandardButton.Yes
+
+    def _call_index(self, name: str) -> None:
+        try:
+            self._actions.index_capability_map(name)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.index_capability_map(%r) failed", name)
+            self._set_map_status(f"failed to index {name}", "error")
+
+    def _on_map_index(self) -> None:
+        """"Pre-index scoped directories...": name the map, apply the tab (so the map carries what
+        the tab shows), then have the engine index the readable folders in the background. A name
+        that already exists asks first and, on Yes, deletes that map before indexing (the engine
+        re-indexes an existing map from its own saved settings, which would ignore the tab)."""
+        self._set_map_status("", "")
+        roots = self._cap_read_list("read_roots")
+        if not roots:
+            self._set_map_status("List at least one readable folder first (Read scope), then pre-index.", "info")
+            return
+        try:
+            name = self._prompt_map_name(_folder_name(roots[0]))
+        except Exception:  # noqa: BLE001
+            log.exception("_prompt_map_name failed")
+            name = None
+        name = str(name or "").strip()
+        if not name:
+            return
+        existing = next((r for r in self._map_rows if str(r.get("name") or "") == name), None)
+        if existing is not None and not self._confirm_replace_map(name, existing, roots):
+            return
+        self._apply_capabilities()
+        if existing is not None:
+            # the engine re-indexes an existing map from the settings it was saved with, so a map
+            # the tab is meant to replace has to go first
+            try:
+                self._actions.delete_capability_map(name)
+            except Exception:  # noqa: BLE001
+                log.exception("actions.delete_capability_map(%r) failed", name)
+                self._set_map_status(f"failed to replace {name}", "error")
+                return
+        self._call_index(name)
+
+    def _confirm_replace_map(self, name: str, existing: dict[str, object], roots: list[str]) -> bool:
+        """Ask before Pre-index overwrites the map ``name`` (a failing confirm counts as No)."""
+        raw = existing.get("roots")
+        old_roots = [str(x) for x in raw] if isinstance(raw, (list, tuple)) else ([str(raw)] if raw else [])
+        try:
+            return self._confirm(
+                "Replace map",
+                f"A map named '{name}' already exists. It covers:\n  " + ("\n  ".join(old_roots) or "no folder")
+                + "\n\nReplace it with the folders in the tab?\n  " + "\n  ".join(roots))
+        except Exception:  # noqa: BLE001
+            log.exception("_confirm failed")
+            return False
+
+    def _on_map_reindex(self) -> None:
+        """Re-scan the selected map's own folders. Nothing on the tab is applied first: the engine
+        re-indexes an existing map from the settings it was saved with (its folders, exclusions and
+        file limit), so the map keeps its scope whatever the tab shows now."""
+        row = self._selected_map_row()
+        if not row:
+            return
+        self._set_map_status("", "")
+        self._call_index(str(row.get("name") or ""))
+
+    def _load_map_question(self, row: dict[str, object]) -> str:
+        """What loading ``row`` will change, in words: the switches it flips and the folders it
+        sets, read from the row's ``settings`` snapshot against the current configuration."""
+        cc = self._cfg.capabilities
+        name = str(row.get("name") or "")
+        settings = row.get("settings")
+        lines: list[str] = []
+        if isinstance(settings, dict):
+            for key, label in self._CAPABILITY_SWITCHES:
+                new = settings.get(key)
+                if isinstance(new, bool) and new != bool(getattr(cc, key)):
+                    lines.append(f"- {label}: {'on' if new else 'off'} (now {'on' if getattr(cc, key) else 'off'})")
+            for key, label in (("read_roots", "Readable folders"), ("edit_roots", "Editable folders")):
+                new_roots = settings.get(key)
+                if isinstance(new_roots, (list, tuple)) and [str(x) for x in new_roots] != list(getattr(cc, key)):
+                    lines.append(f"- {label}: " + (", ".join(str(x) for x in new_roots) or "none"))
+            enabled_names = settings.get("mcp_enabled")
+            if isinstance(enabled_names, (list, tuple)):
+                # only the servers the config already has can be flipped; a map never adds one
+                wanted = {str(n) for n in enabled_names}
+                for spec in cc.mcp:
+                    if isinstance(spec, dict) and spec.get("name"):
+                        now = _mcp_enabled(spec)
+                        if (str(spec["name"]) in wanted) != now:
+                            lines.append(f"- MCP server '{spec['name']}': {'off' if now else 'on'} (now {'on' if now else 'off'})")
+            body = ("It will change:\n" + "\n".join(lines)) if lines else "It leaves the switches and folders as they are."
+        else:
+            body = "It re-applies the settings it was saved with."
+        text = (f"Load the map '{name}'?\n\n{body}\n\nIts saved exclusions, commands, domains and limits are "
+                "re-applied as well. A map never turns on \"All commands\" or local web access and never "
+                "touches the MCP server definitions.")
+        if self._capabilities_changes():
+            text += "\n\nEdits on this tab that you have not applied are replaced."
+        return text
+
+    def _on_map_load(self) -> None:
+        row = self._selected_map_row()
+        if not row:
+            return
+        name = str(row.get("name") or "")
+        self._set_map_status("", "")
+        try:
+            ok = self._confirm("Load map", self._load_map_question(row))
+        except Exception:  # noqa: BLE001
+            log.exception("_confirm failed")
+            ok = False
+        if not ok:
+            return
+        try:
+            self._actions.load_capability_map(name)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.load_capability_map(%r) failed", name)
+            self._set_map_status(f"failed to load {name}", "error")
+
+    def _on_map_delete(self) -> None:
+        row = self._selected_map_row()
+        if not row:
+            return
+        name = str(row.get("name") or "")
+        self._set_map_status("", "")
+        try:
+            ok = self._confirm("Delete map", f"Delete the map '{name}'? The next index makes a new one.")
+        except Exception:  # noqa: BLE001
+            log.exception("_confirm failed")
+            ok = False
+        if not ok:
+            return
+        try:
+            self._actions.delete_capability_map(name)
+        except Exception:  # noqa: BLE001
+            log.exception("actions.delete_capability_map(%r) failed", name)
+            self._set_map_status(f"failed to delete {name}", "error")
+
+    def _on_map_open_folder(self) -> None:
+        try:
+            folder = Path(self._cfg.maps_dir())
+            if not folder.is_dir():
+                self._set_map_status("the maps folder does not exist yet (pre-index a directory first)", "info")
+                return
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(folder)))
+        except Exception:  # noqa: BLE001
+            log.exception("open the maps folder failed")
 
     # ================================================================================= Hardware
     def _build_hardware_tab(self) -> QWidget:

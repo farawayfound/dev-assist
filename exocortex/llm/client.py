@@ -68,6 +68,11 @@ class StreamStats:
     #: chars-per-token estimate from `prompt_tokens`; the Models window's usage panel shows both.
     prompt_tokens: int | None = None
     cached_tokens: int | None = None
+    #: 2026-10-07 (capabilities): why the stream ended -- "stop" (end of text, or one of the
+    #: `stop` strings: llama-server / OpenAI `finish_reason`, Ollama `done_reason`), "length"
+    #: (`max_tokens` reached) or "" (the backend did not say, or the stream was cancelled). The
+    #: tool loop uses it to tell a call that ended on its closing tag from one cut short.
+    finish_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -201,6 +206,21 @@ def _prompt_tokens_from_chunk(chunk: dict[str, Any]) -> tuple[int | None, int | 
         if prompt is None and evaluated is not None:
             prompt = evaluated + (reused or 0)
     return prompt, cached
+
+
+def _finish_reason_from_chunk(chunk: dict[str, Any]) -> str | None:
+    """The stream's end reason, when this chunk carries one: OpenAI-style
+    ``choices[0].finish_reason`` ("stop" / "length"; LM Studio and llama-server send it on the
+    last content chunk, None before) or Ollama's ``done_reason``. None when absent."""
+    choices = chunk.get("choices") or []
+    if choices and isinstance(choices[0], dict):
+        reason = choices[0].get("finish_reason")
+        if isinstance(reason, str) and reason:
+            return reason
+    reason = chunk.get("done_reason")
+    if isinstance(reason, str) and reason:
+        return reason
+    return None
 
 
 def _extract_items(data: Any) -> list[dict[str, Any]]:
@@ -434,6 +454,7 @@ class LMStudioClient:
         usage_tokens: int | None = None
         prompt_tokens: int | None = None
         cached_tokens: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         try:
@@ -443,6 +464,9 @@ class LMStudioClient:
                 for chunk in self._iter_sse_chunks(r):
                     choices = chunk.get("choices") or []
                     text = choices[0].get("text", "") if choices else ""
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     tok = _completion_tokens_from_chunk(chunk)
                     if tok is not None:
                         usage_tokens = tok
@@ -469,7 +493,7 @@ class LMStudioClient:
         finally:
             self.last_stats = self._make_stats(
                 start, ttft, chunk_count, usage_tokens, cancelled,
-                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens,
+                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
             )
 
     def stream_chat(
@@ -480,13 +504,16 @@ class LMStudioClient:
         temperature: float | None = None,
         top_p: float | None = None,
         cancel: threading.Event | None = None,
+        stop: list[str] | None = None,
     ) -> Iterator[ChatDelta]:
         """POST `/v1/chat/completions` (stream=True) and yield `ChatDelta`s.
 
         Reasoning is taken from `delta.reasoning_content` / `delta.reasoning` when the
         server sends it separately, and additionally split out of inline
         ``<think>...</think>`` spans within `delta.content` so it never leaks into
-        the visible answer text.
+        the visible answer text. `stop` (2026-10-07, capabilities) adds stop strings exactly
+        like `stream_completion`'s: the tool loop stops the chat path on the tool call's
+        closing tag; None sends none, as before.
         """
         body: dict[str, Any] = {
             "model": self.model_id,
@@ -496,6 +523,8 @@ class LMStudioClient:
             "top_p": self.cfg.top_p if top_p is None else top_p,
             "stream": True,
         }
+        if stop:
+            body["stop"] = list(stop)
         body.update(self.cfg.extra_body)
 
         start = time.monotonic()
@@ -504,6 +533,7 @@ class LMStudioClient:
         usage_tokens: int | None = None
         prompt_tokens: int | None = None
         cached_tokens: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         splitter = _ThinkSplitter()
@@ -513,6 +543,9 @@ class LMStudioClient:
                     raise LLMError(self._status_error_message(r))
                 for chunk in self._iter_sse_chunks(r):
                     choices = chunk.get("choices") or []
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     delta_obj: dict[str, Any] = {}
                     if choices:
                         delta_obj = choices[0].get("delta") or {}
@@ -554,7 +587,7 @@ class LMStudioClient:
         finally:
             self.last_stats = self._make_stats(
                 start, ttft, chunk_count, usage_tokens, cancelled,
-                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens,
+                prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
             )
 
     # ---- internals -------------------------------------------------------
@@ -573,7 +606,7 @@ class LMStudioClient:
     @staticmethod
     def _make_stats(
         start: float, ttft: float, chunk_count: int, usage_tokens: int | None, cancelled: bool,
-        *, prompt_tokens: int | None = None, cached_tokens: int | None = None,
+        *, prompt_tokens: int | None = None, cached_tokens: int | None = None, finish_reason: str = "",
     ) -> StreamStats:
         elapsed = time.monotonic() - start
         tokens = usage_tokens if usage_tokens is not None else chunk_count
@@ -583,7 +616,7 @@ class LMStudioClient:
         tok_per_s = tokens / gen_time if gen_time > 0 else 0.0
         return StreamStats(
             ttft_s=ttft, tokens=tokens, elapsed_s=elapsed, tok_per_s=tok_per_s, cancelled=cancelled,
-            prompt_tokens=prompt_tokens, cached_tokens=cached_tokens,
+            prompt_tokens=prompt_tokens, cached_tokens=cached_tokens, finish_reason=finish_reason,
         )
 
     @staticmethod
@@ -853,6 +886,7 @@ class OllamaClient(LMStudioClient):
         chunk_count = 0
         eval_count: int | None = None
         prompt_eval_count: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         try:
@@ -866,6 +900,9 @@ class OllamaClient(LMStudioClient):
                         eval_count = chunk["eval_count"]
                     if isinstance(chunk.get("prompt_eval_count"), int):
                         prompt_eval_count = chunk["prompt_eval_count"]
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     text = chunk.get("response", "")
                     if text:
                         chunk_count += 1
@@ -887,6 +924,7 @@ class OllamaClient(LMStudioClient):
         finally:
             self.last_stats = self._make_stats(
                 start, ttft, chunk_count, eval_count, cancelled, prompt_tokens=prompt_eval_count,
+                finish_reason=finish_reason,
             )
 
     def stream_chat(
@@ -897,23 +935,26 @@ class OllamaClient(LMStudioClient):
         temperature: float | None = None,
         top_p: float | None = None,
         cancel: threading.Event | None = None,
+        stop: list[str] | None = None,
     ) -> Iterator[ChatDelta]:
         """POST `/api/chat` and yield `ChatDelta`s; Ollama's own `message.thinking` field is used
         when present, alongside the same inline ``<think>`` splitting the parent does (a model
-        served through Ollama may still emit inline tags instead of the separate field)."""
+        served through Ollama may still emit inline tags instead of the separate field). `stop`
+        (2026-10-07, capabilities) goes into `options.stop` like `stream_completion`'s."""
         body: dict[str, Any] = {
             "model": self.model_id,
             "messages": messages,
             "stream": True,
             "keep_alive": "30m",
             "options": self._ollama_options(max_tokens=max_tokens, temperature=temperature, top_p=top_p,
-                                            stop=None, extra_body=None),
+                                            stop=stop, extra_body=None),
         }
         start = time.monotonic()
         ttft = 0.0
         chunk_count = 0
         eval_count: int | None = None
         prompt_eval_count: int | None = None
+        finish_reason = ""
         cancelled = False
         first = True
         splitter = _ThinkSplitter()
@@ -928,6 +969,9 @@ class OllamaClient(LMStudioClient):
                         eval_count = chunk["eval_count"]
                     if isinstance(chunk.get("prompt_eval_count"), int):
                         prompt_eval_count = chunk["prompt_eval_count"]
+                    reason = _finish_reason_from_chunk(chunk)
+                    if reason is not None:
+                        finish_reason = reason
                     message = chunk.get("message") or {}
                     raw_content = message.get("content") or ""
                     reasoning_field = message.get("thinking") or ""
@@ -957,6 +1001,7 @@ class OllamaClient(LMStudioClient):
         finally:
             self.last_stats = self._make_stats(
                 start, ttft, chunk_count, eval_count, cancelled, prompt_tokens=prompt_eval_count,
+                finish_reason=finish_reason,
             )
 
     # ---- internals -------------------------------------------------------

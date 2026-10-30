@@ -9,13 +9,14 @@ import argparse
 import dataclasses
 import logging
 import shlex
+import shutil
 import sys
 import threading
 import time
 from pathlib import Path
 from typing import Any, Callable
 
-from exocortex import cuda_env
+from exocortex import capabilities, cuda_env
 from exocortex.actions import EngineActions
 from exocortex.bus import (
     CompletionModeEvent,
@@ -23,6 +24,7 @@ from exocortex.bus import (
     AssistDoneEvent,
     AssistErrorEvent,
     AssistStartedEvent,
+    CapabilityMapEvent,
     CheckpointEvent,
     ComponentStatusEvent,
     ContextLibraryEvent,
@@ -34,6 +36,7 @@ from exocortex.bus import (
     HandsFreeEvent,
     InsightsUpdatedEvent,
     ManualAdvanceEvent,
+    McpToolsEvent,
     ModelInfoEvent,
     ModelLibraryEvent,
     ModelPullEvent,
@@ -55,6 +58,10 @@ log = logging.getLogger(__name__)
 
 #: Cadence of the gpu-guard sampler (module-level so tests can shrink it).
 GPU_GUARD_INTERVAL_S = 5.0
+
+#: 2026-10-07 (capabilities): the wall-clock budget of one "Pre-index scoped directories" walk
+#: (module-level so tests can shrink it). A bigger tree is cut there and saved as truncated.
+INDEX_DEADLINE_S = 120.0
 
 # review round two, 2026-09-27 (E4): exocortex.llm.library.ModelProfile's numeric fields, so
 # set_model_profile can coerce whatever the settings dialog handed it (its widgets round-trip
@@ -201,6 +208,28 @@ class Engine(EngineActions):
         # first use by _optimizer() so importing this module never imports the planner or the bench.
         self._optimize_ctl: Any = None
 
+        # 2026-10-07 (capabilities): the tool runner the Assistant's tool loop talks to, plus the
+        # engine-side state of the Capabilities tab: the cached map listing, the one "capability-
+        # index" thread and the one "mcp-connect" thread. Built here (not in start()) so the tab's
+        # status line and the map actions work before the LLM is up. `self.tools` stays None when
+        # the runner cannot be built -- every use below tolerates that (the model then gets no
+        # tools and the tab's actions say so) instead of failing the whole engine.
+        self.tools: Any = None
+        self._maps_cache: list[dict[str, object]] | None = None
+        self._maps_lock = threading.Lock()
+        self._index_thread: threading.Thread | None = None
+        self._index_busy = False           # an index pass is in flight (guarded by _index_lock)
+        self._index_lock = threading.Lock()
+        self._mcp_thread: threading.Thread | None = None
+        self._mcp_running = False          # a connect pass is in flight (guarded by _mcp_lock)
+        self._mcp_again = False            # settings changed during that pass: run one more
+        self._mcp_lock = threading.Lock()
+        try:
+            self.tools = capabilities.ToolRunner(cfg, session_folder=self._session_folder)
+        except Exception:  # noqa: BLE001
+            log.exception("capabilities: the tool runner could not be built; tools are off")
+            self.tools = None
+
     # ---- clock / ids -----------------------------------------------------------------
     def clock(self) -> float:
         """Seconds since the engine (session) started."""
@@ -235,12 +264,18 @@ class Engine(EngineActions):
             self.bus.publish(ModelLibraryEvent(reason="empty-library"))
 
         self.client = make_client(cfg.llm, self.route.backend, base_url=self.route.base_url or None)
-        self.assistant = Assistant(cfg, self.bus, self.client, self.transcript, self.clock, context=self.context)
+        self.assistant = Assistant(cfg, self.bus, self.client, self.transcript, self.clock,
+                                   context=self.context, tools=self.tools)
         self.recorder = SessionRecorder(cfg, self.bus, self.transcript, self.assistant)
         folder = self.recorder.start()
         log.info("session folder: %s", folder)
         self._init_project()
         self._init_dashboard(folder)
+        # 2026-10-07 (capabilities): the project map that was active when the app last ran goes
+        # back into the prompts (and into this session's folder) before the first answer.
+        self._load_active_map()
+        self._copy_active_map_to_session()
+        self._refresh_active_map_at_start()
 
         # 2026-10-07 (Settings > Optimize): an apply that died half-way is rolled back HERE, before
         # llama-server launches (a profile the model cannot start with must not crash-loop every
@@ -258,6 +293,7 @@ class Engine(EngineActions):
         self._init_thread.start()
         self._init_screen()
         self._start_gpu_guard()
+        self._start_mcp_connect()
         if cfg.completion.enabled:
             self.set_completion_mode(True)
         if cfg.handsfree.enabled:
@@ -630,6 +666,11 @@ class Engine(EngineActions):
         self._pull_cancel.set()
         if self._pull_thread is not None and self._pull_thread.is_alive():
             self._pull_thread.join(timeout=2.0)    # polled per 64 KiB chunk: returns within a chunk
+        # 2026-10-07 (capabilities): the map walk polls `_stopped` (set above) and writes nothing
+        # once it is set; the short join keeps its last save_config() from interleaving with ours.
+        index = self._index_thread
+        if index is not None and index.is_alive():
+            index.join(timeout=2.0)
         for name, comp in (("hands-free", self.handsfree), ("completer", self.completer), ("screen", self.screen),
                            ("pipeline", self.pipeline), ("dashboard", self.dashboard), ("assistant", self.assistant),
                            ("recorder", self.recorder), ("llama-server", self.server)):
@@ -639,6 +680,13 @@ class Engine(EngineActions):
                 comp.stop()
             except Exception:  # noqa: BLE001
                 log.exception("error stopping %s", name)
+        # 2026-10-07 (capabilities): after the assistant (no tool call can start any more) the
+        # runner closes its MCP clients -- killing their process trees -- and the web client.
+        if self.tools is not None:
+            try:
+                self.tools.close()
+            except Exception:  # noqa: BLE001
+                log.exception("error closing the tool runner")
         # review round two, 2026-09-27 (E2): the loop above snapshotted self.server; on a fresh
         # machine (self.server None at start) a first Load racing this stop() can create and
         # start a LlamaServerManager (in _ensure_server, from the "llm-swap" thread) after that
@@ -767,6 +815,7 @@ class Engine(EngineActions):
         self._t0 = time.monotonic()
         if self.recorder:
             self.recorder.start()
+            self._copy_active_map_to_session()    # 2026-10-07: the new session folder carries the active map too
         if self.dashboard is not None:
             folder = None
             if self.recorder is not None and self.cfg.dashboard.persist:
@@ -1113,6 +1162,20 @@ class Engine(EngineActions):
             log.info("[context].dir changed to %r; the document library moves at the next launch",
                      changed["context.dir"])
         # every other context.* value is read live by the ContextManager on its next build()
+        if any(k.startswith("capabilities.") for k in changed):
+            # 2026-10-07: the runner re-reads the policy (and drops the MCP clients whose spec
+            # changed); a changed server list or switch needs a new connect pass, off this thread.
+            if self.tools is not None:
+                try:
+                    self.tools.refresh()
+                except Exception:  # noqa: BLE001
+                    log.exception("capabilities: refreshing the tool runner failed")
+            if "capabilities.maps_dir" in changed:
+                self._maps_folder_changed()
+            if any(k.startswith("capabilities.mcp") for k in changed):
+                # the switch, the server list or the timeout: connect what is new, retry what
+                # failed (`connect_mcp` leaves connected servers alone and reconnects errored ones)
+                self._start_mcp_connect()
         self.save_config()
         log.info("settings applied: %s", ", ".join(sorted(changed)))
 
@@ -1698,6 +1761,450 @@ class Engine(EngineActions):
         except Exception:  # noqa: BLE001
             log.exception("optimize_undo failed")
             return False
+
+    # ---- capabilities (2026-10-07: the Models window's "Capabilities" tab) -------------------
+    # The runner (`self.tools`) owns the policy and the tools; the engine owns what needs the
+    # disk and the bus: the project maps (index / load / delete / list), the MCP connect thread
+    # and the tab's status line. Same shape as the context_* actions: synchronous and cheap, or a
+    # named daemon thread; every failure is logged and published, never raised into the UI.
+    def _session_folder(self) -> Path | None:
+        """The current session folder (where edit backups and the map copy go), or None before the
+        recorder exists / has started (its `folder` raises until `start()` ran). The runner calls
+        this lazily, so a new session is picked up without any hand-over."""
+        recorder = self.recorder
+        if recorder is None:
+            return None
+        try:
+            folder = recorder.folder
+        except Exception:  # noqa: BLE001 - RuntimeError before start(); a fake without the attribute
+            return None
+        return Path(folder) if folder else None
+
+    @staticmethod
+    def _map_error_event(name: str, message: str) -> CapabilityMapEvent:
+        """The event of a failed map operation (logged here; nothing changed)."""
+        log.warning("capabilities: map %r: %s", name, message)
+        return CapabilityMapEvent(reason=f"error: {message}", name=name)
+
+    def _map_error(self, name: str, message: str) -> None:
+        """A map operation failed: log it and tell the tab (its status label and the overlay's
+        toast both follow `CapabilityMapEvent`); nothing changed."""
+        self.bus.publish(self._map_error_event(name, message))
+
+    def _refresh_maps(self) -> list[dict[str, object]]:
+        """Rebuild the cached listing from `<maps_dir>/*.json` (headers only, entries never
+        materialised). A corrupt file is skipped with a warning; never raises."""
+        rows: list[dict[str, object]] = []
+        folder = self.cfg.maps_dir()
+        try:
+            files = sorted(folder.glob("*.json")) if folder.is_dir() else []
+        except OSError:
+            log.warning("capabilities: could not list %s", folder, exc_info=True)
+            files = []
+        for file in files:
+            try:
+                row = dict(capabilities.map_header(file))
+            except Exception as e:  # noqa: BLE001 - CapabilityError for a bad file, OSError for an unreadable one
+                log.warning("capabilities: skipping map file %s: %s", file.name, e)
+                continue
+            row.setdefault("path", str(file))
+            rows.append(row)
+        rows.sort(key=lambda r: str(r.get("name", "")).casefold())
+        with self._maps_lock:
+            self._maps_cache = rows
+        return rows
+
+    def capability_maps(self) -> list[dict[str, object]]:
+        """The saved project maps (`map_header` rows plus ``active``), from the cache; `[]` on any error."""
+        try:
+            with self._maps_lock:
+                cached = self._maps_cache
+            rows = cached if cached is not None else self._refresh_maps()
+            active = self.cfg.capabilities.active_map
+            # `active` is read live (a settings change can move it without a re-scan)
+            return [{**row, "active": bool(active) and row.get("name") == active} for row in rows]
+        except Exception:  # noqa: BLE001
+            log.exception("capabilities: could not list the project maps")
+            return []
+
+    def _map_path(self, name: str) -> Path | None:
+        """The file of the map called `name`: `<maps_dir>/<slug>.json`, else the listing's row of
+        that name (a file renamed by hand). None when there is no such map."""
+        try:
+            direct = self.cfg.maps_dir() / f"{capabilities.map_slug(name)}.json"
+            if direct.is_file():
+                return direct
+        except Exception:  # noqa: BLE001
+            log.debug("capabilities: slug lookup failed for %r", name, exc_info=True)
+        with self._maps_lock:
+            cached = self._maps_cache
+        for row in cached if cached is not None else self._refresh_maps():
+            if row.get("name") == name and row.get("path"):
+                candidate = Path(str(row["path"]))
+                if candidate.is_file():
+                    return candidate
+        return None
+
+    def _maps_folder_changed(self) -> None:
+        """`[capabilities].maps_dir` changed. It is applied live (every map call reads
+        `cfg.maps_dir()`), so the cached listing of the old folder is dropped (the next
+        `capability_maps()` scans the new one) and the active map is read again from the new
+        folder -- the model must not keep seeing a map from a folder the app no longer looks at.
+        An active name with no file there stays in the config (a map restored later is picked up
+        again) but shows the model nothing. Never raises."""
+        with self._maps_lock:
+            self._maps_cache = None
+        name = self.cfg.capabilities.active_map
+        if not name or self.tools is None:
+            return
+        try:
+            if self._map_path(name) is None:
+                log.warning("capabilities: the active map %r has no file in the new maps folder %s",
+                            name, self.cfg.maps_dir())
+                self.tools.set_map_text("")
+                return
+            self._load_active_map()
+            self._copy_active_map_to_session()
+        except Exception:  # noqa: BLE001
+            log.exception("capabilities: could not re-read the active map after the maps folder changed")
+
+    def _copy_map_to_session(self, path: Path) -> None:
+        """Best effort: keep a copy of the map in `<session>/maps/` so the session folder shows
+        what the model was told about the project."""
+        folder = self._session_folder()
+        if folder is None:
+            return
+        try:
+            dest = folder / "maps"
+            dest.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(path, dest / path.name)
+        except OSError:
+            log.warning("capabilities: could not copy %s into the session folder", path.name, exc_info=True)
+
+    def _copy_active_map_to_session(self) -> None:
+        """`_copy_map_to_session` for the active map, if there is one (a launch, a new session)."""
+        name = self.cfg.capabilities.active_map
+        if not name:
+            return
+        try:
+            path = self._map_path(name)
+            if path is not None:
+                capabilities.map_header(path)       # a corrupt file is not worth a copy (CapabilityError)
+                self._copy_map_to_session(path)
+        except Exception as e:  # noqa: BLE001 - CapabilityError for a bad file, OSError
+            log.warning("capabilities: not copying the active map %r into the session folder: %s", name, e)
+
+    def _load_active_map(self) -> None:
+        """Hand the active map's rendered text to the runner (the `<map>` block of every
+        tool-enabled prompt). A missing or corrupt file logs a warning and clears nothing: the
+        name stays in the config so a map restored later is picked up again."""
+        name = self.cfg.capabilities.active_map
+        if not name or self.tools is None:
+            return
+        try:
+            path = self._map_path(name)
+            if path is None:
+                log.warning("capabilities: the active map %r has no file in %s", name, self.cfg.maps_dir())
+                return
+            self.tools.set_map_text(capabilities.load_map(path).text)
+        except Exception as e:  # noqa: BLE001 - CapabilityError, OSError
+            log.warning("capabilities: could not load the active map %r: %s", name, e)
+
+    def _refresh_active_map_at_start(self) -> None:
+        """Re-index the active map in the background at every launch (2026-10-08). A map is a
+        snapshot: the owner's was made in the morning, the folders were renamed in the afternoon,
+        and the evening session's first question asked for a path that no longer existed. The
+        stored text stays in place until the pass finishes (`_load_active_map` put it there), so a
+        question asked meanwhile still has a map; the refreshed one then replaces it and is copied
+        into the session folder. The pass is `automatic`: the overlay toasts it only when files or
+        folders were added, removed or renamed (2026-10-29: "Map 'X': 28 files" at every launch read
+        as 28 documents loaded into the context, which a map never does -- it lists paths for the
+        tools). Nothing happens without an active map or a file for it; a failure only logs."""
+        name = self.cfg.capabilities.active_map
+        if not name or self.tools is None:
+            return
+        try:
+            if self._map_path(name) is None:
+                return
+            self.index_capability_map(name, automatic=True)
+        except Exception:  # noqa: BLE001 - a refresh must never break start()
+            log.exception("capabilities: could not refresh the active map %r at start", name)
+
+    def index_capability_map(self, name: str, *, automatic: bool = False) -> None:
+        """Index the folders of the map `name` on the "capability-index" thread (one at a time)
+        and make it the active map; reports through `CapabilityMapEvent`. A map that already
+        exists is refreshed over its OWN stored scope (roots, excludes, file cap -- `_index_scope`);
+        a new name takes the configured read folders. `automatic` (the launch refresh) rides on
+        the events, so the overlay can keep quiet about an unchanged tree."""
+        name = (name or "").strip()
+        if not name:
+            self._map_error(name, "a map needs a name")
+            return
+        with self._index_lock:
+            if self._index_busy:
+                self._map_error(name, "indexing already running")
+                return
+            self._index_busy = True
+            # "indexing" goes out before the thread exists, so it can never arrive after "indexed"
+            self.bus.publish(CapabilityMapEvent(reason="indexing", name=name, automatic=automatic))
+            try:
+                self._index_thread = threading.Thread(
+                    target=self._index_map, args=(name, automatic), name="capability-index", daemon=True)
+                self._index_thread.start()
+            except RuntimeError as e:      # cannot start a thread (interpreter shutting down)
+                self._index_busy = False
+                self._map_error(name, str(e) or type(e).__name__)
+
+    def _index_map(self, name: str, automatic: bool = False) -> None:
+        """The "capability-index" thread: walk the readable folders, render and save the map,
+        make it the active one. Reports through `CapabilityMapEvent`; never raises. The busy flag
+        is cleared BEFORE the final event goes out, so a click on "Re-index" that answers
+        "indexed" is never refused as "already running"."""
+        event: CapabilityMapEvent | None = None
+        try:
+            event = self._index_run(name, automatic=automatic)
+        except (capabilities.CapabilityError, OSError) as e:
+            event = self._map_error_event(name, str(e) or type(e).__name__)
+        except Exception as e:  # noqa: BLE001
+            log.exception("capabilities: indexing %r failed", name)
+            event = self._map_error_event(name, str(e) or type(e).__name__)
+        finally:
+            with self._index_lock:
+                self._index_busy = False
+        if event is not None:
+            self.bus.publish(event)
+
+    @staticmethod
+    def _clean_strings(value: object) -> list[str]:
+        """`value` as a list of non-empty strings, or `[]` when it is anything else."""
+        if not isinstance(value, list):
+            return []
+        return [v.strip() for v in value if isinstance(v, str) and v.strip()]
+
+    def _index_scope(self, name: str) -> tuple[list[str], list[str], int, dict[str, Any]]:
+        """What one index pass walks: `(roots, excluded names, file cap, settings to store)`.
+
+        A map that already exists keeps its OWN scope: its stored roots, excludes and file cap (and
+        its stored settings, verbatim), so "Re-index" refreshes the map that was built, not
+        whatever the tab shows now -- except that names the config excludes NOW are added to the
+        map's excludes (a map never un-hides anything). A name with no map file (a first index, or "Pre-index"
+        after the old map was deleted) takes the current config, as does any value the stored
+        scope does not carry or carries in the wrong shape. Never raises."""
+        cc = self.cfg.capabilities
+        roots = self._clean_strings(list(cc.read_roots))
+        excludes = [str(x) for x in cc.read_exclude]
+        max_files = int(cc.map_max_files)
+        settings: dict[str, Any] | None = None
+        try:
+            path = self._map_path(name)
+            old = capabilities.map_header(path) if path is not None else None
+        except Exception as e:  # noqa: BLE001 - a corrupt file: it is about to be replaced
+            log.warning("capabilities: the stored scope of map %r is unreadable (%s); using the current settings", name, e)
+            old = None
+        if old is not None:
+            stored = old.get("settings")
+            stored = stored if isinstance(stored, dict) else {}
+            roots = self._clean_strings(stored.get("read_roots")) or self._clean_strings(old.get("roots")) or roots
+            if isinstance(stored.get("read_exclude"), list):
+                # the map's excludes, plus any the config gained since: like `apply_snapshot`, a
+                # map never un-hides a name the user has hidden meanwhile
+                kept = self._clean_strings(stored["read_exclude"])
+                excludes = kept + [x for x in excludes if x not in kept]
+            cap_value = stored.get("map_max_files")
+            if isinstance(cap_value, int) and not isinstance(cap_value, bool) and cap_value > 0:
+                max_files = cap_value
+            if stored:
+                settings = dict(stored)
+        if settings is None:
+            settings = capabilities.settings_snapshot(cc)
+        # what the map stores is what was walked
+        for key, value in (("read_roots", roots), ("read_exclude", excludes), ("map_max_files", max_files)):
+            if key in settings:
+                settings[key] = list(value) if isinstance(value, list) else value
+        return roots, excludes, max_files, settings
+
+    @staticmethod
+    def _entry_keys(m: capabilities.CapabilityMap) -> set[tuple[str, int, str]]:
+        """`("f" | "d", root index, relative path)` for every file and folder of `m`: what the
+        closing event's `changed` compares. Sizes and summaries are left out on purpose -- a file
+        edited since is the same tree; a rename, an added or a removed path is not."""
+        return {("f", e.root, e.path) for e in m.files} | {("d", e.root, e.path) for e in m.dirs}
+
+    def _stored_entry_keys(self, name: str) -> set[tuple[str, int, str]] | None:
+        """`_entry_keys` of the map `name` as stored, or None when there is no readable file for it
+        (a first index, or a corrupt file about to be replaced -- both count as changed)."""
+        try:
+            path = self._map_path(name)
+            return self._entry_keys(capabilities.load_map(path)) if path is not None else None
+        except Exception:  # noqa: BLE001 - CapabilityError for a corrupt file, OSError
+            return None
+
+    def _index_run(self, name: str, automatic: bool = False) -> CapabilityMapEvent | None:
+        """The work of one index pass; returns the closing event (None when the app is quitting:
+        the walk was cut short and nothing is written). The event's `changed` says whether the
+        files and folders found differ from those the stored map listed (`_entry_keys`)."""
+        cc = self.cfg.capabilities
+        before = self._stored_entry_keys(name)
+        roots, excludes, max_files, settings = self._index_scope(name)
+        if not roots:
+            return self._map_error_event(name, "no readable folder to index (add one under Read scope)")
+        for root in roots:
+            if not Path(root).is_dir():
+                return self._map_error_event(name, f"folder not found: {root}")
+        # the app's own folders (models, context, maps, sessions, config.toml) are never indexed,
+        # even when a read root contains them -- the same list the runner refuses to read
+        protected = [str(p) for p in self.tools.protected_paths()] if self.tools is not None else []
+        m = capabilities.build_map(
+            name, roots, excludes=excludes, max_files=max_files, settings=settings,
+            deadline=time.monotonic() + INDEX_DEADLINE_S, cancel=self._stopped, protected=protected,
+        )
+        if self._stopped.is_set():
+            return None                     # quitting: write nothing, the walk was cut short
+        # the map text is cut ONCE, here, to the CONFIGURED budget (never the calibrated
+        # estimator, which drifts with every answer): the stored text is what every job shows the
+        # model, so the `<map>` block stays byte-identical between jobs
+        m.text = capabilities.render_map(
+            m, max_chars=int(int(cc.map_tokens) * float(self.cfg.context.chars_per_token)))
+        folder = self.cfg.maps_dir()
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"{capabilities.map_slug(name)}.json"
+        capabilities.save_map(m, path)
+        self._copy_map_to_session(path)
+        if self.tools is not None:
+            self.tools.set_map_text(m.text)
+        cc.active_map = name
+        self.save_config()
+        self._refresh_maps()
+        detail = f"cut at {len(m.files)} files" if m.truncated else ""
+        changed = before is None or self._entry_keys(m) != before
+        log.info("capabilities: %s %r: %d files, %d dirs%s%s", "refreshed" if automatic else "indexed",
+                 name, len(m.files), len(m.dirs), f" ({detail})" if detail else "",
+                 "" if changed else " (unchanged)")
+        return CapabilityMapEvent(reason="indexed", name=name, files=len(m.files), dirs=len(m.dirs),
+                                  detail=detail, automatic=automatic, changed=changed)
+
+    def load_capability_map(self, name: str) -> None:
+        """Make the saved map `name` the active one and re-apply its (narrowing) settings."""
+        cc = self.cfg.capabilities
+        try:
+            path = self._map_path(name)
+            if path is None:
+                self._map_error(name, f"no such map: {name}")
+                return
+            m = capabilities.load_map(path)
+            changed = capabilities.apply_snapshot(cc, m.settings)
+        except Exception as e:  # noqa: BLE001 - CapabilityError for a bad file, OSError
+            self._map_error(name, str(e) or type(e).__name__)
+            return
+        cc.active_map = name
+        if self.tools is not None:
+            try:
+                self.tools.set_map_text(m.text)
+                self.tools.refresh()
+            except Exception:  # noqa: BLE001 - the settings are applied: still save and report them
+                log.exception("capabilities: the tool runner could not take the loaded map")
+        self._start_mcp_connect()           # the map may have flipped `enabled` on servers
+        self.save_config()
+        self._copy_map_to_session(path)
+        self._refresh_maps()
+        log.info("capabilities: loaded map %r (%s)", name, ", ".join(changed) if changed else "no settings changed")
+        self.bus.publish(CapabilityMapEvent(reason="loaded", name=name, files=len(m.files), dirs=len(m.dirs)))
+
+    def delete_capability_map(self, name: str) -> None:
+        """Delete the saved map `name`; when it was the active one the model's `<map>` goes too."""
+        cc = self.cfg.capabilities
+        was_active = bool(name) and cc.active_map == name
+        try:
+            path = self._map_path(name)
+            if path is None and not was_active:
+                self._map_error(name, f"no such map: {name}")
+                return
+            if path is not None:
+                path.unlink()
+        except OSError as e:
+            self._map_error(name, f"could not delete {name}: {e}")
+            return
+        if was_active:
+            # also when the file was already gone: a dangling name would otherwise stay "active"
+            # with no row in the tab to delete it from
+            cc.active_map = ""
+            if self.tools is not None:
+                self.tools.set_map_text("")
+        self.save_config()
+        self._refresh_maps()
+        log.info("capabilities: deleted map %r", name)
+        self.bus.publish(CapabilityMapEvent(reason="deleted", name=name))
+
+    def _mcp_wanted(self) -> bool:
+        """True when the MCP switch is on and at least one configured server is enabled."""
+        cc = self.cfg.capabilities
+        return bool(cc.mcp_servers) and any(isinstance(s, dict) and bool(s.get("enabled", True)) for s in cc.mcp)
+
+    def _start_mcp_connect(self) -> None:
+        """Connect the enabled MCP servers on the "mcp-connect" daemon thread (a stdio server can
+        take seconds to start; `connect_mcp` blocks). One pass at a time: a request that arrives
+        while one runs makes it run once more when it ends, so the last settings always win."""
+        if self.tools is None or self._stopped.is_set() or not self._mcp_wanted():
+            return
+        with self._mcp_lock:
+            if self._mcp_running:
+                self._mcp_again = True
+                return
+            self._mcp_running = True
+            self._mcp_again = False
+            self._mcp_thread = threading.Thread(target=self._mcp_connect_loop, name="mcp-connect", daemon=True)
+            self._mcp_thread.start()
+
+    def _mcp_connect_loop(self) -> None:
+        """Body of the "mcp-connect" thread: connect, and again while settings changed meanwhile."""
+        while True:
+            try:
+                self.tools.connect_mcp()
+            except Exception:  # noqa: BLE001
+                log.exception("capabilities: connecting the MCP servers failed")
+            if self._stopped.is_set():
+                # stop() may have closed the runner while this pass was still starting a server:
+                # close again (idempotent) so that late client -- a child process -- is not orphaned
+                try:
+                    self.tools.close()
+                except Exception:  # noqa: BLE001
+                    log.exception("capabilities: closing the tool runner after a late connect failed")
+            with self._mcp_lock:
+                if not self._mcp_again or self._stopped.is_set():
+                    self._mcp_running = False
+                    return
+                self._mcp_again = False
+
+    def mcp_server_tools(self, name: str, request_id: int) -> None:
+        """List the tools of the configured MCP server `name` on a daemon thread; the answer (or
+        the reason it failed) arrives as a `McpToolsEvent` carrying `request_id`."""
+        def _run() -> None:
+            try:
+                if self.tools is None:
+                    raise RuntimeError("capabilities are unavailable")
+                found = self.tools.mcp_tools(name)
+                rows = tuple({"name": str(getattr(t, "name", "")), "description": str(getattr(t, "description", ""))}
+                             for t in found)
+                self.bus.publish(McpToolsEvent(request_id=request_id, server=name, tools=rows))
+            except Exception as e:  # noqa: BLE001 - McpError, an unknown server, a timeout
+                message = str(e) or type(e).__name__
+                log.warning("capabilities: MCP server %r: %s", name, message)
+                self.bus.publish(McpToolsEvent(request_id=request_id, server=name, error=message))
+
+        threading.Thread(target=_run, name="mcp-tools", daemon=True).start()
+
+    def capability_status(self) -> dict[str, object]:
+        """The runner's status (tools offered, roots, MCP states, notes) plus `active_map`; `{}`
+        without a runner. No filesystem or network access; never raises."""
+        if self.tools is None:
+            return {}
+        try:
+            status = dict(self.tools.status())
+            status["active_map"] = self.cfg.capabilities.active_map
+            return status
+        except Exception:  # noqa: BLE001
+            log.exception("capabilities: could not read the tool runner's status")
+            return {}
 
     def quit(self) -> None:
         if self._on_quit:
